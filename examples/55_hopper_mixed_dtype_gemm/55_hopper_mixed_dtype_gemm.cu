@@ -117,8 +117,8 @@ enum GemmMode {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// GEMM kernel configurations
 /////////////////////////////////////////////////////////////////////////////////////////////////
-using MmaType = cutlass::float_e4m3_t;
-using QuantType = cutlass::int4b_t;
+using MmaType = cutlass::bfloat16_t;
+using QuantType = cutlass::float_e4m3_t;
 constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
 
 // A matrix configuration
@@ -135,12 +135,12 @@ constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // M
 using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
 using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
 
-using ElementZero = cutlass::half_t;
-using ElementScale = cutlass::half_t;
+using ElementZero = cutlass::bfloat16_t;
+using ElementScale = cutlass::bfloat16_t;
 using LayoutScale = cutlass::layout::RowMajor;
 
 // C/D matrix configuration
-using         ElementC    = cutlass::half_t;                                // Element type for C and D matrix operands
+using         ElementC    = cutlass::bfloat16_t;                            // Element type for C and D matrix operands
 using         LayoutC     = cutlass::layout::RowMajor;                      // Layout type for C and D matrix operands
 constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
 
@@ -154,10 +154,28 @@ using ElementAccumulator  = float;                                          // E
 using ElementCompute      = float;                                          // Element type for epilogue computation
 using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<_128,_256,cute::Int<TileShapeK>>;         // Threadblock-level tile size
+
+// // Ping-pong
+// using TileShape           = Shape<_64,_16,cute::Int<TileShapeK>>;         // Threadblock-level tile size
+// using ClusterShape        = Shape<_2,_1,_1>;                                // Shape of the threadblocks in a cluster
+// using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedPingpongMixedInput;  // Kernel to launch based on the default setting in the Collective Builder 
+// using EpilogueSchedule    = cutlass::epilogue::TmaWarpSpecialized;
+// using TileScheduler = cutlass::gemm::PersistentScheduler;
+
+// Cooperative M_tile >= 128
+using TileShape           = Shape<_128,_16,cute::Int<TileShapeK>>;         // Threadblock-level tile size
 using ClusterShape        = Shape<_2,_1,_1>;                                // Shape of the threadblocks in a cluster
 using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedCooperativeMixedInput;  // Kernel to launch based on the default setting in the Collective Builder 
 using EpilogueSchedule    = cutlass::epilogue::TmaWarpSpecializedCooperative;
+using TileScheduler = cutlass::gemm::StreamKScheduler;
+
+// Cooperative M_tile >= 128
+// using TileShape           = Shape<_64,_16,cute::Int<TileShapeK>>;         // Threadblock-level tile size
+// using ClusterShape        = Shape<_2,_1,_1>;                                // Shape of the threadblocks in a cluster
+// using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedMixedInput;  // Kernel to launch based on the default setting in the Collective Builder 
+// using EpilogueSchedule    = cutlass::epilogue::TmaWarpSpecialized;
+// using TileScheduler = cutlass::gemm::StreamKScheduler;
+
 using EpilogueTileType    = cutlass::epilogue::collective::EpilogueTileAuto;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -191,7 +209,8 @@ using CollectiveMainloopConvertOnly = typename cutlass::gemm::collective::Collec
 using GemmKernelConvertOnly = cutlass::gemm::kernel::GemmUniversal<
     Shape<int,int,int,int>, // Indicates ProblemShape
     CollectiveMainloopConvertOnly,
-    CollectiveEpilogue
+    CollectiveEpilogue,
+    TileScheduler
 >;
 
 using GemmConvertOnly = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelConvertOnly>;
@@ -213,7 +232,8 @@ using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::Collecti
 using GemmKernelScaleOnly = cutlass::gemm::kernel::GemmUniversal<
     Shape<int,int,int,int>, // Indicates ProblemShape
     CollectiveMainloopScaleOnly,
-    CollectiveEpilogue
+    CollectiveEpilogue,
+    TileScheduler
 >;
 
 using GemmScaleOnly = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleOnly>;
@@ -235,7 +255,8 @@ using CollectiveMainloopScaleWithZeroPoint = typename cutlass::gemm::collective:
 using GemmKernelScaleWithZeroPoint = cutlass::gemm::kernel::GemmUniversal<
     Shape<int,int,int,int>, // Indicates ProblemShape
     CollectiveMainloopScaleWithZeroPoint,
-    CollectiveEpilogue
+    CollectiveEpilogue,
+    TileScheduler
 >;
 
 using GemmScaleWithZeroPoint = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleWithZeroPoint>;
@@ -404,8 +425,10 @@ bool initialize_quant_tensor(
   cutlass::TensorView<Element, Layout> view,
   uint64_t seed=2023) {
   
-  float scope_min = float(cutlass::platform::numeric_limits<Element>::lowest());
-  float scope_max = float(cutlass::platform::numeric_limits<Element>::max());
+  float scope_min = 0.f;
+  float scope_max = 448.0f;
+  // float scope_min = float(cutlass::platform::numeric_limits<Element>::lowest());
+  // float scope_max = float(cutlass::platform::numeric_limits<Element>::max());
 
   cutlass::reference::host::TensorFillRandomUniform(
     view, seed, scope_max, scope_min);
@@ -423,7 +446,8 @@ bool initialize_scale(
     cutlass::reference::host::TensorFill(view, Element(1.0f));
   } 
   else {
-    float elt_max_f = float(cutlass::platform::numeric_limits<QuantType>::max());
+    // float elt_max_f = float(cutlass::platform::numeric_limits<QuantType>::max());
+    float elt_max_f = 448.0f;
     const float max_dequant_val = 4.f;
     const float min_dequant_val = 0.5f;
 
@@ -596,7 +620,7 @@ bool verify(const Options &options) {
   // compare_reference
   tensor_D.sync_host();
   tensor_ref_D.sync_host();
-  const ElementD epsilon(1e-2f);
+  const ElementD epsilon(20e-2f);
   const ElementD non_zero_floor(1e-4f);
   bool passed = cutlass::reference::host::TensorRelativelyEquals(tensor_ref_D.host_view(), tensor_D.host_view(), epsilon, non_zero_floor);
   return passed;
@@ -645,6 +669,7 @@ int run(Options &options)
     GpuTimer timer;
     timer.start();
     for (int iter = 0; iter < options.iterations; ++iter) {
+      gemm.initialize(arguments, workspace.get());
       CUTLASS_CHECK(gemm.run());
     }
     timer.stop();

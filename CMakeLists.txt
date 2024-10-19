@@ -146,7 +146,8 @@ if (CUDA_VERSION VERSION_GREATER_EQUAL 12.0 AND NOT CUDA_COMPILER MATCHES "[Cc]l
   list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 90a)
 endif()
 set(CUTLASS_NVCC_ARCHS ${CUTLASS_NVCC_ARCHS_SUPPORTED} CACHE STRING "The SM architectures requested.")
-set(CUTLASS_NVCC_ARCHS_ENABLED ${CUTLASS_NVCC_ARCHS} CACHE STRING "The SM architectures to build code for.")
+# set(CUTLASS_NVCC_ARCHS_ENABLED ${CUTLASS_NVCC_ARCHS} CACHE STRING "The SM architectures to build code for.")
+set(CUTLASS_NVCC_ARCHS_ENABLED 90a CACHE STRING "The SM architectures to build code for.")
 
 # Find unsupported and deprecated compute capabilities
 if (CUTLASS_NVCC_ARCHS_SUPPORTED)
@@ -378,8 +379,8 @@ endif()
 # Don't leak lineinfo in release builds
 if (NOT CMAKE_BUILD_TYPE MATCHES "Release")
   list(APPEND CUTLASS_CUDA_CLANG_FLAGS -gmlt)
-  list(APPEND CUTLASS_CUDA_NVCC_FLAGS -lineinfo)
 endif()
+list(APPEND CUTLASS_CUDA_NVCC_FLAGS -lineinfo)
 
 #Report CUDA build flags
 if (CUDA_COMPILER MATCHES "[Cc]lang")
