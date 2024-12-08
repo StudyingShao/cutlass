@@ -99,6 +99,7 @@ public:
   /// Warp count (concept: GemmShape)
   using WarpCount = typename Mma::WarpCount;
   static int const kThreadCount = 32 * WarpCount::kCount;
+  static constexpr int kInterleave = Mma::IteratorB::Shape::kRow / Mma::Shape::kK;
 
   /// Workspace bytes per thread block
   static size_t const kWorkspaceBytesPerBlock =
@@ -127,6 +128,10 @@ public:
     int batch_count {1};        // Either (mode == GemmUniversalMode::kBatched) the batch count, or (mode == GemmUniversalMode::kGemm) the tile-splitting factor
 
     typename EpilogueOutputOp::Params epilogue{};
+
+    int group_size;
+    typename Mma::IteratorScale::TensorRef ref_scale;
+    typename Mma::IteratorScale::TensorRef ref_zero;
 
     void const * ptr_A = nullptr;
     void const * ptr_B = nullptr;
@@ -164,6 +169,9 @@ public:
       GemmCoord problem_size,
       int batch_split,                              /// Either (mode == GemmUniversalMode::kBatched) the batch count, or (mode == GemmUniversalMode::kGemm) the tile-splitting factor (1 defaults to StreamK, >1 emulates Split-K)
       typename EpilogueOutputOp::Params epilogue,
+      int group_size,
+      typename Mma::IteratorScale::TensorRef ref_scale,
+      typename Mma::IteratorScale::TensorRef ref_zero,
       void const * ptr_A,
       void const * ptr_B,
       void const * ptr_C,
@@ -182,6 +190,9 @@ public:
       problem_size(problem_size),
       batch_count(batch_split),
       epilogue(epilogue),
+      group_size(group_size),
+      ref_scale(ref_scale),
+      ref_zero(ref_zero),
       ptr_A(ptr_A), ptr_B(ptr_B), ptr_C(ptr_C), ptr_D(ptr_D),
       batch_stride_A(batch_stride_A), batch_stride_B(batch_stride_B), batch_stride_C(batch_stride_C), batch_stride_D(batch_stride_D),
       stride_a(stride_a), stride_b(stride_b), stride_c(stride_c), stride_d(stride_d), avail_sms(avail_sms)
@@ -195,6 +206,9 @@ public:
       GemmCoord problem_size,
       int batch_split,                              /// Either (mode == GemmUniversalMode::kBatched) the batch count, or (mode == GemmUniversalMode::kGemm) the tile-splitting factor (1 defaults to StreamK, >1 emulates Split-K)
       typename EpilogueOutputOp::Params epilogue,
+      int group_size,
+      typename Mma::IteratorScale::TensorRef ref_scale,
+      typename Mma::IteratorScale::TensorRef ref_zero,
       void const * ptr_A,
       void const * ptr_B,
       void const * ptr_C,
@@ -213,6 +227,9 @@ public:
       problem_size(problem_size),
       batch_count(batch_split),
       epilogue(epilogue),
+      group_size(group_size),
+      ref_scale(ref_scale),
+      ref_zero(ref_zero),
       ptr_A(ptr_A), ptr_B(ptr_B), ptr_C(ptr_C), ptr_D(ptr_D),
       batch_stride_A(batch_stride_A), batch_stride_B(batch_stride_B), batch_stride_C(batch_stride_C), batch_stride_D(batch_stride_D),
       lda(lda), ldb(ldb), ldc(ldc), ldd(ldd), avail_sms(avail_sms)
@@ -254,6 +271,11 @@ public:
 
     typename Mma::IteratorA::Params params_A{};
     typename Mma::IteratorB::Params params_B{};
+
+    int group_size;
+    typename Mma::IteratorScale::Params params_scale;
+    typename Mma::IteratorScale::TensorRef ref_scale;
+    typename Mma::IteratorScale::TensorRef ref_zero;
 
     int64_t batch_stride_A{0};
     int64_t batch_stride_B{0};
@@ -330,6 +352,10 @@ public:
       params_D(args.ldd ? make_Coord_with_padding<LayoutC::kStrideRank>(args.ldd) : args.stride_d),
       output_op(args.epilogue),
       mode(args.mode),
+      group_size(args.group_size),
+      params_scale(args.ref_scale.layout()),
+      ref_scale(args.ref_scale),
+      ref_zero(args.ref_zero),
       ptr_A(const_cast<void *>(args.ptr_A)),
       ptr_B(const_cast<void *>(args.ptr_B)),
       ptr_C(const_cast<void *>(args.ptr_C)),
@@ -665,10 +691,14 @@ protected:
 
   }
 
+  struct IteratorPack{
+    typename Mma::IteratorB iterator_B;
+    typename Mma::IteratorScale iterator_scale;
+  };
 
-  /// Iterator for fetching tile fragments from B
+  /// Iterator for fetching tile fragments from B and scales
   CUTLASS_DEVICE
-  typename Mma::IteratorB init_iterator_B(
+  IteratorPack init_iterator_B_scale(
     TileWorkDesc &tile_work,
     GemmUniversalMode mode)
   {
@@ -685,12 +715,20 @@ protected:
 
     int n_begin = tile_work.tiled_coord.n() * Mma::Shape::kN;
     int n_end = params.block_mapping.problem_size.n();
-    return typename Mma::IteratorB(
-        params.params_B,
-        ptr_B,
-        { tile_work.k_end, n_end },
+
+    IteratorPack iter{
+      typename Mma::IteratorB(
+        params.params_B, ptr_B,
+        { tile_work.k_end * kInterleave, n_end / kInterleave },
         threadIdx.x,
-        { tile_work.k_begin, n_begin });
+        { tile_work.k_begin * kInterleave, n_begin / kInterleave }),
+      typename Mma::IteratorScale(
+        params.params_scale, params.ref_scale.data(), params.ref_zero.data(),
+        {tile_work.k_end / 64, n_end},
+        threadIdx.x,
+        {tile_work.k_begin / 64, n_begin}, params.group_size)};
+
+    return iter;
   }
 
 
@@ -939,7 +977,7 @@ protected:
   {
     // Initialize input iterators
     typename Mma::IteratorA iterator_A = init_iterator_A(tile_work, params.mode);
-    typename Mma::IteratorB iterator_B = init_iterator_B(tile_work, params.mode);
+    IteratorPack iter = init_iterator_B_scale(tile_work, params.mode);
 
     // Initialize accumulators
     AccumulatorTile accumulator_tile;
@@ -947,13 +985,20 @@ protected:
 
     // Initialize MMA abstraction
     Mma mma(
-      shared_storage.main_loop,
-      thread_idx,
-      warp_idx,
-      lane_idx);
+      shared_storage.main_loop,    // shared_storage
+      params.group_size,           // group_size
+      thread_idx,                  // thread_idx
+      warp_idx,                    // warp_idx
+      lane_idx);                   // lane_idx
 
     // Perform this tile's range of multiply-accumulate (MAC) iterations
-    mma(tile_work.k_iters_remaining, accumulator_tile, iterator_A, iterator_B, accumulator_tile);
+    mma(
+      tile_work.k_iters_remaining, // gemm_k_iterations
+      accumulator_tile,            // accum
+      iterator_A,                  // iterator_A
+      iter.iterator_B,             // iterator_B
+      iter.iterator_scale,         // iterator_scale
+      accumulator_tile);           // src_accum
 
     if ((ThreadblockSwizzle::kReductionStrategy == ThreadblockSwizzle::kAtomic) ||
         (params.block_mapping.reduction_blocks == 0) ||

@@ -244,6 +244,7 @@ struct ThreadblockSwizzleStreamK {
   static void get_sk_blocks(
     int &sk_blocks,     /// [out]
     int &savings_iters, /// [out]
+    int full_waves,
     int sk_tiles,
     int iters_per_tile,
     int avail_sms,
@@ -262,38 +263,46 @@ struct ThreadblockSwizzleStreamK {
     int dp_equiv_waves = (sk_tiles + avail_sms - 1) / avail_sms;
     int dp_equiv_iters = iters_per_tile * dp_equiv_waves;
 
-    int min_sk_blocks = (allow_partial_wave) ? fast_min(avail_sms, sk_tiles + 1) : avail_sms;
-    int max_sk_blocks = fast_min(avail_sms * max_sk_occupancy, sk_iters / kMinItersPerSkBlock);
-
-    for (int trial_sk_blocks = min_sk_blocks; trial_sk_blocks <= max_sk_blocks; ++trial_sk_blocks)
+    if (full_waves == 0)
     {
-      int sk_waves = (trial_sk_blocks + avail_sms - 1) / avail_sms;
-      int max_sk_iters_per_block = (sk_iters + trial_sk_blocks - 1) / trial_sk_blocks;
-      int sk_iter_equiv = max_sk_iters_per_block * sk_waves;
+      sk_blocks = avail_sms * 2;
+      savings_iters = 1;
+    }
+    else
+    {
+      int min_sk_blocks = (allow_partial_wave) ? fast_min(avail_sms, sk_tiles + 1) : avail_sms;
+      int max_sk_blocks = fast_min(avail_sms * max_sk_occupancy, sk_iters / kMinItersPerSkBlock);
 
-      int num_peers = ((trial_sk_blocks + sk_tiles - 1) / sk_tiles) + 1;        // add one for alignment skew
-
-      float iter_cost = 0.02f * float(num_peers) * float(sk_iter_equiv);
-
-      if (trial_sk_blocks % sk_tiles == 0)
+      for (int trial_sk_blocks = min_sk_blocks; trial_sk_blocks <= max_sk_blocks; ++trial_sk_blocks)
       {
-        // aligned
-        num_peers = (trial_sk_blocks / sk_tiles);
+        int sk_waves = (trial_sk_blocks + avail_sms - 1) / avail_sms;
+        int max_sk_iters_per_block = (sk_iters + trial_sk_blocks - 1) / trial_sk_blocks;
+        int sk_iter_equiv = max_sk_iters_per_block * sk_waves;
 
-        iter_cost = 0.0f;
-      }
+        int num_peers = ((trial_sk_blocks + sk_tiles - 1) / sk_tiles) + 1;        // add one for alignment skew
 
-      float peer_cost = 2.0f * float(num_peers);
+        float iter_cost = 0.02f * float(num_peers) * float(sk_iter_equiv);
 
-      float base_cost = 2.0f * float(sk_waves);
+        if (trial_sk_blocks % sk_tiles == 0)
+        {
+          // aligned
+          num_peers = (trial_sk_blocks / sk_tiles);
 
-      int fixup_iter_equiv = int(base_cost + iter_cost + peer_cost);
+          iter_cost = 0.0f;
+        }
 
-      int trial_savings_iters = dp_equiv_iters - sk_iter_equiv - fixup_iter_equiv;
+        float peer_cost = 2.0f * float(num_peers);
 
-      if (trial_savings_iters >= savings_iters) {
-          savings_iters = trial_savings_iters;
-          sk_blocks = trial_sk_blocks;
+        float base_cost = 2.0f * float(sk_waves);
+
+        int fixup_iter_equiv = int(base_cost + iter_cost + peer_cost);
+
+        int trial_savings_iters = dp_equiv_iters - sk_iter_equiv - fixup_iter_equiv;
+
+        if (trial_savings_iters >= savings_iters) {
+            savings_iters = trial_savings_iters;
+            sk_blocks = trial_sk_blocks;
+        }
       }
     }
   }
@@ -334,6 +343,7 @@ struct ThreadblockSwizzleStreamK {
         get_sk_blocks(
           sk_blocks,
           score,
+          full_waves,
           partial_wave_tiles,
           iters_per_tile,
           avail_sms,
@@ -362,6 +372,7 @@ struct ThreadblockSwizzleStreamK {
         get_sk_blocks(
           sk_blocks,
           score,
+          full_waves,
           partial_wave_tiles,
           iters_per_tile,
           avail_sms,
@@ -382,6 +393,7 @@ struct ThreadblockSwizzleStreamK {
     get_sk_blocks(
       sk_blocks,
       score,
+      full_waves,
       partial_wave_tiles + avail_sms,
       iters_per_tile,
       avail_sms,
@@ -528,6 +540,7 @@ struct ThreadblockSwizzleStreamK {
       // remap the block indices so that we can reliably spread the SK blocks evenly across the
       // device's first SM occupancy valence. Also see get_num_blocks() and get_block_idx().
       remap_block_indices = (
+          (output_tiles / avail_sms) &&
           (sm_occupancy > 1) &&
           (device_sms_ == avail_sms) &&
           (get_num_active_blocks() > avail_sms * 2));
