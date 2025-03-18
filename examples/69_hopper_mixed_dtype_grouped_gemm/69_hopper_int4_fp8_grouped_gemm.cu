@@ -128,6 +128,8 @@ using ElementZero = cutlass::float_e4m3_t;
 // using ElementScale = cutlass::float_e4m3_t;
 // using ElementZero = float;
 using ElementScale = float;
+// using ElementScale = cutlass::half_t;
+using ElementScalePacked = cutlass::Array<ElementScale, 1>;
 using LayoutScale = cutlass::layout::RowMajor;
 
 // C/D matrix configuration
@@ -165,7 +167,7 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
 // The Scale information must get paired with the operand that will be scaled. In this example, B is scaled so we make a tuple of B's information and the scale information.
 using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
-    cute::tuple<ElementB, cutlass::Array<ElementScale, 2>>, LayoutB_Transpose *, AlignmentB,
+    cute::tuple<ElementB, ElementScalePacked>, LayoutB_Transpose *, AlignmentB,
     ElementA, LayoutA_Transpose *, AlignmentA,
     ElementAccumulator,
     TileShape, ClusterShape,
@@ -182,7 +184,7 @@ using GemmKernelScaleOnly = cutlass::gemm::kernel::GemmUniversal<
 
 // using CollectiveMainloopShuffled = typename cutlass::gemm::collective::CollectiveBuilder<
 //     ArchTag, OperatorClass,
-//     cute::tuple<ElementB, cutlass::Array<ElementScale, 2>>, LayoutB_Reordered *, AlignmentB,
+//     cute::tuple<ElementB, ElementScalePacked>, LayoutB_Reordered *, AlignmentB,
 //     ElementA, LayoutA_Transpose *, AlignmentA,
 //     ElementAccumulator,
 //     TileShape, ClusterShape,
@@ -239,7 +241,7 @@ cutlass::DeviceAllocation<QuantType> block_B;
 cutlass::DeviceAllocation<ElementB> block_B_modified;
 cutlass::DeviceAllocation<MmaType> block_B_dq;
 cutlass::DeviceAllocation<ElementScale> block_scale;
-cutlass::DeviceAllocation<cutlass::Array<ElementScale, 2>> block_scale_packed;
+cutlass::DeviceAllocation<ElementScalePacked> block_scale_packed;
 cutlass::DeviceAllocation<ElementZero> block_zero;
 cutlass::DeviceAllocation<ElementC> block_C;
 cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutput> block_D;
@@ -248,7 +250,7 @@ cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutpu
 cutlass::DeviceAllocation<const MmaType *> ptr_A;
 cutlass::DeviceAllocation<const QuantType *> ptr_B;
 cutlass::DeviceAllocation<const MmaType *> ptr_B_dq;
-cutlass::DeviceAllocation<const cutlass::Array<ElementScale, 2> *> ptr_scale_packed;
+cutlass::DeviceAllocation<const ElementScalePacked *> ptr_scale_packed;
 cutlass::DeviceAllocation<const ElementZero *> ptr_zero;
 cutlass::DeviceAllocation<const ElementC *> ptr_C;
 cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutput *> ptr_D;
@@ -415,7 +417,7 @@ void initialize(Options& options) {
   std::vector<MmaType *> ptr_B_dq_host(options.groups);
   std::vector<ElementC *> ptr_C_host(options.groups);
   std::vector<ElementC *> ptr_D_host(options.groups);
-  std::vector<cutlass::Array<ElementScale, 2> *> ptr_scale_packed_host(options.groups);
+  std::vector<ElementScalePacked *> ptr_scale_packed_host(options.groups);
   std::vector<ElementZero *> ptr_zero_host(options.groups);
   std::vector<ElementAccumulator *> ptr_alpha_host(options.groups);
   std::vector<ElementAccumulator *> ptr_beta_host(options.groups);
@@ -545,7 +547,7 @@ void initialize(Options& options) {
 
   // TODO BY JIANGS: SCALE
   // cutlass::pack_scale_fp8(block_scale.get(), block_scale_packed.get(), block_scale.size());
-  cutlass::pack_scale_fp32(block_scale.get(), block_scale_packed.get(), block_scale.size());
+  cutlass::pack_scale_fp32(block_scale.get(), block_scale_packed.get(), block_scale.size(), ElementScalePacked::kElements);
   
 
 
