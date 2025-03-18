@@ -339,6 +339,36 @@ static bool pack_scale_fp8(ElementScale const *block_in, cutlass::Array<ElementS
   return true;
 }
 
+template <class ElementScale>
+static bool pack_scale_fp32(ElementScale const *block_in, cutlass::Array<ElementScale, 2> *block_out, const size_t block_size) {
+  std::vector<ElementScale> data_in(block_size);
+  std::vector<cutlass::Array<ElementScale, 2>> data_out(block_size);
+
+  ////////////////////////////////////////////////////////////////////////////////////////
+  try {
+    cutlass::device_memory::copy_to_host(data_in.data(), block_in, block_size);
+  }
+  catch (cutlass::cuda_exception const& e) {
+    std::cerr << "CUDA Error: " << cudaGetErrorString(e.cudaError()) << std::endl;
+    return false;
+  }
+  ////////////////////////////////////////////////////////////////////////////////////////
+  for (size_t i = 0; i < block_size; i++) {
+    data_out[i][0] = data_in[i];
+    data_out[i][1] = data_in[i] * 2;
+  }
+  ////////////////////////////////////////////////////////////////////////////////////////
+  try {
+    cutlass::device_memory::copy_to_device(block_out, data_out.data(), block_size);
+  }
+  catch (cutlass::cuda_exception const& e) {
+    std::cerr << "CUDA Error: " << cudaGetErrorString(e.cudaError()) << std::endl;
+    return false;
+  }
+  ////////////////////////////////////////////////////////////////////////////////////////
+  return true;
+}
+
 template <class T, class = void>
 struct UnderlyingElement {
   using type = T;

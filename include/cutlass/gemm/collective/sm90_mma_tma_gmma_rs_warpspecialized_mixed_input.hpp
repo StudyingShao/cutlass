@@ -333,7 +333,7 @@ public:
         TileShape{},
         ClusterShape{}));  // mcast along N mode for this M load, if any
 
-   using TMA_Scale = decltype(make_tma_copy<TmaElementScale>(
+    using TMA_Scale = decltype(make_tma_copy<TmaElementScale>(
         GmemTiledCopyScale{},
         make_tensor(detail::get_logical_ptr(static_cast<NonVoidElementScale const*>(nullptr)), repeat_like(NonVoidStrideScale{}, int32_t(0)), NonVoidStrideScale{}),
         SmemLayoutScale{}(_,_,cute::Int<0>{}),
@@ -429,7 +429,18 @@ public:
       auto scale_k = (K + args.group_size - 1) / args.group_size;
       ElementScale const* ptr_S = args.ptr_S;
       StrideScale dS = args.dS;
+
+      if (thread0)
+      {
+        printf("stride scale: ");
+        print(dS);
+        printf("\n");
+      }
+
       Tensor tensor_scale = make_tensor(detail::get_logical_ptr(ptr_S), make_layout(make_shape(M,scale_k,L), dS));
+      printf("tensor_scale: ");
+      print(tensor_scale);
+      printf("\n");
       tma_load_scale = make_tma_copy<TmaElementScale>(
           GmemTiledCopyScale{},
           tensor_scale,
@@ -822,6 +833,30 @@ public:
     
     Tensor tCsB = mma_warpgroup_slice.partition_B(sB);                                        // (MMA,MMA_N,MMA_K,PIPE)
     Tensor tCrB = mma_warpgroup_slice.make_fragment_B(tCsB);                                  // (MMA,MMA_N,MMA_K,PIPE)
+
+    if (block0() && threadIdx.x == 160) {
+      printf("tiled_mma thr_layout: ");
+      print(tiled_mma.get_thr_layout_vmnk());
+      printf("\n");
+      printf("sA: ");
+      print(sA.layout());
+      printf("\n");
+      printf("tCsA: ");
+      print(tCsA.layout());
+      printf("\n");
+      printf("sB: ");
+      print(sB.layout());
+      printf("\n");
+      printf("tCsB: ");
+      print(tCsB.layout());
+      printf("\n");
+      printf("tCrB: ");
+      print(tCrB.layout());
+      printf("\naccum: ");
+      print(accum.layout());
+      printf("\n");
+    }
+
 
     //
     // Copy Atom A retiling

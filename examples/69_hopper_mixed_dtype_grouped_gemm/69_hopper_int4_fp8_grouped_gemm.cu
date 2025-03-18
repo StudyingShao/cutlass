@@ -85,6 +85,7 @@
 
 #include "helper.h"
 #include "grouped_mixed_dtype_utils.hpp"
+#include "host_validation.hpp"
 
 using namespace cute;
 
@@ -124,11 +125,14 @@ using LayoutAtomQuant = decltype(cutlass::compute_memory_reordering_atom<MmaType
 using LayoutB_Reordered = decltype(cute::tile_to_shape(LayoutAtomQuant{}, Layout<Shape<int,int,Int<1>>, StrideB>{}));
 
 using ElementZero = cutlass::float_e4m3_t;
-using ElementScale = cutlass::float_e4m3_t;
+// using ElementScale = cutlass::float_e4m3_t;
+// using ElementZero = float;
+using ElementScale = float;
 using LayoutScale = cutlass::layout::RowMajor;
 
 // C/D matrix configuration
-using         ElementC    = cutlass::half_t;                                // Element type for C and D matrix operands
+using         ElementC    = float;                                // Element type for C and D matrix operands
+// using         ElementC    = cutlass::half_t;                                // Element type for C and D matrix operands
 using         LayoutC     = cutlass::layout::RowMajor;                      // Layout type for C and D matrix operands
 constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
 
@@ -141,7 +145,7 @@ constexpr int AlignmentD  = 128 / cutlass::sizeof_bits<ElementD>::value;
 using ElementAccumulator  = float;                                          // Element type for internal accumulation
 using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<_128,_16,cute::Int<TileShapeK>>;                           // Threadblock-level tile size
+using TileShape           = Shape<_128,_16,cute::Int<TileShapeK>>;          // Threadblock-level tile size
 using ClusterShape        = Shape<_1,_1,_1>;                                // Shape of the threadblocks in a cluster
 using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
 using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
@@ -161,7 +165,7 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
 // The Scale information must get paired with the operand that will be scaled. In this example, B is scaled so we make a tuple of B's information and the scale information.
 using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
-    cute::tuple<ElementB, cutlass::Array<ElementScale, 8>>, LayoutB_Transpose *, AlignmentB,
+    cute::tuple<ElementB, cutlass::Array<ElementScale, 2>>, LayoutB_Transpose *, AlignmentB,
     ElementA, LayoutA_Transpose *, AlignmentA,
     ElementAccumulator,
     TileShape, ClusterShape,
@@ -176,25 +180,25 @@ using GemmKernelScaleOnly = cutlass::gemm::kernel::GemmUniversal<
     CollectiveEpilogue
 >;
 
-using CollectiveMainloopShuffled = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    cute::tuple<ElementB, cutlass::Array<ElementScale, 8>>, LayoutB_Reordered *, AlignmentB,
-    ElementA, LayoutA_Transpose *, AlignmentA,
-    ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    KernelSchedule
-  >::CollectiveOp;
+// using CollectiveMainloopShuffled = typename cutlass::gemm::collective::CollectiveBuilder<
+//     ArchTag, OperatorClass,
+//     cute::tuple<ElementB, cutlass::Array<ElementScale, 2>>, LayoutB_Reordered *, AlignmentB,
+//     ElementA, LayoutA_Transpose *, AlignmentA,
+//     ElementAccumulator,
+//     TileShape, ClusterShape,
+//     cutlass::gemm::collective::StageCountAutoCarveout<
+//       static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+//     KernelSchedule
+//   >::CollectiveOp;
 
-using GemmKernelShuffled = cutlass::gemm::kernel::GemmUniversal<
-    ProblemShape, 
-    CollectiveMainloopShuffled,
-    CollectiveEpilogue
->;
+// using GemmKernelShuffled = cutlass::gemm::kernel::GemmUniversal<
+//     ProblemShape, 
+//     CollectiveMainloopShuffled,
+//     CollectiveEpilogue
+// >;
 
 using GemmScaleOnly = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleOnly>;
-using GemmShuffled  = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelShuffled>;
+// using GemmShuffled  = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelShuffled>;
 
 using StrideC = typename GemmKernelScaleOnly::InternalStrideC;
 using StrideD = typename GemmKernelScaleOnly::InternalStrideD;
@@ -235,7 +239,7 @@ cutlass::DeviceAllocation<QuantType> block_B;
 cutlass::DeviceAllocation<ElementB> block_B_modified;
 cutlass::DeviceAllocation<MmaType> block_B_dq;
 cutlass::DeviceAllocation<ElementScale> block_scale;
-cutlass::DeviceAllocation<cutlass::Array<ElementScale, 8>> block_scale_packed;
+cutlass::DeviceAllocation<cutlass::Array<ElementScale, 2>> block_scale_packed;
 cutlass::DeviceAllocation<ElementZero> block_zero;
 cutlass::DeviceAllocation<ElementC> block_C;
 cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutput> block_D;
@@ -244,7 +248,7 @@ cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutpu
 cutlass::DeviceAllocation<const MmaType *> ptr_A;
 cutlass::DeviceAllocation<const QuantType *> ptr_B;
 cutlass::DeviceAllocation<const MmaType *> ptr_B_dq;
-cutlass::DeviceAllocation<const cutlass::Array<ElementScale, 8> *> ptr_scale_packed;
+cutlass::DeviceAllocation<const cutlass::Array<ElementScale, 2> *> ptr_scale_packed;
 cutlass::DeviceAllocation<const ElementZero *> ptr_zero;
 cutlass::DeviceAllocation<const ElementC *> ptr_C;
 cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutput *> ptr_D;
@@ -284,6 +288,7 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
 
     this->Base::parse(argc, args);
 
+    // Only have implementation of mode 1 (scale only)
     mode = 1; // override the mode value to always be scale only mode
   }
 
@@ -341,7 +346,8 @@ void allocate(Options const& options) {
     auto N = get<1>(problem);
     auto K = get<2>(problem);
 
-    const int scale_k = 1;
+    // const int scale_k = 1;
+    const int scale_k = K / options.c;
 
     offset_A.push_back(total_elements_A);
     offset_B.push_back(total_elements_B * cutlass::sizeof_bits<QuantType>::value / 8);
@@ -395,7 +401,7 @@ void allocate(Options const& options) {
 /// Initialize operands to be used in the GEMM and reference GEMM
 void initialize(Options& options) {
 
-  uint64_t seed = 2020;
+  [[maybe_unused]]uint64_t seed = 2020;
 
   problem_sizes.reset(options.groups);
   problem_sizes.copy_from_host(options.problem_sizes_host.data());
@@ -409,14 +415,15 @@ void initialize(Options& options) {
   std::vector<MmaType *> ptr_B_dq_host(options.groups);
   std::vector<ElementC *> ptr_C_host(options.groups);
   std::vector<ElementC *> ptr_D_host(options.groups);
-  std::vector<cutlass::Array<ElementScale, 8> *> ptr_scale_packed_host(options.groups);
+  std::vector<cutlass::Array<ElementScale, 2> *> ptr_scale_packed_host(options.groups);
   std::vector<ElementZero *> ptr_zero_host(options.groups);
   std::vector<ElementAccumulator *> ptr_alpha_host(options.groups);
   std::vector<ElementAccumulator *> ptr_beta_host(options.groups);
 
   for (int32_t i = 0; i < options.groups; ++i) {
     ptr_A_host.at(i) = block_A.get() + offset_A.at(i);
-    ptr_B_host.at(i) = block_B_modified.get() + offset_B.at(i);
+    // ptr_B_host.at(i) = block_B_modified.get() + offset_B.at(i);
+    ptr_B_host.at(i) = block_B.get() + offset_B.at(i);
     ptr_B_dq_host.at(i) = block_B_dq.get() + offset_B_dq.at(i);
     ptr_C_host.at(i) = block_C.get() + offset_C.at(i);
     ptr_D_host.at(i) = block_D.get() + offset_D.at(i);
@@ -478,12 +485,70 @@ void initialize(Options& options) {
   beta_device.reset(options.groups);
   beta_device.copy_from_host(ptr_beta_host.data());
 
-  initialize_tensor(block_A, seed + 2023);
-  initialize_quant_tensor(block_B, seed + 2022);
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////
+  
+  // block_A -> cutlass::DeviceAllocation<MmaType>
+  // initialize_tensor(block_A, seed + 2023);
+  
+  print("jiangs block_A (size=%d)\n", int(block_A.size())); // block_A (size=512)  
+  // print_device<<<1, 1>>>(block_A.get(), block_A.size());
+  set_device<<<1, 1>>>(block_A.get(), block_A.size());
+  print_device<<<1, 1>>>(block_A.get(), block_A.size());
+  cudaDeviceSynchronize();
+
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////
+  
+  // initialize_quant_tensor(block_B, seed + 2022);
+
+  float scope_min = float(cutlass::platform::numeric_limits<QuantType>::lowest());
+  float scope_max = float(cutlass::platform::numeric_limits<QuantType>::max());
+  print("jiangs block_B (size=%d) min=%f max=%f\n",
+    int(block_B.size()), scope_min, scope_max); // jiangs block_B (size=4096) min=-8.000000 max=7.000000
+  // print_device<<<1, 1>>>(block_B.get(), block_B.size());  
+  set_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 0);
+  print_device_int4<<<1, 1>>>(block_B.get(), block_B.size());
+
+
   cutlass::unified_encode_int4b(block_B.get(), block_B_modified.get(), block_B.size());
-  initialize_tensor(block_C, seed + 2021);
-  initialize_scale(block_scale, options);
-  cutlass::pack_scale_fp8(block_scale.get(), block_scale_packed.get(), block_scale.size());
+  
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////
+  
+  print("jiangs block_C (size=%d)\n", int(block_C.size())); // block_C (size=16)
+  print_device<<<1, 1>>>(block_C.get(), block_C.size());  
+  // initialize_tensor(block_C, seed + 2021);
+  print_device<<<1, 1>>>(block_C.get(), block_C.size());  
+  cudaDeviceSynchronize();
+  
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////
+  
+  print("jiangs block_scale (size=%d)\n", int(block_scale.size())); // block_scale (size=16)
+  print_device<<<1, 1>>>(block_scale.get(), block_scale.size());  
+  set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size());
+  // initialize_scale(block_scale, options);
+  print_device<<<1, 1>>>(block_scale.get(), block_scale.size());
+  cudaDeviceSynchronize();
+  
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  groupwise_verify(
+    problem_sizes.get(),
+    options.groups,
+    block_A.get(), block_B.get(), block_scale.get(), block_ref_D.get(),
+    128,
+    stride_A.get(), stride_B.get()
+  );
+
+  printf("block_D_ref: ");
+  print_device<<<1,1>>>(block_ref_D.get(), block_ref_D.size());
+  /////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+  // TODO BY JIANGS: SCALE
+  // cutlass::pack_scale_fp8(block_scale.get(), block_scale_packed.get(), block_scale.size());
+  cutlass::pack_scale_fp32(block_scale.get(), block_scale_packed.get(), block_scale.size());
+  
+
+
   initialize_zero(block_zero, options);
   block_alpha.copy_from_host(alpha_host.data());
   block_beta.copy_from_host(beta_host.data());
@@ -522,12 +587,13 @@ typename Gemm::Arguments args_from_options(Options const& options, bool host_pro
 {
   using Args = typename Gemm::Arguments;
   auto&& dB = [&]() {
-    if constexpr (cute::is_same_v<Gemm, GemmShuffled>) { // offline swizzling is enabled.
-      return layout_B_reordered.get();
-    }
-    else {
-      return stride_B.get();
-    }
+    // if constexpr (cute::is_same_v<Gemm, GemmShuffled>) { // offline swizzling is enabled.
+    //   return layout_B_reordered.get();
+    // }
+    // else {
+    //   return stride_B.get();
+    // }
+    return stride_B.get();
   }();
   cutlass::KernelHardwareInfo hw_info;
   // Change device_id to another value if you are running on a machine with multiple GPUs and wish
@@ -562,10 +628,13 @@ typename Gemm::Arguments args_from_options(Options const& options, bool host_pro
     fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
     fusion_args.dBeta = {cute::_0{}, cute::_0{}, 1};
   }
+
+  // printf("chunk size = %d\n", options.c);
+
   arguments = Args {
     cutlass::gemm::GemmUniversalMode::kGrouped,
     {options.groups, problem_sizes.get(), nullptr},
-    {ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_scale_packed.get(), stride_S.get(), options.k},
+    {ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_scale_packed.get(), stride_S.get(), options.c},
     {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
     hw_info
   };
@@ -630,7 +699,9 @@ bool verify(Options const& options) {
       stride_A_verif = cutlass::make_cute_packed_stride(StrideA_verif{}, cute::make_shape(M, K, 1));
       stride_B_verif = cutlass::make_cute_packed_stride(StrideB_verif{}, cute::make_shape(N, K, 1));
 
-      const int scale_k = 1;
+      // const int scale_k = 1;
+      const int scale_k = K / options.c;
+
       auto layout_B = make_layout(cute::make_shape(N, K, Int<1>{}), stride_B_host.at(i));
       auto layout_scale_zero = make_layout(cute::make_shape(N, scale_k, Int<1>{}), stride_S_host_ref.at(i));
       cudaStream_t stream = cudaStreamDefault;
@@ -648,12 +719,12 @@ bool verify(Options const& options) {
       };
 
       // Run the gemm where the scaling is performed outside of the kernel.
-      GemmRef gemm_ref;
-      size_t workspace_size = GemmRef::get_workspace_size(arguments);
-      cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-      CUTLASS_CHECK(gemm_ref.can_implement(arguments));
-      CUTLASS_CHECK(gemm_ref.initialize(arguments, workspace.get()));
-      CUTLASS_CHECK(gemm_ref.run());
+      // GemmRef gemm_ref;
+      // size_t workspace_size = GemmRef::get_workspace_size(arguments);
+      // cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+      // CUTLASS_CHECK(gemm_ref.can_implement(arguments));
+      // CUTLASS_CHECK(gemm_ref.initialize(arguments, workspace.get()));
+      // CUTLASS_CHECK(gemm_ref.run());
 
       // Wait for kernel to finish
       CUDA_CHECK(cudaDeviceSynchronize());
@@ -662,6 +733,12 @@ bool verify(Options const& options) {
       std::cout << "Group: " << i << " Status: " << passed << std::endl;
     }
   }
+
+  compare_device<<<1,1>>>(block_D.get(), block_ref_D.get(), block_D.size());
+  // printf("block_D: ");
+  // print_device<<<1,1>>>(block_D.get(), block_D.size());
+
+
   return passed;
 }
 
@@ -680,6 +757,8 @@ int run(Options &options, bool host_problem_shapes_available = true)
 
   // Using the arguments, query for extra workspace required for matrix multiplication computation
   size_t workspace_size = Gemm::get_workspace_size(arguments);
+
+  printf("workspace_size = %ld\n", workspace_size);
 
   // Allocate workspace memory
   cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
@@ -752,7 +831,7 @@ int main(int argc, char const **args) {
   std::cout << "Running in per-column scale mode." << std::endl;
   if (options.shuffle) {
     std::cout << "Offline shuffle enabled." << std::endl;
-    run<GemmShuffled>(options, false);
+    // run<GemmShuffled>(options, false);
   } else {
     std::cout << "Offline shuffle disabled." << std::endl;
     run<GemmScaleOnly>(options, false);

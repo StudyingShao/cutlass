@@ -342,6 +342,8 @@ struct CollectiveBuilder<
        sizeof_bits<ElementA_>::value != sizeof_bits<ElementB_>::value)>
 > {
 
+// 应该就是这里了
+
 private:
   using ScaleA = detail::deduce_mixed_width_dtype_t<1, ElementA_>;
   using ScaleB = detail::deduce_mixed_width_dtype_t<1, ElementB_>;

@@ -58,8 +58,9 @@ public:
     void parse(int argc, char const **args) {
         cutlass::CommandLine cmd(argc, args);
         cmd.get_cmd_line_argument("groups", groups);
-        cmd.get_cmd_line_argument("c", c);
         MixedDtypeOptions::parse(argc, args);
+        c = k;
+        cmd.get_cmd_line_argument("c", c);
 
         problem_sizes_host = benchmark_path.empty() ? randomize_problems(cmd) : load_benchmark_problems();
     }
@@ -72,6 +73,7 @@ public:
             << "  --n=<int>                   Sets the N extent of the GEMM for all groups\n"
             << "  --k=<int>                   Sets the K extent of the GEMM for all groups\n"
             << "  --groups=<int>              Sets the number of individual GEMM problems\n"
+            << "  --c=<int>                   The size of each chunk for the scales and zeros. To broadcast a vector of scales or zeros, set the group size to K.\n"
             << "  --mode=<int>                The mode to run the gemm\n"
             << "  --alpha=<f32>               Epilogue scalar alpha\n"
             << "  --beta=<f32>                Epilogue scalar beta\n"

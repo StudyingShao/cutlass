@@ -74,7 +74,7 @@ struct integer_subbyte {
   template<class T,
     class Enable = cutlass::platform::enable_if_t<cutlass::platform::is_convertible_v<T, int>>
   >
-  [[deprecated("Implicit conversion is deprecated; please use explicit construction instead")]]
+  // [[deprecated("Implicit conversion is deprecated; please use explicit construction instead")]]
   CUTLASS_HOST_DEVICE
   integer_subbyte(T value)
       : integer_subbyte(static_cast<xint_t>(value)) {}

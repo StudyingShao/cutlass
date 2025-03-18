@@ -209,6 +209,7 @@ template <class MMA_Atom,
           class PermutationMNK = Tile<Underscore,Underscore,Underscore>>
 struct TiledMMA : MMA_Atom
 {
+  // jiangs TiledMMA
   using Atom           = MMA_Atom;
   using AtomShape_MNK  = typename MMA_Atom::Shape_MNK;
   using AtomThrID      = typename MMA_Atom::ThrID;
@@ -581,6 +582,9 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
                MMAThrLayout     const& thr_layout   = {},
                Permutations     const& permutations = {})
 {
+
+  // mma_atom.jiangs;
+
   auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});
   auto permutation_mnk = append<3>(permutations, _);
 
@@ -598,6 +602,9 @@ make_tiled_mma(MMA_Op       const&,
                MMAThrLayout const& thr_layout   = {},
                Permutations const& permutations = {})
 {
+
+  // mma_atom.jiangs;
+
   // Attempt to wrap in an MMA_Atom<> and forward
   return make_tiled_mma(MMA_Atom<MMA_Op>{}, thr_layout, permutations);
 }
