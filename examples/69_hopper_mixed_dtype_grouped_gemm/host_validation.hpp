@@ -96,7 +96,7 @@ __global__ void compare_device(T *ptr1, T *ptr2, int count) {
     
     if (thread0())
     {
-        printf("compare_device -----------------------------------------------\n");
+        // printf("compare_device -----------------------------------------------\n");
         for (int i = 0; i < count; i++)
         {
             float abs_error = abs(float(ptr1[i]) - float(ptr2[i]));
@@ -227,7 +227,7 @@ void groupwise_verify(
     int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
-    printf("jiangs func start -----------------------------------------------------\n");
+    // printf("jiangs func start -----------------------------------------------------\n");
     groupwise_verify_kernel<<<1024, 1024>>>(
         problem_sizes, 
         group_num, 
@@ -235,5 +235,5 @@ void groupwise_verify(
         group_size,
         stride_A, stride_B);
     cudaDeviceSynchronize();
-    printf("jiangs func end   -----------------------------------------------------\n");
+    // printf("jiangs func end   -----------------------------------------------------\n");
 }

@@ -330,7 +330,7 @@ public:
       //
       int smem_size = GemmKernel::SharedStorageSize;
 
-      printf("jiangs smem_size = %d\n", smem_size);
+      // printf("jiangs smem_size = %d\n", smem_size);
 
       CUTLASS_ASSERT(cuda_adapter == nullptr);
 
