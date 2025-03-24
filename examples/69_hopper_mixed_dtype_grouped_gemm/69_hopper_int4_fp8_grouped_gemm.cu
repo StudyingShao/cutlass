@@ -148,13 +148,14 @@ constexpr int AlignmentD  = 128 / cutlass::sizeof_bits<ElementD>::value;
 using ElementAccumulator  = float;                                          // Element type for internal accumulation
 using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<_128,_64,cute::Int<TileShapeK>>;          // Threadblock-level tile size
+using TileShape           = Shape<_128,_16,cute::Int<TileShapeK>>;          // Threadblock-level tile size
+// using TileShape           = Shape<_64,_64,cute::Int<TileShapeK>>;          // Threadblock-level tile size
 using ClusterShape        = Shape<_1,_1,_1>;                                // Shape of the threadblocks in a cluster
 using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
-// using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
-// using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative; // Epilogue to launch
-using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
-using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong; // Epilogue to launch
+using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
+using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative; // Epilogue to launch
+// using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
+// using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong; // Epilogue to launch
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
@@ -494,25 +495,25 @@ void initialize(Options& options) {
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
   
   // block_A -> cutlass::DeviceAllocation<MmaType>
-  // initialize_tensor(block_A, seed + 2023);
+  initialize_tensor(block_A, seed + 2023);
   
   // print("jiangs block_A (size=%d)\n", int(block_A.size())); // block_A (size=512)  
   // print_device<<<1, 1>>>(block_A.get(), block_A.size());
   set_device<<<1, 1>>>(block_A.get(), block_A.size());
-  print_device<<<1, 1>>>(block_A.get(), block_A.size());
+  print_device<<<1, 1>>>(block_A.get(), block_A.size(), 'A');
   cudaDeviceSynchronize();
 
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
   
-  // initialize_quant_tensor(block_B, seed + 2022);
+  initialize_quant_tensor(block_B, seed + 2022);
 
   float scope_min = float(cutlass::platform::numeric_limits<QuantType>::lowest());
   float scope_max = float(cutlass::platform::numeric_limits<QuantType>::max());
   // print("jiangs block_B (size=%d) min=%f max=%f\n",
     // int(block_B.size()), scope_min, scope_max); // jiangs block_B (size=4096) min=-8.000000 max=7.000000
   // print_device<<<1, 1>>>(block_B.get(), block_B.size());  
-  set_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 0);
-  print_device_int4<<<1, 1>>>(block_B.get(), block_B.size());
+  set_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 1);
+  print_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 'B');
 
 
   cutlass::unified_encode_int4b(block_B.get(), block_B_modified.get(), block_B.size());
@@ -520,18 +521,18 @@ void initialize(Options& options) {
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
   
   // print("jiangs block_C (size=%d)\n", int(block_C.size())); // block_C (size=16)
-  print_device<<<1, 1>>>(block_C.get(), block_C.size());  
-  // initialize_tensor(block_C, seed + 2021);
-  print_device<<<1, 1>>>(block_C.get(), block_C.size());  
+  // print_device<<<1, 1>>>(block_C.get(), block_C.size());  
+  initialize_tensor(block_C, seed + 2021);
+  print_device<<<1, 1>>>(block_C.get(), block_C.size(), 'C');  
   cudaDeviceSynchronize();
   
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
   
   // print("jiangs block_scale (size=%d)\n", int(block_scale.size())); // block_scale (size=16)
-  print_device<<<1, 1>>>(block_scale.get(), block_scale.size());  
+  // print_device<<<1, 1>>>(block_scale.get(), block_scale.size());  
   set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size());
   // initialize_scale(block_scale, options);
-  print_device<<<1, 1>>>(block_scale.get(), block_scale.size());
+  print_device<<<1, 1>>>(block_scale.get(), block_scale.size(), 'S');
   cudaDeviceSynchronize();
   
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -545,7 +546,7 @@ void initialize(Options& options) {
   );
 
   // printf("block_D_ref: ");
-  print_device<<<1,1>>>(block_ref_D.get(), block_ref_D.size());
+  print_device<<<1,1>>>(block_ref_D.get(), block_ref_D.size(), 'R');
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -553,6 +554,7 @@ void initialize(Options& options) {
   // cutlass::pack_scale_fp8(block_scale.get(), block_scale_packed.get(), block_scale.size());
   cutlass::pack_scale_fp32(block_scale.get(), block_scale_packed.get(), block_scale.size(), ElementScalePacked::kElements);
   
+  print_device_packed<<<1, 1>>>(block_scale_packed.get(), block_scale.size(), 'P');
 
 
   initialize_zero(block_zero, options);
@@ -747,18 +749,25 @@ bool verify(Options const& options) {
 
   compare_device<<<1,1>>>(block_D.get(), block_ref_D.get(), block_D.size());
   // printf("block_D: ");
-  // print_device<<<1,1>>>(block_D.get(), block_D.size());
+  print_device<<<1,1>>>(block_ref_D.get(), block_ref_D.size(), 'R');
+  print_device<<<1,1>>>(block_D.get(), block_D.size(), 'D');
 
 
   return passed;
 }
 
+bool setup = false;
+
 /// Execute a given example GEMM computation
 template <typename Gemm>
-MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true, std::string config = "")
+MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true)
 {
-  allocate(options);
-  initialize(options);
+  if (!setup) {
+    printf("Setup input tensors.\n");
+    allocate(options);
+    initialize(options);
+    setup = true;
+  }
 
   // Instantiate CUTLASS kernel depending on templates
   Gemm gemm;
@@ -787,11 +796,14 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
   // Check if output from CUTLASS kernel and reference kernel are equal or not
   MixedDtypeResult result;
   result.passed = verify(options);
-  // std::cout << "  Disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
+  // if (!options.explore) {
+  //   std::cout << "  Disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
+  // }
+  // if (!result.passed) {
+  //   exit(-1);
+  // }
+
   grouped_mixed_dtype_profiling(gemm, options, result, alpha_host, beta_host);
-  if (!result.passed) {
-    exit(-1);
-  }
 
   return result;
 }

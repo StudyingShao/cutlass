@@ -536,6 +536,12 @@ public:
 
       auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
       work_tile_info = next_work_tile_info;
+
+      // if (warp_group_thread_idx == 0 && block0()){
+      //   printf("Consumer1 block %d warp_group_idx %d k_tile_count %d work_tile_info(%d,%d,%d) valid %d\n",
+      //     blockIdx.x, warp_group_idx, k_tile_count, work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx, work_tile_info.is_valid());
+      // }
+
       if (!work_tile_info.is_valid()) {
         return;
       }
@@ -768,6 +774,14 @@ public:
     } // Producer Warp Group End
 
     else if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
+      // if (warp_group_thread_idx == 0) {
+      //   printf("WarpGroupRole::Consumer 1 block %d warp_group_idx %d warp %d work_tile_info(%d,%d,%d) valid %d %d\n",
+      //     blockIdx.x, warp_group_idx, threadIdx.x/32,
+      //     work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx, 
+      //     work_tile_info.is_valid(), TileScheduler::valid_warpgroup_in_work_tile(work_tile_info));
+      //   printf("\n");
+      // }
+      
       cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
       // Index of warp group within consumer warp groups
@@ -828,6 +842,14 @@ public:
         if (TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
 
           math_wg_order_barrier.wait();
+
+          // if (threadIdx.x % 32 == 0) {
+          //   printf("WarpGroupRole::Consumer block %d warp_group_idx %d warp %d work_tile_info(%d,%d,%d) valid %d %d\n",
+          //     blockIdx.x, warp_group_idx, threadIdx.x/32,
+          //     work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx, 
+          //     work_tile_info.is_valid(), TileScheduler::valid_warpgroup_in_work_tile(work_tile_info));
+          //   printf("\n");
+          // }
 
           collective_mainloop.mma(
             mainloop_pipeline,

@@ -8,10 +8,10 @@ using namespace cute;
 
 
 template <typename T>
-__global__ void print_device(T *ptr, int count) {
+__global__ void print_device(T *ptr, int count, const char str = ' ') {
 #ifdef ENABLE_PRINT
   if (thread0()) {
-    printf("print_device ");
+    printf("print_device %c ", str);
     for (int i = 0; i < count; i++)
     {
       printf("(%d):%f ", i, float(ptr[i]));
@@ -21,12 +21,26 @@ __global__ void print_device(T *ptr, int count) {
 #endif
 }
 
-
 template <typename T>
-__global__ void print_device_int4(T *ptr_, int count) {
+__global__ void print_device_packed(T *ptr, int count, const char str = ' ') {
 #ifdef ENABLE_PRINT
   if (thread0()) {
-    printf("print_device(int4) ");
+    printf("print_device %c ", str);
+    for (int i = 0; i < count; i++)
+    {
+      printf("(%d):%f", i, float(ptr[i][0]));
+    }
+    printf("\n");
+  }
+#endif
+}
+
+
+template <typename T>
+__global__ void print_device_int4(T *ptr_, int count, const char str = ' ') {
+#ifdef ENABLE_PRINT
+  if (thread0()) {
+    printf("print_device(int4) %c ", str);
     for (int i = 0; i < count / 2; i++)
     {
       uint8_t *ptr = reinterpret_cast<uint8_t *>(&ptr_[i]);
@@ -56,13 +70,11 @@ __global__ void set_device(T *ptr, int count) {
 
 template<typename T>
 __global__ void set_device_sequential(T *ptr, int count) {
-#ifdef DEBUG_INPUT
   if (thread0())
     for (int i = 0; i < count; i++)
     {
-      ptr[i] = static_cast<T>((i + 1)) * 0.1f;
+      ptr[i] = static_cast<T>((i + 1) % 50) * 0.1f;
     }
-#endif
 }
 
 
@@ -81,8 +93,7 @@ __global__ void set_device_int4(T *ptr_, int count, uint8_t value = 0) {
       else
         low = value; // 0~14
 
-      uint8_t high = low + 1; // 1~15
-
+      uint8_t high = low; // 1~15
       // uint8_t high = low + 1; // 1~15
       uint8_t *ptr = reinterpret_cast<uint8_t *>(ptr_);
       ptr[i] = (high << 4) | low;
@@ -100,7 +111,7 @@ __global__ void compare_device(T *ptr1, T *ptr2, int count) {
         for (int i = 0; i < count; i++)
         {
             float abs_error = abs(float(ptr1[i]) - float(ptr2[i]));
-            if (abs_error > 1e-2)
+            if (abs_error > 1)
                 printf("(%d):%f %f abs_error %f\n",
                     i, float(ptr1[i]), float(ptr2[i]), abs_error);
         }

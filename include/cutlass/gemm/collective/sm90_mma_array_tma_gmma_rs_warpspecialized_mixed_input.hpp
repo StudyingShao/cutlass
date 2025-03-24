@@ -958,11 +958,7 @@ public:
     //   print(tCsB.layout());
     //   printf("\n");
     //   printf("tCrB: ");
-    //   print(tCrB.layout());
     //   // tCrB: (_1,_1,_4,(_1,_19)):(_0,_0,_2,(_0,_128))
-    //   // print(tCrB.layout());
-    //   printf("\ntCrB.size: ");
-    //   print(tCrB.size());
     //   printf("\ntCrB.layout: ");
     //   print(tCrB.layout());
     //   printf("\ntCrB.stride: ");
@@ -1038,25 +1034,34 @@ public:
       
       Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
       
+      // if (block0() && threadIdx.x == 160) {
+      //   auto tCsS = cute::get<0>(partitioned_extra_info);
+      //   auto tCrS = cute::get<1>(partitioned_extra_info);
+      //   printf("tCsS: ");
+      //   print(tCsS.layout());
+      //   printf("\n");
+      //   printf("tCrS: ");
+      //   print(tCrS.layout());
+      //   printf("\n");
+      // }
+
       // if (threadIdx.x % 128 == 0) {
-      //   // tCsS     ((_4,_2,_2),_1,_1,(_1,_19)):((_0,_8,_0),_0,_0,(_0,_128))
+      //   // tCsS ((_4,_2,_2),_1,_1,(_1,_19)):((_0,_8,_0),_0,_0,(_0,_128))
       //   // tCrS ((_4,_2,_2),_1,_1):((_0,_1,_0),_0,_0)
 
       //   // printf("\njiangs -----------------------------------------------------------\n");
       //   auto tCsS = cute::get<0>(partitioned_extra_info);
       //   auto tCrS = cute::get<1>(partitioned_extra_info);
-      //   // print(tCsS.layout());
-      //   // print(tCrS.layout());
-      //   printf("\nmma tCsS btwl(%d,%d,%d,%d)   %f %f %f %f\n",
-      //     blockIdx.x, threadIdx.x, threadIdx.x / 32, threadIdx.x % 32,
+      //   printf("\nmma tCsS b_wg_w_t(%d,%d,%d,%d)   %f %f %f %f\n",
+      //     blockIdx.x, threadIdx.x/128, threadIdx.x/32, threadIdx.x%128,
       //     float(tCsS(make_tuple(0,0,0),0,0,0)[0]),
       //     float(tCsS(make_tuple(0,1,0),0,0,0)[0]),
       //     float(tCsS(make_tuple(1,0,0),0,0,0)[0]),
       //     float(tCsS(make_tuple(0,0,1),0,0,0)[0])
       //   );
 
-      //   printf("\nmma tCrS btwl(%d,%d,%d,%d)   %f %f %f %f\n",
-      //     blockIdx.x, threadIdx.x, threadIdx.x / 32, threadIdx.x % 32,
+      //   printf("\nmma tCrS b_wg_w_t(%d,%d,%d,%d)   %f %f %f %f\n",
+      //     blockIdx.x, threadIdx.x/128, threadIdx.x/32, threadIdx.x%128,
       //     float(tCrS(make_tuple(0,0,0),0,0)[0]),
       //     float(tCrS(make_tuple(0,1,0),0,0)[0]),
       //     float(tCrS(make_tuple(1,0,0),0,0)[0]),
@@ -1083,9 +1088,8 @@ public:
         cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate);
         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
-        // if (float(intermediate(make_tuple(0,0,0), 0,0)) > 0.0001 || float(intermediate(make_tuple(0,0,0), 0,0)) < -0.0001)
-        // {
-        //   printf("jiangs after k_block %d read_stage %d b_wg_w_t(%d,%d,%d,%d) %f %f %f %f %f %f %f %f\n",
+        // if (float(intermediate(make_tuple(0,0,0), 0,0)) > 0.0001 || float(intermediate(make_tuple(0,0,0), 0,0)) < -0.0001) {
+        //   printf("jiangs after k_block %d read_stage %d b_wg_w_t(%d,%d,%d,%d) %f %f %f %f %f %f %f %f | %f %f %f %f %f %f %f %f\n",
         //     k_block, read_stage,
         //     blockIdx.x, threadIdx.x/128, threadIdx.x/32, threadIdx.x%128,
         //     float(intermediate(make_tuple(0,0,0), 0,0)),
@@ -1095,7 +1099,15 @@ public:
         //     float(intermediate(make_tuple(1,0,0), 0,0)),
         //     float(intermediate(make_tuple(1,0,1), 0,0)),
         //     float(intermediate(make_tuple(1,1,0), 0,0)),
-        //     float(intermediate(make_tuple(1,1,1), 0,0))
+        //     float(intermediate(make_tuple(1,1,1), 0,0)),
+        //     float(intermediate(make_tuple(0,0,0), 1,0)), // 
+        //     float(intermediate(make_tuple(0,0,1), 1,0)),
+        //     float(intermediate(make_tuple(0,1,0), 1,0)),
+        //     float(intermediate(make_tuple(0,1,1), 1,0)),
+        //     float(intermediate(make_tuple(1,0,0), 1,0)),
+        //     float(intermediate(make_tuple(1,0,1), 1,0)),
+        //     float(intermediate(make_tuple(1,1,0), 1,0)),
+        //     float(intermediate(make_tuple(1,1,1), 1,0))
         //   );
         // }
 
@@ -1113,15 +1125,17 @@ public:
       warpgroup_fence_operand(intermediate);
 
       // Apply the group-wise scaling
-      // tCrS  ((4,_2,_2),_1,_1):((_0,_1,_0),_0,_0)
-      // accum ((2,_2,_2),_1,_1):((_0,_1,_0),_0,_0)
+      // tCrS  ((4, _2, _2), MMA_M, _1)
+      // accum ((2, _2, _2), MMA_M, _1)
       auto tCrS = cute::get<1>(partitioned_extra_info);
-      for (int m = 0; m < size<0, 1>(accum); m++) {
-        for (int n = 0; n < size<0, 2>(accum); n++) {
-          for (int e = 0; e < size<0, 0>(accum); e++) {
-            auto accum_coord = make_coord(make_tuple(e, m, n), 0, 0);
-            auto scale_coord = make_coord(make_tuple(0, m, 0), 0, 0);
-            accum(accum_coord) = intermediate(accum_coord) * tCrS(scale_coord)[0];
+      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+        for (int m = 0; m < size<0, 1>(accum); m++) {
+          for (int n = 0; n < size<0, 2>(accum); n++) {
+            for (int e = 0; e < size<0, 0>(accum); e++) {
+              auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+              accum(accum_coord) = intermediate(accum_coord) * tCrS(scale_coord)[0];
+            }
           }
         }
       }
@@ -1203,12 +1217,14 @@ public:
 
           // Apply the group-wise scaling
           auto tCrS = cute::get<1>(partitioned_extra_info);
-          for (int m = 0; m < size<0, 1>(accum); m++) {
-            for (int n = 0; n < size<0, 2>(accum); n++) {
-              for (int e = 0; e < size<0, 0>(accum); e++) {
-                auto accum_coord = make_coord(make_tuple(e, m, n), 0, 0);
-                auto scale_coord = make_coord(make_tuple(0, m, 0), 0, 0);
-                accum(accum_coord) = fma(intermediate(accum_coord), tCrS(scale_coord)[0], accum(accum_coord));
+          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+            for (int m = 0; m < size<0, 1>(accum); m++) {
+              for (int n = 0; n < size<0, 2>(accum); n++) {
+                for (int e = 0; e < size<0, 0>(accum); e++) {
+                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                  accum(accum_coord) = fma(intermediate(accum_coord), tCrS(scale_coord)[0], accum(accum_coord));
+                }
               }
             }
           }
@@ -1314,12 +1330,14 @@ public:
 
       // Apply the group-wise scaling
       auto tCrS = cute::get<1>(partitioned_extra_info);
-      for (int m = 0; m < size<0, 1>(accum); m++) {
-        for (int n = 0; n < size<0, 2>(accum); n++) {
-          for (int e = 0; e < size<0, 0>(accum); e++) {
-            auto accum_coord = make_coord(make_tuple(e, m, n), 0, 0);
-            auto scale_coord = make_coord(make_tuple(0, m, 0), 0, 0);
-            accum(accum_coord) = fma(intermediate(accum_coord), tCrS(scale_coord)[0], accum(accum_coord));
+      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+        for (int m = 0; m < size<0, 1>(accum); m++) {
+          for (int n = 0; n < size<0, 2>(accum); n++) {
+            for (int e = 0; e < size<0, 0>(accum); e++) {
+              auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+              accum(accum_coord) = fma(intermediate(accum_coord), tCrS(scale_coord)[0], accum(accum_coord));
+            }
           }
         }
       }
