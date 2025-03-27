@@ -123,8 +123,6 @@ template <
 >
 void dispatch_TileShape(Options options, std::vector<MixedDtypeResult> &results, std::vector<std::string> &configs, std::string config) {
 
-    static const int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
-
     if constexpr (std::is_same_v<KernelSchedule, cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>) {
         
         capture_results<KernelSchedule, ClusterShape, Shape< _64, _16, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape< _64, _16, _" + std::to_string(TileShapeK) + ">");
@@ -136,11 +134,17 @@ void dispatch_TileShape(Options options, std::vector<MixedDtypeResult> &results,
     capture_results<KernelSchedule, ClusterShape, Shape<_128, _16, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_128, _16, _" + std::to_string(TileShapeK) + ">");
     capture_results<KernelSchedule, ClusterShape, Shape<_128, _32, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_128, _32, _" + std::to_string(TileShapeK) + ">");
     capture_results<KernelSchedule, ClusterShape, Shape<_128, _64, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_128, _64, _" + std::to_string(TileShapeK) + ">");
-    capture_results<KernelSchedule, ClusterShape, Shape<_128,_128, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_128,_128, _" + std::to_string(TileShapeK) + ">");
-    capture_results<KernelSchedule, ClusterShape, Shape<_128,_128, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_128,_256, _" + std::to_string(TileShapeK) + ">");
-    capture_results<KernelSchedule, ClusterShape, Shape<_128,_128, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_256,_128, _" + std::to_string(TileShapeK) + ">");
-    capture_results<KernelSchedule, ClusterShape, Shape<_128,_128, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_256,_256, _" + std::to_string(TileShapeK) + ">");
-    
+
+    if constexpr ((TileShapeK <= 256) || (std::is_same_v<KernelSchedule, cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>)) {
+        capture_results<KernelSchedule, ClusterShape, Shape<_128,_128, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_128,_128, _" + std::to_string(TileShapeK) + ">");
+    }
+    if constexpr (TileShapeK <= 256) {
+        capture_results<KernelSchedule, ClusterShape, Shape<_128,_256, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_128,_256, _" + std::to_string(TileShapeK) + ">");
+        capture_results<KernelSchedule, ClusterShape, Shape<_256,_128, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_256,_128, _" + std::to_string(TileShapeK) + ">");
+    }
+    if constexpr (TileShapeK == 128) {
+        capture_results<KernelSchedule, ClusterShape, Shape<_256,_256, cute::Int<TileShapeK>>>(options, results, configs, config + " Shape<_256,_256, _" + std::to_string(TileShapeK) + ">");
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
