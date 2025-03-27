@@ -992,6 +992,15 @@ public:
       Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});// (BLK_M,BLK_SCALE_K,PIPE)
       Tensor tCsS = mma_thread_slice.partition_A(sS);
 
+      // if (block0() && threadIdx.x == 160) {
+      //   printf("sS: ");
+      //   print(sS.layout());
+      //   printf("\n");
+      //   printf("tCsS: ");
+      //   print(tCsS.layout());
+      //   printf("\n");
+      // }
+
       // if (threadIdx.x % 128 == 0) { // 两个 consumer warpgroup 的 0 号线程
       //   printf("sS: ");
       //   print(sS);

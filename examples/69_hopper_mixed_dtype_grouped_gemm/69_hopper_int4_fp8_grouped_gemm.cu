@@ -88,12 +88,28 @@
 #include "grouped_mixed_dtype_utils.hpp"
 #include "host_validation.hpp"
 
+// #define PROFILE
+
 using namespace cute;
 
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M,N,K> per group
 using MmaType = cutlass::float_e4m3_t;
 using QuantType = cutlass::int4b_t;
-constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
+
+// constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
+//--------------------------------------------------------------------------------------------
+// constexpr int TileShapeK = 128;
+// using ElementScale = float;
+// using ElementScalePacked = cutlass::Array<ElementScale, 1>;
+//--------------------------------------------------------------------------------------------
+// constexpr int TileShapeK = 256;
+// using ElementScale = float;
+// using ElementScalePacked = cutlass::Array<ElementScale, 2>;
+//--------------------------------------------------------------------------------------------
+constexpr int TileShapeK = 512;
+using ElementScale = cutlass::half_t;
+using ElementScalePacked = cutlass::Array<ElementScale, 4>;
+//--------------------------------------------------------------------------------------------
 
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 
@@ -128,9 +144,6 @@ using LayoutB_Reordered = decltype(cute::tile_to_shape(LayoutAtomQuant{}, Layout
 using ElementZero = cutlass::float_e4m3_t;
 // using ElementScale = cutlass::float_e4m3_t;
 // using ElementZero = float;
-using ElementScale = float;
-// using ElementScale = cutlass::half_t;
-using ElementScalePacked = cutlass::Array<ElementScale, 1>;
 using LayoutScale = cutlass::layout::RowMajor;
 
 // C/D matrix configuration
@@ -150,7 +163,7 @@ using ArchTag             = cutlass::arch::Sm90;                            // T
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
 using TileShape           = Shape<_128,_16,cute::Int<TileShapeK>>;          // Threadblock-level tile size
 // using TileShape           = Shape<_64,_64,cute::Int<TileShapeK>>;          // Threadblock-level tile size
-using ClusterShape        = Shape<_1,_1,_1>;                                // Shape of the threadblocks in a cluster
+using ClusterShape        = Shape<_2,_1,_1>;                                // Shape of the threadblocks in a cluster
 using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
 using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
 using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative; // Epilogue to launch
@@ -180,6 +193,7 @@ using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::Collecti
     KernelSchedule
   >::CollectiveOp;
 
+// TileScheduler=void -> Ptr-Array Cooperative and Grouped Gemm Cooperative kernel only supports the default scheduler.
 using GemmKernelScaleOnly = cutlass::gemm::kernel::GemmUniversal<
     ProblemShape, 
     CollectiveMainloopScaleOnly,
@@ -292,6 +306,7 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
     cutlass::CommandLine cmd(argc, args);
     cmd.get_cmd_line_argument("shuffle", shuffle);
     cmd.get_cmd_line_argument("explore", explore);
+    cmd.get_cmd_line_argument("compare", compare);
 
     this->Base::parse(argc, args);
 
@@ -354,7 +369,8 @@ void allocate(Options const& options) {
     auto K = get<2>(problem);
 
     // const int scale_k = 1;
-    const int scale_k = K / options.c;
+    // const int scale_k = K / options.c;
+    const int scale_k = K / TileShapeK;
 
     offset_A.push_back(total_elements_A);
     offset_B.push_back(total_elements_B * cutlass::sizeof_bits<QuantType>::value / 8);
@@ -499,7 +515,7 @@ void initialize(Options& options) {
   
   // print("jiangs block_A (size=%d)\n", int(block_A.size())); // block_A (size=512)  
   // print_device<<<1, 1>>>(block_A.get(), block_A.size());
-  set_device<<<1, 1>>>(block_A.get(), block_A.size());
+  set_device<<<1, 1>>>(block_A.get(), block_A.size(), 1);
   print_device<<<1, 1>>>(block_A.get(), block_A.size(), 'A');
   cudaDeviceSynchronize();
 
@@ -535,13 +551,16 @@ void initialize(Options& options) {
   print_device<<<1, 1>>>(block_scale.get(), block_scale.size(), 'S');
   cudaDeviceSynchronize();
   
+  // cutlass::pack_scale_fp8(block_scale.get(), block_scale_packed.get(), block_scale.size());
+  cutlass::pack_scale_fp32(block_scale.get(), block_scale_packed.get(), block_scale.size(), ElementScalePacked::kElements);  
+  print_device_packed<<<1, 1>>>(block_scale_packed.get(), block_scale.size(), 'P');
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
   groupwise_verify(
     problem_sizes.get(),
     options.groups,
-    block_A.get(), block_B.get(), block_scale.get(), block_ref_D.get(),
-    128,
+    block_A.get(), block_B.get(), block_scale_packed.get(), block_ref_D.get(),
+    TileShapeK, options.c,
     stride_A.get(), stride_B.get()
   );
 
@@ -550,11 +569,6 @@ void initialize(Options& options) {
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
-  // TODO BY JIANGS: SCALE
-  // cutlass::pack_scale_fp8(block_scale.get(), block_scale_packed.get(), block_scale.size());
-  cutlass::pack_scale_fp32(block_scale.get(), block_scale_packed.get(), block_scale.size(), ElementScalePacked::kElements);
-  
-  print_device_packed<<<1, 1>>>(block_scale_packed.get(), block_scale.size(), 'P');
 
 
   initialize_zero(block_zero, options);
@@ -747,7 +761,9 @@ bool verify(Options const& options) {
     }
   }
 
-  compare_device<<<1,1>>>(block_D.get(), block_ref_D.get(), block_D.size());
+  if (options.compare) {
+    compare_device<<<1,1>>>(block_D.get(), block_ref_D.get(), block_D.size());
+  }
   // printf("block_D: ");
   print_device<<<1,1>>>(block_ref_D.get(), block_ref_D.size(), 'R');
   print_device<<<1,1>>>(block_D.get(), block_D.size(), 'D');
@@ -808,8 +824,9 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
   return result;
 }
 
+#ifdef PROFILE
 #include "kernel_profiler.h"
-
+#endif
 
 #endif // defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 
@@ -854,7 +871,9 @@ int main(int argc, char const **args) {
   //
 
   if (options.explore) {
+    #ifdef PROFILE
     best_config_finder(options);
+    #endif
   }
   else {
     #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)

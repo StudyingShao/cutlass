@@ -57,12 +57,15 @@ __global__ void print_device_int4(T *ptr_, int count, const char str = ' ') {
 
 
 template<typename T>
-__global__ void set_device(T *ptr, int count) {
+__global__ void set_device(T *ptr, int count, int value = 0) {
 #ifdef DEBUG_INPUT
   if (thread0())
     for (int i = 0; i < count; i++)
     {
-      ptr[i] = static_cast<T>(i / 256 + 1);
+      if (value == 0)
+        ptr[i] = static_cast<T>(i / 256 + 1);
+      else
+        ptr[i] = static_cast<T>(value);
     }
 #endif
 }
@@ -103,17 +106,17 @@ __global__ void set_device_int4(T *ptr_, int count, uint8_t value = 0) {
 
 
 template <typename T>
-__global__ void compare_device(T *ptr1, T *ptr2, int count) {
+__global__ void compare_device(T *out, T *ref, int count) {
     
     if (thread0())
     {
         // printf("compare_device -----------------------------------------------\n");
         for (int i = 0; i < count; i++)
         {
-            float abs_error = abs(float(ptr1[i]) - float(ptr2[i]));
-            if (abs_error > 1)
-                printf("(%d):%f %f abs_error %f\n",
-                    i, float(ptr1[i]), float(ptr2[i]), abs_error);
+            float abs_error = abs(float(out[i]) - float(ref[i]));
+            if (abs_error > 1e-1)
+                printf("(%d): out %f ref %f abs_error %f\n",
+                    i, float(out[i]), float(ref[i]), abs_error);
         }
         printf("\n");
     }
@@ -124,7 +127,7 @@ template <
     typename ProblemSizes,
     typename ElementA, // fp8
     typename ElementB, // int4
-    typename ElementScale,
+    typename ElementScalePacked,
     typename ElementD,
     typename StrideA,
     typename StrideB
@@ -132,8 +135,8 @@ template <
 __global__ void groupwise_verify_kernel(
     ProblemSizes problem_sizes,
     int group_num,
-    ElementA A, ElementB B, ElementScale scale, ElementD D,
-    int group_size,
+    ElementA A, ElementB B, ElementScalePacked scale, ElementD D,
+    int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
     // if (thread0()) {
@@ -165,7 +168,7 @@ __global__ void groupwise_verify_kernel(
 
     ElementA A_ptr = A;
     uint8_t * B_ptr = reinterpret_cast<uint8_t *>(B);
-    ElementScale scale_ptr = scale;
+    ElementScalePacked scale_ptr = scale;
     ElementD D_ptr = D;
 
     int bid = blockIdx.x;
@@ -185,7 +188,7 @@ __global__ void groupwise_verify_kernel(
 
                     ElementA local_A_ptr = A_ptr + m * K + k;
                     uint8_t * local_B_ptr = B_ptr + n * K / 2 + k / 2;
-                    ElementScale local_scale_ptr = scale_ptr + (k / group_size) * N + n;
+                    ElementScalePacked local_scale_ptr = scale_ptr + (k / block_tile_k) * N + n;
 
                     float elem_A_0 = local_A_ptr[0];
                     float elem_A_1 = local_A_ptr[1];
@@ -194,7 +197,8 @@ __global__ void groupwise_verify_kernel(
                     float elem_B_low = (elem_B_low_ < 8) ? elem_B_low_ : (float)elem_B_low_ - 16;
                     float elem_B_high = (elem_B_high_ < 8) ? elem_B_high_ : (float)elem_B_high_ - 16;
 
-                    float scale = *local_scale_ptr;
+                    int scale_idx = (k % block_tile_k) / group_size;
+                    float scale = static_cast<float>((*local_scale_ptr)[scale_idx]);
 
                     accum += elem_A_0 * elem_B_low * scale + elem_A_1 * elem_B_high * scale;
 
@@ -216,7 +220,7 @@ __global__ void groupwise_verify_kernel(
 
         A_ptr += M * K;
         B_ptr += N * K / 2;
-        scale_ptr += N * K / group_size;
+        scale_ptr += N * K / block_tile_k;
         D_ptr += M * N;
     }
 }
@@ -226,7 +230,7 @@ template <
     typename ProblemSizes,
     typename ElementA,
     typename ElementB,
-    typename ElementScale,
+    typename ElementScalePacked,
     typename ElementD,
     typename StrideA,
     typename StrideB
@@ -234,8 +238,8 @@ template <
 void groupwise_verify(
     ProblemSizes problem_sizes,
     int group_num,
-    ElementA A, ElementB B, ElementScale scale, ElementD D,
-    int group_size,
+    ElementA A, ElementB B, ElementScalePacked scale, ElementD D,
+    int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
     // printf("jiangs func start -----------------------------------------------------\n");
@@ -243,7 +247,7 @@ void groupwise_verify(
         problem_sizes, 
         group_num, 
         A, B, scale, D,
-        group_size,
+        block_tile_k, group_size,
         stride_A, stride_B);
     cudaDeviceSynchronize();
     // printf("jiangs func end   -----------------------------------------------------\n");

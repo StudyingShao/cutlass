@@ -44,6 +44,7 @@ public:
     using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
 
     bool explore = false;
+    bool compare = true;
     int groups = 6;
     int c = 512;
     std::string benchmark_path;

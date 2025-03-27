@@ -951,6 +951,9 @@ public:
     //   printf("tiled_mma thr_layout: ");
     //   print(tiled_mma.get_thr_layout_vmnk());
     //   printf("\n");
+    //   printf("sA: ");
+    //   print(sA.layout());
+    //   printf("\n");
     //   printf("tCsA: ");
     //   print(tCsA.layout());
     //   printf("\n");
@@ -1004,13 +1007,21 @@ public:
     PipelineState smem_pipe_release = smem_pipe_read;
 
     multiply_add<ElementAccumulator> fma;
-    Tensor intermediate = make_fragment_like(accum);
 
-    warpgroup_fence_operand(intermediate);
+    constexpr int NumMMAsPerChunk = GROUP_SIZE / cute::get<0, 1>(tCsB.shape())();
+    constexpr int NumChunksPerTileK = cute::size<1>(sA.shape())() / GROUP_SIZE;
+    cute::array<decltype(make_fragment_like(accum)) , NumChunksPerTileK> intermediate_array;
+
+    // warpgroup_fence_operand(intermediate);
 
     constexpr int K_BLOCK_MAX = size<2>(tCrA_load);
     constexpr int K_WAIT_MAX = cute::min(K_BLOCK_MAX - 1, 7);
     static_assert(K_BLOCK_MAX >= 4, "Consider increasing TileShapeK");
+
+    // if (block0() && threadIdx.x == 160) {
+    //   printf("K_BLOCK_MAX=%d  NumMMAsPerChunk=%d  NumChunksPerTileK=%d\n",
+    //     K_BLOCK_MAX, NumMMAsPerChunk, NumChunksPerTileK);
+    // }
 
     ConsumerToken barrier_token = {BarrierStatus::WaitAgain};
     // First k tile
@@ -1032,7 +1043,9 @@ public:
           partitioned_extra_info, copy_partitions_extra_info, 1, read_stage);
       }
       
+      // src: tCrA_load, dst: tCrA_mma
       Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+      // Utils::convert_A_kblock(tCrA_load, tCrA_mma, 1);
       
       // if (block0() && threadIdx.x == 160) {
       //   auto tCsS = cute::get<0>(partitioned_extra_info);
@@ -1067,81 +1080,108 @@ public:
       //     float(tCrS(make_tuple(1,0,0),0,0)[0]),
       //     float(tCrS(make_tuple(0,0,1),0,0)[0])
       //   );
+
+      //   printf("\nmma tCrS b_wg_w_t(%d,%d,%d,%d)   %f %f %f %f\n",
+      //     blockIdx.x, threadIdx.x/128, threadIdx.x/32, threadIdx.x%128,
+      //     float(tCrS(make_tuple(0,0,0),0,0)[1]),
+      //     float(tCrS(make_tuple(0,1,0),0,0)[1]),
+      //     float(tCrS(make_tuple(1,0,0),0,0)[1]),
+      //     float(tCrS(make_tuple(0,0,1),0,0)[1])
+      //   );
       // }
 
       tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
       // Unroll the K mode manually to set scale D to 1
+      // CUTLASS_PRAGMA_UNROLL
+      // for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
       CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
-        warpgroup_arrive();
-        
-        // if (threadIdx.x % 128 == 0) {
-          //   printf("jiangs tCrA_mma k_block %d read_stage %d b_wg_w_t(%d,%d) %f\n",
+      for (int chunk_id = 0; chunk_id < NumChunksPerTileK; ++chunk_id) {
+        tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int mma_id = 0; mma_id < NumMMAsPerChunk; ++mma_id) {
+          int k_block = chunk_id * NumMMAsPerChunk + mma_id;
+
+          warpgroup_arrive();
+          
+          // if (threadIdx.x % 128 == 0) {
+            //   printf("jiangs tCrA_mma k_block %d read_stage %d b_wg_w_t(%d,%d) %f\n",
+            //     k_block, read_stage,
+            //     blockIdx.x, threadIdx.x/128,
+            //     float(tCrA_mma(0))
+            //   );
+            // }
+            
+          // (V,M) x (V,N) => (V,M,N)
+          cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate_array[chunk_id]);
+          tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+
+          // if (float(intermediate(make_tuple(0,0,0), 0,0)) > 0.0001 || float(intermediate(make_tuple(0,0,0), 0,0)) < -0.0001) {
+          //   printf("jiangs after k_block %d read_stage %d b_wg_w_t(%d,%d,%d,%d) %f %f %f %f %f %f %f %f | %f %f %f %f %f %f %f %f\n",
           //     k_block, read_stage,
-          //     blockIdx.x, threadIdx.x/128,
-          //     float(tCrA_mma(0))
+          //     blockIdx.x, threadIdx.x/128, threadIdx.x/32, threadIdx.x%128,
+          //     float(intermediate(make_tuple(0,0,0), 0,0)),
+          //     float(intermediate(make_tuple(0,0,1), 0,0)),
+          //     float(intermediate(make_tuple(0,1,0), 0,0)),
+          //     float(intermediate(make_tuple(0,1,1), 0,0)),
+          //     float(intermediate(make_tuple(1,0,0), 0,0)),
+          //     float(intermediate(make_tuple(1,0,1), 0,0)),
+          //     float(intermediate(make_tuple(1,1,0), 0,0)),
+          //     float(intermediate(make_tuple(1,1,1), 0,0)),
+          //     float(intermediate(make_tuple(0,0,0), 1,0)), // 
+          //     float(intermediate(make_tuple(0,0,1), 1,0)),
+          //     float(intermediate(make_tuple(0,1,0), 1,0)),
+          //     float(intermediate(make_tuple(0,1,1), 1,0)),
+          //     float(intermediate(make_tuple(1,0,0), 1,0)),
+          //     float(intermediate(make_tuple(1,0,1), 1,0)),
+          //     float(intermediate(make_tuple(1,1,0), 1,0)),
+          //     float(intermediate(make_tuple(1,1,1), 1,0))
           //   );
           // }
-          
-        // (V,M) x (V,N) => (V,M,N)
-        cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate);
-        tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
-        // if (float(intermediate(make_tuple(0,0,0), 0,0)) > 0.0001 || float(intermediate(make_tuple(0,0,0), 0,0)) < -0.0001) {
-        //   printf("jiangs after k_block %d read_stage %d b_wg_w_t(%d,%d,%d,%d) %f %f %f %f %f %f %f %f | %f %f %f %f %f %f %f %f\n",
-        //     k_block, read_stage,
-        //     blockIdx.x, threadIdx.x/128, threadIdx.x/32, threadIdx.x%128,
-        //     float(intermediate(make_tuple(0,0,0), 0,0)),
-        //     float(intermediate(make_tuple(0,0,1), 0,0)),
-        //     float(intermediate(make_tuple(0,1,0), 0,0)),
-        //     float(intermediate(make_tuple(0,1,1), 0,0)),
-        //     float(intermediate(make_tuple(1,0,0), 0,0)),
-        //     float(intermediate(make_tuple(1,0,1), 0,0)),
-        //     float(intermediate(make_tuple(1,1,0), 0,0)),
-        //     float(intermediate(make_tuple(1,1,1), 0,0)),
-        //     float(intermediate(make_tuple(0,0,0), 1,0)), // 
-        //     float(intermediate(make_tuple(0,0,1), 1,0)),
-        //     float(intermediate(make_tuple(0,1,0), 1,0)),
-        //     float(intermediate(make_tuple(0,1,1), 1,0)),
-        //     float(intermediate(make_tuple(1,0,0), 1,0)),
-        //     float(intermediate(make_tuple(1,0,1), 1,0)),
-        //     float(intermediate(make_tuple(1,1,0), 1,0)),
-        //     float(intermediate(make_tuple(1,1,1), 1,0))
-        //   );
-        // }
+          warpgroup_commit_batch();
 
-        warpgroup_commit_batch();
-
-        if (k_block < K_BLOCK_MAX - 2) {
-          Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-            partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+          if (k_block < K_BLOCK_MAX - 2) {
+            Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
+              partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+            // Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 2);
+          }
+          if (k_block < K_BLOCK_MAX - 1) {
+            Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+          }
         }
-        if (k_block < K_BLOCK_MAX - 1) {
-          Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
-        }
-      }     
+      }
 
-      warpgroup_fence_operand(intermediate);
+      CUTLASS_PRAGMA_UNROLL
+      for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
+        warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-      // Apply the group-wise scaling
-      // tCrS  ((4, _2, _2), MMA_M, _1)
-      // accum ((2, _2, _2), MMA_M, _1)
-      auto tCrS = cute::get<1>(partitioned_extra_info);
-      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-        for (int m = 0; m < size<0, 1>(accum); m++) {
-          for (int n = 0; n < size<0, 2>(accum); n++) {
-            for (int e = 0; e < size<0, 0>(accum); e++) {
-              auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-              accum(accum_coord) = intermediate(accum_coord) * tCrS(scale_coord)[0];
+        // Apply the group-wise scaling
+        // tCrS  ((4, _2, _2), MMA_M, _1)
+        // accum ((2, _2, _2), MMA_M, _1)
+        auto tCrS = cute::get<1>(partitioned_extra_info);
+        for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+          for (int m = 0; m < size<0, 1>(accum); m++) {
+            for (int n = 0; n < size<0, 2>(accum); n++) {
+              for (int e = 0; e < size<0, 0>(accum); e++) {
+                auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+
+                if (chunk_id_ == 0) {
+                  accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * static_cast<float>(tCrS(scale_coord)[0]);
+                }
+                else {
+                  accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), static_cast<float>(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
+                }
+              }
             }
           }
         }
       }
 
       // if (float(accum(make_tuple(0,0,0), 0,0)) > 0.0001 || float(accum(make_tuple(0,0,0), 0,0)) < -0.0001) {
-      //   printf("last_k_tile accum  read_stage %d  b_wg_w_t(%d,%d,%d,%d): %f %f %f %f %f %f %f %f\n",
+      //   printf("first_k_tile accum  read_stage %d  b_wg_w_t(%d,%d,%d,%d): %f %f %f %f %f %f %f %f\n",
       //     read_stage,
       //     blockIdx.x, threadIdx.x/128, threadIdx.x/32, threadIdx.x%128,
       //     float(accum(make_tuple(0,0,0), 0,0)),
@@ -1168,6 +1208,7 @@ public:
         
         warpgroup_wait<K_WAIT_MAX>(); 
         Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+        // Utils::convert_A_kblock(tCrA_load, tCrA_mma, 1);
       }
     }
 
@@ -1186,117 +1227,180 @@ public:
       int read_stage = smem_pipe_read.index();
       ++smem_pipe_read;
 
-      warpgroup_fence_operand(intermediate);
+      // warpgroup_fence_operand(intermediate);
 
-      tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+      // if (block0() && threadIdx.x == 160) {
+      //   printf("K_BLOCK_MAX=%d  NumMMAsPerChunk=%d  NumChunksPerTileK=%d\n",
+      //     K_BLOCK_MAX, NumMMAsPerChunk, NumChunksPerTileK);
+
+      //   CUTLASS_PRAGMA_UNROLL
+      //   for (int chunk_id = 0; chunk_id < NumChunksPerTileK; ++chunk_id) {
+      //     CUTLASS_PRAGMA_UNROLL
+      //     for (int mma_id = 0; mma_id < NumMMAsPerChunk; ++mma_id) {
+      //       int k_block = chunk_id * NumMMAsPerChunk + mma_id;
+      //       printf("k_block %d\n", k_block);
+      //     }
+      //   }
+      // }
 
       // Unroll the K mode manually to set scale D to 1
+      // CUTLASS_PRAGMA_UNROLL
+      // for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
       CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
-        
-        warpgroup_arrive();
-        // (V,M) x (V,N) => (V,M,N)
-        cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate);
-        tiled_mma.accumulate_ = GMMA::ScaleOut::One;
-        warpgroup_commit_batch();
+      for (int chunk_id = 0; chunk_id < NumChunksPerTileK; ++chunk_id) {
+        tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
-        warpgroup_wait<K_WAIT_MAX>(); // We have K_BLOCK_MAX - 1 GMMA instructions pending for this stage, so we can release prior barrier
-        if (k_block == K_BLOCK_MAX - 1) {
-          pipeline.consumer_release(smem_pipe_release);             // UNLOCK smem_pipe_release, done _computing_ on it
-          ++smem_pipe_release;
-        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int mma_id = 0; mma_id < NumMMAsPerChunk; ++mma_id) {
+          int k_block = chunk_id * NumMMAsPerChunk + mma_id;
 
-        if (k_block == 0) {
-          barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
-        }
+          warpgroup_arrive();
+          // (V,M) x (V,N) => (V,M,N)
+          cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate_array[chunk_id]);
+          tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+          warpgroup_commit_batch();
 
-        if (k_block == K_BLOCK_MAX - 1) { 
-          // The last k_block
+          warpgroup_wait<K_WAIT_MAX>(); // We have K_BLOCK_MAX - 1 GMMA instructions pending for this stage, so we can release prior barrier
+          if (k_block == K_BLOCK_MAX - 1) {
+            pipeline.consumer_release(smem_pipe_release);             // UNLOCK smem_pipe_release, done _computing_ on it
+            ++smem_pipe_release;
+          }
 
-          warpgroup_fence_operand(intermediate);
+          if (k_block == 0) {
+            barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
+          }
 
-          // Apply the group-wise scaling
-          auto tCrS = cute::get<1>(partitioned_extra_info);
-          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-            for (int m = 0; m < size<0, 1>(accum); m++) {
-              for (int n = 0; n < size<0, 2>(accum); n++) {
-                for (int e = 0; e < size<0, 0>(accum); e++) {
-                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-                  accum(accum_coord) = fma(intermediate(accum_coord), tCrS(scale_coord)[0], accum(accum_coord));
+          // if ((k_block + 1) % NumMMAsPerChunk == 0) {
+          //   tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+          //   warpgroup_fence_operand(intermediate);
+
+          //   // Apply the group-wise scaling
+          //   auto tCrS = cute::get<1>(partitioned_extra_info);
+          //   for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+          //     for (int m = 0; m < size<0, 1>(accum); m++) {
+          //       for (int n = 0; n < size<0, 2>(accum); n++) {
+          //         for (int e = 0; e < size<0, 0>(accum); e++) {
+          //           auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+          //           auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+          //           int scale_idx = k_block / NumMMAsPerChunk;
+
+          //           accum(accum_coord) = fma(intermediate(accum_coord), static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
+          //         }
+          //       }
+          //     }
+          //   }
+          // }
+
+          if (k_block == K_BLOCK_MAX - 1) {
+            // The last k_block
+
+            // tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+
+            CUTLASS_PRAGMA_UNROLL
+            for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
+              warpgroup_fence_operand(intermediate_array[chunk_id_]);
+
+              // Apply the group-wise scaling
+              auto tCrS = cute::get<1>(partitioned_extra_info);
+              for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+                for (int m = 0; m < size<0, 1>(accum); m++) {
+                  for (int n = 0; n < size<0, 2>(accum); n++) {
+                    for (int e = 0; e < size<0, 0>(accum); e++) {
+                      auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                      auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+
+                      accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), static_cast<float>(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
+                    }
+                  }
                 }
               }
             }
-          }
 
-          // if (float(accum(make_tuple(0,0,0), 0,0)) > 0.0001 || float(accum(make_tuple(0,0,0), 0,0)) < -0.0001) {
-          //   printf("last_k_tile accum  read_stage %d  b_wg_w_t(%d,%d,%d,%d): %f %f %f %f %f %f %f %f\n",
-          //     read_stage,
-          //     blockIdx.x, threadIdx.x/128, threadIdx.x/32, threadIdx.x%128,
-          //     float(accum(make_tuple(0,0,0), 0,0)),
-          //     float(accum(make_tuple(1,0,0), 0,0)),
-          //     float(accum(make_tuple(0,1,0), 0,0)),
-          //     float(accum(make_tuple(1,1,0), 0,0)),
-          //     float(accum(make_tuple(0,0,1), 0,0)),
-          //     float(accum(make_tuple(1,0,1), 0,0)),
-          //     float(accum(make_tuple(0,1,1), 0,0)),
-          //     float(accum(make_tuple(1,1,1), 0,0))
-          //   );
-          // }
+            pipeline.consumer_wait(smem_pipe_read, barrier_token);
 
-          // if (threadIdx.x % 128 == 0) {
-          //   auto tCrS = cute::get<1>(partitioned_extra_info);
-          //   printf("\nmma tCrS before btwl(%d,%d,%d,%d)   %f %f %f %f\n",
-          //     blockIdx.x, threadIdx.x, threadIdx.x / 32, threadIdx.x % 32,
-          //     float(tCrS(make_tuple(0,0,0),0,0)[0]),
-          //     float(tCrS(make_tuple(0,1,0),0,0)[0]),
-          //     float(tCrS(make_tuple(1,0,0),0,0)[0]),
-          //     float(tCrS(make_tuple(0,0,1),0,0)[0])
-          //   );
-          // }
-          
-          pipeline.consumer_wait(smem_pipe_read, barrier_token);
-
-          // 当 k_block 参数传入 0 时，就会进行 scale 的拷贝，比如这里
-          Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-            partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read.index());
-
-          // if (threadIdx.x % 128 == 0) {
-          //   auto tCrS = cute::get<1>(partitioned_extra_info);
-          //   printf("\nmma tCrS after btwl(%d,%d,%d,%d)   %f %f %f %f\n",
-          //     blockIdx.x, threadIdx.x, threadIdx.x / 32, threadIdx.x % 32,
-          //     float(tCrS(make_tuple(0,0,0),0,0)[0]),
-          //     float(tCrS(make_tuple(0,1,0),0,0)[0]),
-          //     float(tCrS(make_tuple(1,0,0),0,0)[0]),
-          //     float(tCrS(make_tuple(0,0,1),0,0)[0])
-          //   );
-          // }
-
-          Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-            partitioned_extra_info, copy_partitions_extra_info, 1, smem_pipe_read.index());
-          Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
-        } 
-        else {
-          if (k_block < K_BLOCK_MAX - 2) {
+            // 当 k_block 参数传入 0 时，就会进行 scale 的拷贝，比如这里
             Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-              partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+              partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read.index());
+            Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
+              partitioned_extra_info, copy_partitions_extra_info, 1, smem_pipe_read.index());
+            Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+            // Utils::convert_A_kblock(tCrA_load, tCrA_mma, 1);
           }
-          Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+          else {
+            if (k_block < K_BLOCK_MAX - 2) {
+              Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
+                partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+              // Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 2);
+            }
+            Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+
+            // if ((k_block + 1) % NumMMAsPerChunk == 0) {
+            //   tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+            //   warpgroup_fence_operand(intermediate);
+
+            //   // Apply the group-wise scaling
+            //   auto tCrS = cute::get<1>(partitioned_extra_info);
+            //   for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+            //     for (int m = 0; m < size<0, 1>(accum); m++) {
+            //       for (int n = 0; n < size<0, 2>(accum); n++) {
+            //         for (int e = 0; e < size<0, 0>(accum); e++) {
+            //           auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+            //           auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+            //           int scale_idx = k_block / NumMMAsPerChunk;
+
+            //           accum(accum_coord) = fma(intermediate(accum_coord), static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
+
+            //           // if (float(intermediate(make_tuple(0,0,0), 0,0)) > 0.0001 || float(intermediate(make_tuple(0,0,0), 0,0)) < -0.0001) {
+            //           //   printf("mainloop intermediate  k_block %d  b_wg_w_t(%d,%d,%d,%d) scale %f : %f %f %f %f %f %f %f %f\n",
+            //           //     k_block,
+            //           //     blockIdx.x, threadIdx.x/128, threadIdx.x/32, threadIdx.x%128,
+            //           //     float(tCrS(scale_coord)[scale_idx]),
+            //           //     float(intermediate(make_tuple(0,0,0), 0,0)),
+            //           //     float(intermediate(make_tuple(1,0,0), 0,0)),
+            //           //     float(intermediate(make_tuple(0,1,0), 0,0)),
+            //           //     float(intermediate(make_tuple(1,1,0), 0,0)),
+            //           //     float(intermediate(make_tuple(0,0,1), 0,0)),
+            //           //     float(intermediate(make_tuple(1,0,1), 0,0)),
+            //           //     float(intermediate(make_tuple(0,1,1), 0,0)),
+            //           //     float(intermediate(make_tuple(1,1,1), 0,0))
+            //           //   );
+            //           // }
+            //         }
+            //       }
+            //     }
+            //   }
+  
+            //   // if (float(accum(make_tuple(0,0,0), 0,0)) > 0.0001 || float(accum(make_tuple(0,0,0), 0,0)) < -0.0001) {
+            //   //   printf("mainloop accum k_block %d  b_wg_w_t(%d,%d,%d,%d): %f %f %f %f %f %f %f %f\n",
+            //   //     k_block,
+            //   //     blockIdx.x, threadIdx.x/128, threadIdx.x/32, threadIdx.x%128,
+            //   //     float(accum(make_tuple(0,0,0), 0,0)),
+            //   //     float(accum(make_tuple(1,0,0), 0,0)),
+            //   //     float(accum(make_tuple(0,1,0), 0,0)),
+            //   //     float(accum(make_tuple(1,1,0), 0,0)),
+            //   //     float(accum(make_tuple(0,0,1), 0,0)),
+            //   //     float(accum(make_tuple(1,0,1), 0,0)),
+            //   //     float(accum(make_tuple(0,1,1), 0,0)),
+            //   //     float(accum(make_tuple(1,1,1), 0,0))
+            //   //   );
+            //   // }
+            // }
+          }          
         }
       }
-
     }
 
-    warpgroup_fence_operand(intermediate);
+    // warpgroup_fence_operand(intermediate);
 
     {
       //
       // Last k tile
       //
+      Tensor intermediate = make_fragment_like(accum);
 
       int read_stage = smem_pipe_read.index();
 
-      warpgroup_fence_operand(intermediate); // TODO 这玩应可能可以放在最后，gemm 没用 accum 做输入，在 scale 之前 fence 就行
+      // warpgroup_fence_operand(intermediate); // TODO 这玩应可能可以放在最后，gemm 没用 accum 做输入，在 scale 之前 fence 就行
       
       tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
@@ -1320,31 +1424,33 @@ public:
         if (k_block < K_BLOCK_MAX - 2) {
           Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
             partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+          // Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 2);
         }
         if (k_block < K_BLOCK_MAX - 1) {
           Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
         }
-      }
 
-      warpgroup_fence_operand(intermediate);
+        if ((k_block + 1) % NumMMAsPerChunk == 0) {
+          tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+          warpgroup_fence_operand(intermediate);
 
-      // Apply the group-wise scaling
-      auto tCrS = cute::get<1>(partitioned_extra_info);
-      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-        for (int m = 0; m < size<0, 1>(accum); m++) {
-          for (int n = 0; n < size<0, 2>(accum); n++) {
-            for (int e = 0; e < size<0, 0>(accum); e++) {
-              auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-              accum(accum_coord) = fma(intermediate(accum_coord), tCrS(scale_coord)[0], accum(accum_coord));
+          // Apply the group-wise scaling
+          auto tCrS = cute::get<1>(partitioned_extra_info);
+          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+            for (int m = 0; m < size<0, 1>(accum); m++) {
+              for (int n = 0; n < size<0, 2>(accum); n++) {
+                for (int e = 0; e < size<0, 0>(accum); e++) {
+                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                  int scale_idx = k_block / NumMMAsPerChunk;
+
+                  accum(accum_coord) = fma(intermediate(accum_coord), static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
+                }
+              }
             }
           }
         }
       }
-
-      //   printf("jiangs apply scale  read_stage %d b_wg_w_t(%d,%d,%d,%d) %f %f %f %f %f %f %f %f\n",
-      //     read_stage,
-      //     
 
       // if (float(accum(make_tuple(0,0,0), 0,0)) > 0.0001 || float(accum(make_tuple(0,0,0), 0,0)) < -0.0001) {
       //   printf("last_k_tile accum  read_stage %d  b_wg_w_t(%d,%d,%d,%d): %f %f %f %f %f %f %f %f\n",
