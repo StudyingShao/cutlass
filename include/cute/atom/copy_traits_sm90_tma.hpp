@@ -828,9 +828,6 @@ fill_tma_gmem_shape_stride(Tensor<GEngine,GLayout>   const& gtensor,           /
   constexpr int tma_rank = decltype(rank(tma_gbasis_stride))::value;
   static_assert(TmaRank >= tma_rank);
 
-  // printf("gtensor: ");
-  // print(gtensor);
-  // printf("\n");
   auto gmem_shape  =  shape(gtensor);
   auto gmem_stride = stride(gtensor);
   // Use the indirections in tma_gbasis_stride into gtensor to construct the tma gmem shapes/strides
@@ -861,7 +858,6 @@ fill_tma_gmem_shape_stride(Tensor<GEngine,GLayout>   const& gtensor,           /
         }
       });
     }
-    // printf("gmem_prob_shape[%d] = %d\n", i, gmem_prob_shape[i]);
   });
 }
 
@@ -915,11 +911,7 @@ make_tma_copy_desc(Tensor<GEngine,GLayout> const& gtensor,         // The origin
   cute::array<uint64_t, 5> gmem_prob_shape  = {1,1,1,1,1};
   cute::array<uint64_t, 5> gmem_prob_stride = {0,0,0,0,0};
 
-  
-  // std::cout << "jiangs before gmem_prob_shape " << gmem_prob_shape << std::endl;
   fill_tma_gmem_shape_stride(gtensor_T, stride(tma_gbasis), gmem_prob_shape, gmem_prob_stride);
-  // std::cout << "jiangs after gmem_prob_shape " << gmem_prob_shape << std::endl;
-  
   assert((reinterpret_cast<uint64_t>(gmem_address) & 0b1111) == 0);  // Address must be 16B-aligned
 
   assert(gmem_prob_shape[0] >= (uint64_t(1)));               // Size must be min 1
@@ -1027,8 +1019,6 @@ make_tma_copy_desc(Tensor<GEngine,GLayout> const& gtensor,         // The origin
         tma_oobFill);
 
     if (result != CUDA_SUCCESS) {
-    // if (true) {
-      // std::cout << "TMA Desc Addr:   " << &tma_desc
       std::cerr << "TMA Desc Addr:   " << &tma_desc
                 << "\nformat         " << tma_format
                 << "\ndim            " << tma_dim

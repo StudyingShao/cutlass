@@ -1112,7 +1112,6 @@ CUTE_HOST_DEVICE void print(Tensor<Engine,Layout> const& tensor)
   print(tensor.data()); print(" o "); print(tensor.layout());
 }
 
-// jiangs print_tensor
 template <class Engine, class Layout>
 CUTE_HOST_DEVICE void print_tensor(Tensor<Engine,Layout> const& tensor, bool print_type = true)
 {

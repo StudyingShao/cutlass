@@ -743,7 +743,6 @@ public:
     static_check_scale(flatten(Layout{}));
   }
 
-  // dequantize_A_kblock is here!!!
   template <class EngineIn,
             class EngineOut, 
             class LayoutIn,
@@ -782,8 +781,6 @@ public:
       }
     } 
     else if constexpr (UseScaleLookupTable) {
-      // this path
-
       constexpr int num_elements = decltype(size(src))::value;
       static_assert(is_same_v<RealSwappedElementA, cutlass::int4b_t>, "Lookup table only supports int4 being the quant type now.");
       static_assert(sizeof_bits_v<ElementScale> == 64, "Lookup table only supports 8 8bit scale values now.");
@@ -906,7 +903,6 @@ public:
     static_assert(size_v<LayoutIn> == cosize_v<LayoutIn>);
     static_assert(size_v<LayoutOut> == cosize_v<LayoutOut>);
     using SrcType = typename EngineIn::value_type;
-    using DstType = typename EngineOut::value_type;
 
     Tensor src = tCrA_load(_, _, k_block);
     Tensor dst = tCrA_mma(_, _, k_block);
@@ -991,63 +987,9 @@ public:
     else if constexpr (UseScaleLookupTable) {
       Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});// (BLK_M,BLK_SCALE_K,PIPE)
       Tensor tCsS = mma_thread_slice.partition_A(sS);
-
-      // if (block0() && threadIdx.x == 160) {
-      //   printf("sS: ");
-      //   print(sS.layout());
-      //   printf("\n");
-      //   printf("tCsS: ");
-      //   print(tCsS.layout());
-      //   printf("\n");
-      // }
-
-      // if (threadIdx.x % 128 == 0) { // 两个 consumer warpgroup 的 0 号线程
-      //   printf("sS: ");
-      //   print(sS);
-      //   printf("\n");
-      //   printf("tCsS: ");
-      //   print(tCsS);
-      //   printf("\n");
-
-      //   for (int k = 0;k < 8;k++) {
-      //     for (int j = 0;j < 8;j++) {
-      //       for (int i = 0;i < 8;i++) {
-      //         printf("sS btwl(%d,%d,%d,%d) (%d,%d,%d) %f %f\n",
-      //           blockIdx.x, threadIdx.x, threadIdx.x/32, threadIdx.x%32, i, j, k,
-      //           float(sS(make_tuple(i,j), 0,k)[0]),
-      //           float(sS(make_tuple(i,j), 0,k)[1])
-      //         );
-      //       }
-      //     }
-      //   }
-
-      //   // tCsS: smem_ptr[64b](0x7f6b0002fe80) o ((_4,_2,_2),_1,_1,(_1,_19)):((_0,_8,_0),_0,_0,(_0,_128))
-      //   // (aka "std::conditional_t<false, float, std::conditional_t<true, cutlass::Array<float, 2, true>, void>>") to "float"
-      //   for (int k = 0; k < 10; k++) {
-      //     for (int l = 0; l < 4; l++) {
-      //       for (int j = 0; j < 2; j++) {
-      //         for (int i = 0; i < 2; i++) {
-      //           printf("tCsS btwl(%d,%d,%d,%d) ((%d,%d,%d),%d) %f %f\n",
-      //                  blockIdx.x, threadIdx.x, threadIdx.x / 32, threadIdx.x % 32, l, i, j, k,
-      //                  float(tCsS(make_tuple(l, i, j), 0, 0, k)[0]),
-      //                  float(tCsS(make_tuple(l, i, j), 0, 0, k)[1])
-      //                 );
-      //         }
-      //       }
-      //     }
-      //   }
-      // }
-
       Tensor tCrS = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_,_,Int<0>{})).layout()); 
-      // Tensor tCrS_pos = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_,_,Int<0>{})).layout()); 
 
       return cute::make_tuple(tCsS, tCrS);
-
-      // UseScaleLookupTable = KernelConversionMode == ConversionMode::ConvertAndScale && cutlass::detail::is_Array_v<ElementScale>;
-      // UseScaleLookupTable 已经包含了下面的条件
-      // if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      //   return cute::make_tuple(tCsS, tCrS_neg, tCrS_pos);
-      // }
     }
     else if constexpr (ModeHasScales) {
       Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});// (BLK_M,BLK_SCALE_K,PIPE)

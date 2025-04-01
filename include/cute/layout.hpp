@@ -1863,7 +1863,6 @@ max_alignment(Layout<Shape,Stride> const& layout)
 template <class Shape, class Stride>
 CUTE_HOST_DEVICE void print(Layout<Shape,Stride> const& layout)
 {
-  // layout.shape(1.0f);
   print(layout.shape()); print(":"); print(layout.stride());
 }
 

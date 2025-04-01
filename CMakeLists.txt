@@ -454,6 +454,8 @@ if(UNIX)
   list(APPEND CUTLASS_CUDA_NVCC_FLAGS -Xcompiler=-fno-strict-aliasing)
 endif()
 
+# jiangs TODO for debug
+# list(APPEND CUTLASS_CUDA_NVCC_FLAGS -lineinfo)
 # Don't leak lineinfo in release builds
 if (NOT CMAKE_BUILD_TYPE MATCHES "Release")
   list(APPEND CUTLASS_CUDA_CLANG_FLAGS -gmlt)

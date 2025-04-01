@@ -142,8 +142,6 @@ using LayoutAtomQuant = decltype(cutlass::compute_memory_reordering_atom<MmaType
 using LayoutB_Reordered = decltype(cute::tile_to_shape(LayoutAtomQuant{}, Layout<Shape<int,int,Int<1>>, StrideB>{}));
 
 using ElementZero = cutlass::float_e4m3_t;
-// using ElementScale = cutlass::float_e4m3_t;
-// using ElementZero = float;
 using LayoutScale = cutlass::layout::RowMajor;
 
 // C/D matrix configuration
@@ -368,7 +366,6 @@ void allocate(Options const& options) {
     auto N = get<1>(problem);
     auto K = get<2>(problem);
 
-    // const int scale_k = 1;
     // const int scale_k = K / options.c;
     const int scale_k = K / TileShapeK;
 
@@ -514,7 +511,6 @@ void initialize(Options& options) {
   initialize_tensor(block_A, seed + 2023);
   
   // print("jiangs block_A (size=%d)\n", int(block_A.size())); // block_A (size=512)  
-  // print_device<<<1, 1>>>(block_A.get(), block_A.size());
   set_device<<<1, 1>>>(block_A.get(), block_A.size(), 1);
   print_device<<<1, 1>>>(block_A.get(), block_A.size(), 'A');
   cudaDeviceSynchronize();
@@ -527,7 +523,6 @@ void initialize(Options& options) {
   float scope_max = float(cutlass::platform::numeric_limits<QuantType>::max());
   // print("jiangs block_B (size=%d) min=%f max=%f\n",
     // int(block_B.size()), scope_min, scope_max); // jiangs block_B (size=4096) min=-8.000000 max=7.000000
-  // print_device<<<1, 1>>>(block_B.get(), block_B.size());  
   set_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 1);
   print_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 'B');
 
@@ -537,7 +532,6 @@ void initialize(Options& options) {
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
   
   // print("jiangs block_C (size=%d)\n", int(block_C.size())); // block_C (size=16)
-  // print_device<<<1, 1>>>(block_C.get(), block_C.size());  
   initialize_tensor(block_C, seed + 2021);
   print_device<<<1, 1>>>(block_C.get(), block_C.size(), 'C');  
   cudaDeviceSynchronize();
@@ -545,7 +539,6 @@ void initialize(Options& options) {
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
   
   // print("jiangs block_scale (size=%d)\n", int(block_scale.size())); // block_scale (size=16)
-  // print_device<<<1, 1>>>(block_scale.get(), block_scale.size());  
   set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size());
   // initialize_scale(block_scale, options);
   print_device<<<1, 1>>>(block_scale.get(), block_scale.size(), 'S');
@@ -564,7 +557,6 @@ void initialize(Options& options) {
     stride_A.get(), stride_B.get()
   );
 
-  // printf("block_D_ref: ");
   print_device<<<1,1>>>(block_ref_D.get(), block_ref_D.size(), 'R');
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 

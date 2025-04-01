@@ -425,10 +425,7 @@ public:
 
     // Note: Tma Descriptor Prefetch (from either const or param) is not applicable here
     
-    // if (thread0()){
-    //   printf("this is the mainloop !!!!!!\n");
-    // }
-
+    // jiangs mainloop cooperative
 
     // Mainloop Load pipeline
     using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
@@ -513,11 +510,6 @@ public:
     cluster_wait_fn();
 
     auto work_tile_info = scheduler.initial_work_tile_info(ClusterShape{});
-    // if (warp_group_thread_idx == 0 && block0()){
-    //   printf("block %d warp_group_idx %d work_tile_info(%d,%d,%d) valid %d\n",
-    //     blockIdx.x, warp_group_idx, work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx, work_tile_info.is_valid());
-    // }
- 
     if (not work_tile_info.is_valid()) {
       // When problem shapes are only on device, the grid launched may be larger than the total number of blocks across groups
       return;
@@ -549,15 +541,8 @@ public:
         int32_t const sm_idx = blockIdx.x + (blockIdx.y * gridDim.x);
         int32_t const sm_count = params.hw_info.sm_count;
 
-        // if (thread0()) {
-        //   printf("before tensormaps_init\n");
-        // }
         // Fetch a copy of tensormaps for the CTA
         auto input_tensormaps = collective_mainloop.tensormaps_init(params.mainloop, shared_storage.tensormaps.mainloop, sm_count, sm_idx);
-        // if (thread0()) {
-        //   printf("after tensormaps_init\n");
-        // }
-        
         // Update tensormap for the initial batch for the CTA
         if (work_tile_info.is_valid()) {
           collective_mainloop.tensormaps_perform_update(
@@ -727,10 +712,6 @@ public:
               problem_shape_MNKL = append<4>(params.problem_shape.get_problem_shape(work_tile_info.L_idx), 1);
             }
 
-            // if(threadIdx.x == 0) {
-            //   printf("block %d group_id %d\n", blockIdx.x, work_tile_info.L_idx);
-            // }
-
             // tensormap update
             {
               collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
@@ -757,15 +738,6 @@ public:
 
     else if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
       cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
-
-      // if (warp_group_thread_idx == 0) {
-      //   printf("WarpGroupRole::Consumer block %d warp_group_idx %d warp %d work_tile_info(%d,%d,%d) valid %d %d\n",
-      //     blockIdx.x, warp_group_idx, threadIdx.x/32,
-      //     work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx, 
-      //     work_tile_info.is_valid(), TileScheduler::valid_warpgroup_in_work_tile(work_tile_info));
-      //   printf("\n");
-      // }
-
 
       // Index of warp group within consumer warp groups
       int consumer_warp_group_idx = warp_group_role == WarpGroupRole::Consumer0 ? 0 : 1;
@@ -823,14 +795,6 @@ public:
             detail::PersistentTileSchedulerSm90Group<ProblemShape>,
             detail::PersistentTileSchedulerSm90>);
         if (TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
-
-          // if (warp_group_thread_idx == 0) {
-          //   printf("collective_mainloop.mma block %d warp_group_idx %d warp %d work_tile_info(%d,%d,%d) valid %d %d\n",
-          //     blockIdx.x, warp_group_idx, threadIdx.x/32,
-          //     work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx, 
-          //     work_tile_info.is_valid(), TileScheduler::valid_warpgroup_in_work_tile(work_tile_info));
-          //   printf("\n");
-          // }
 
           collective_mainloop.mma(
             mainloop_pipeline,
