@@ -1012,6 +1012,8 @@ public:
         }
       }
 
+      warpgroup_wait<0>();
+
       CUTLASS_PRAGMA_UNROLL
       for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
         warpgroup_fence_operand(intermediate_array[chunk_id_]);
@@ -1098,6 +1100,8 @@ public:
           if (k_block == K_BLOCK_MAX - 1) {
             // The last k_block
 
+            warpgroup_wait<0>();
+
             CUTLASS_PRAGMA_UNROLL
             for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
               warpgroup_fence_operand(intermediate_array[chunk_id_]);
@@ -1175,6 +1179,8 @@ public:
 
         if ((k_block + 1) % NumMMAsPerChunk == 0) {
           tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+
+          warpgroup_wait<0>();
           warpgroup_fence_operand(intermediate);
 
           // Apply the group-wise scaling
