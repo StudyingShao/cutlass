@@ -920,6 +920,7 @@ public:
       }
     }();
     Tensor tCsB = mma_warpgroup_slice.partition_B(sB);                                        // (MMA,MMA_N,MMA_K,PIPE)
+    // tCrB is just a view of the tensor tCsB
     Tensor tCrB = mma_warpgroup_slice.make_fragment_B(tCsB);                                  // (MMA,MMA_N,MMA_K,PIPE)
 
     //
@@ -1052,7 +1053,7 @@ public:
         Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
           partitioned_extra_info, copy_partitions_extra_info, 1, smem_pipe_read.index());
         
-        warpgroup_wait<K_WAIT_MAX>(); 
+        // warpgroup_wait<K_WAIT_MAX>(); 
         Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
       }
     }
@@ -1087,7 +1088,7 @@ public:
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
           warpgroup_commit_batch();
 
-          warpgroup_wait<K_WAIT_MAX>(); // We have K_BLOCK_MAX - 1 GMMA instructions pending for this stage, so we can release prior barrier
+          // warpgroup_wait<K_WAIT_MAX>(); // We have K_BLOCK_MAX - 1 GMMA instructions pending for this stage, so we can release prior barrier
           if (k_block == K_BLOCK_MAX - 1) {
             pipeline.consumer_release(smem_pipe_release);             // UNLOCK smem_pipe_release, done _computing_ on it
             ++smem_pipe_release;
@@ -1137,7 +1138,7 @@ public:
                 partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
             }
             Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
-          }          
+          }
         }
       }
     }
@@ -1162,7 +1163,7 @@ public:
         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
         warpgroup_commit_batch();
 
-        warpgroup_wait<K_WAIT_MAX>();
+        // warpgroup_wait<K_WAIT_MAX>();
         if (k_block == K_BLOCK_MAX - 1) {
           // release prior barrier
           pipeline.consumer_release(smem_pipe_release);             // UNLOCK smem_pipe_release, done _computing_ on it
@@ -1213,7 +1214,7 @@ public:
     smem_pipe_release.advance(k_tile_count);
     
     // Wait on all GMMAs to complete
-    warpgroup_wait<0>();
+    // warpgroup_wait<0>();
 
     for (int count = 0; count < prologue_mma_count; ++count) {
       pipeline.consumer_release(smem_pipe_release);                 // UNLOCK smem_pipe_release, done _computing_ on it
