@@ -204,26 +204,7 @@ using GemmKernelScaleOnly = cutlass::gemm::kernel::GemmUniversal<
     CollectiveEpilogue
 >;
 
-using CollectiveMainloopShuffled = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    cute::tuple<ElementB, cutlass::Array<ElementScale, 8>>, LayoutB_Reordered, AlignmentB,
-    ElementA, LayoutA_Transpose, AlignmentA,
-    ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))
-    >,
-    KernelSchedule
-  >::CollectiveOp;
-
-using GemmKernelShuffled = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>, // Indicates ProblemShape
-    CollectiveMainloopShuffled,
-    CollectiveEpilogue
->;
-
 using GemmScaleOnly = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleOnly>;
-using GemmShuffled  = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelShuffled>;
 
 using StrideC = typename GemmKernelScaleOnly::StrideC;
 using StrideD = typename GemmKernelScaleOnly::StrideD;
@@ -362,15 +343,15 @@ void initialize(Options const& options) {
   cudaStream_t stream = cudaStreamDefault;
   cutlass::dequantize(block_B_dq.get(), block_B.get(), layout_B, block_scale.get(), block_zero.get(), layout_scale_zero, options.g, stream);
 
-  if (options.shuffle) {
-    // Repeat the reorder layout atom to tile the whole tensor shape 
-    layout_B_reordered = cute::tile_to_shape(LayoutAtomQuant{}, shape_B);
-    cutlass::reorder_tensor(block_B_modified.get(), layout_B, layout_B_reordered);
+//   if (options.shuffle) {
+//     // Repeat the reorder layout atom to tile the whole tensor shape 
+//     layout_B_reordered = cute::tile_to_shape(LayoutAtomQuant{}, shape_B);
+//     cutlass::reorder_tensor(block_B_modified.get(), layout_B, layout_B_reordered);
 
-    print("Quantized tensor layout: ");
-    print(layout_B_reordered);
-    print("\n");
-  }
+//     print("Quantized tensor layout: ");
+//     print(layout_B_reordered);
+//     print("\n");
+//   }
 }
 
 /// Populates a Gemm::Arguments structure from the given commandline options
@@ -380,12 +361,13 @@ typename Gemm::Arguments args_from_options(Options const& options)
 {
   using Args = typename Gemm::Arguments;
   auto&& dB = [&]() {
-    if constexpr (cute::is_same_v<Gemm, GemmShuffled>) { // offline swizzling is enabled.
-      return layout_B_reordered;
-    } 
-    else {
-      return stride_B;
-    }
+    // if constexpr (cute::is_same_v<Gemm, GemmShuffled>) { // offline swizzling is enabled.
+    //   return layout_B_reordered;
+    // } 
+    // else {
+    //   return stride_B;
+    // }
+    return stride_B;
   }();
   return Args {
     cutlass::gemm::GemmUniversalMode::kGemm,
@@ -550,13 +532,15 @@ int main(int argc, char const **args) {
   } else {
     std::cout << "Running in group scale mode." << std::endl;
   }
-  if (options.shuffle) {
-    std::cout << "Offline shuffle enabled." << std::endl;
-    run<GemmShuffled>(options);
-  } else {
-    std::cout << "Offline shuffle disabled." << std::endl;
-    run<GemmScaleOnly>(options);
-  }
+  // if (options.shuffle) {
+  //   std::cout << "Offline shuffle enabled." << std::endl;
+  //   run<GemmShuffled>(options);
+  // } else {
+  //   std::cout << "Offline shuffle disabled." << std::endl;
+  //   run<GemmScaleOnly>(options);
+  // }
+  std::cout << "Offline shuffle disabled." << std::endl;
+  run<GemmScaleOnly>(options);
 #endif
 
   return 0;
