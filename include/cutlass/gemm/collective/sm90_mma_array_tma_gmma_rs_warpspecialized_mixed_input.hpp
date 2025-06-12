@@ -46,7 +46,7 @@
 #include "cute/tensor_predicate.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
 
-#define GROUP_SIZE 128
+#define GROUP_SIZE 32
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -266,6 +266,9 @@ public:
                                         KernelConversionMode == ConversionMode::ConvertAndScaleWithZero;
   static constexpr bool UseScaleLookupTable = KernelConversionMode == ConversionMode::ConvertAndScale &&
                                               cutlass::detail::is_Array_v<ElementScale>;
+  static constexpr bool UseFP4ToBF16LookupTable = KernelConversionMode == ConversionMode::ConvertAndScale &&
+                                                  cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+                                                  cute::is_same_v<ElementB, cutlass::bfloat16_t>;
   static constexpr size_t SmemAlignmentA = cutlass::detail::alignment_for_swizzle(SmemLayoutA{}); 
   static constexpr size_t SmemAlignmentB = cutlass::detail::alignment_for_swizzle(SmemLayoutB{});
   static constexpr size_t SmemAlignmentScale = cute::max(SmemAlignmentA, SmemAlignmentB);
@@ -943,6 +946,75 @@ public:
     CUTE_STATIC_ASSERT_V(size<3>(tCsA) == size<3>(tCsB));                                                       // PIPE
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sA));                                         // PIPE
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sB));                                         // PIPE
+    
+
+    // if (block0() && threadIdx.x == 160) {
+    //   printf("TileShape: ");
+    //   print(TileShape{});
+    //   printf("\n");
+    //   printf("ClusterShape: ");
+    //   print(ClusterShape{});
+    //   printf("\n");
+    //   printf("CtaShape_MNK: ");
+    //   print(CtaShape_MNK{});
+    //   printf("\n");
+      
+    //   printf("//////////////////////////\n");
+      
+    //   printf("SmemLayoutA: ");
+    //   print(SmemLayoutA{});
+    //   printf("\n");
+    //   printf("SmemLayoutB: ");
+    //   print(SmemLayoutB{});
+    //   printf("\n");
+
+    //   printf("//////////////////////////\n");
+      
+    //   printf("sA: ");
+    //   print(sA.layout());
+    //   printf("\n");
+    //   printf("tCsA: ");
+    //   print(tCsA.layout());
+    //   printf("\n");
+    //   printf("tCrA_mma: ");
+    //   print(tCrA_mma.layout());
+    //   printf("\n");
+    //   printf("tCrA_load: ");
+    //   print(tCrA_load.layout());
+    //   printf("\n");
+      
+    //   printf("//////////////////////////\n");
+      
+    //   printf("tCsB: ");
+    //   print(tCsB.layout());
+    //   printf("\n");
+    //   printf("tCrB: ");
+    //   print(tCrB.layout());
+    //   printf("\n");
+    //   printf("tCrB: ");
+    //   print(tCrB);
+    //   printf("\n");
+      
+    //   printf("//////////////////////////\n");
+      
+    //   printf("tCrA_mma: ");
+    //   print(tCrA_mma);
+    //   printf("\n");
+
+    //   printf("accum: ");
+    //   print(accum);
+    //   printf("\n");
+
+    // }
+
+    // if (threadIdx.x == 160) {
+    //   printf("block (%d %d %d) %f %f\n",
+    //     blockIdx.z, blockIdx.y, blockIdx.x, 
+    //     float(tCsB(0,0,0,0)),
+    //     float(tCrA_mma(0))
+    //   );
+    // }
+
     
     //
     // PIPELINED MAIN LOOP

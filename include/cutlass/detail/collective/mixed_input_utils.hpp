@@ -527,6 +527,84 @@ auto get_gmem_layout(Shape const& shape, Stride const& stride) {
   }
 }
 
+
+typedef uint32_t            __nv_fp4x8_storage_t;
+typedef uint32_t            __nv_bf16x2_storage_t;
+typedef cutlass::uint128_t  __nv_bf16x8_storage_t;
+
+inline __device__ unsigned
+prmt(unsigned hi, unsigned lo, unsigned select_code)
+{
+  unsigned res = 0;
+
+  asm volatile(
+    "{\n"							\
+    "prmt.b32 %0, %1, %2, %3;\n"				\
+    "}\n"							\
+    : "=r"(res) : "r"(lo) , "r"(hi), "r"(select_code));
+
+  return res;
+}
+
+__device__ __inline__
+__nv_fp8x4_storage_t
+cvt_lut_bf16
+(
+  const unsigned index
+)
+{
+  const __nv_fp8x4_storage_t h4b_lut = 0x03020100U; //7654
+  const __nv_fp8x4_storage_t l4b_lut = 0xFFFEFC00U; //3210
+
+  __nv_fp8x4_storage_t lut_res = prmt(h4b_lut, l4b_lut, index);
+
+  return lut_res;
+}
+
+__device__ __inline__
+__nv_bf16x8_storage_t
+psx_cvt_lut_prmt_fp4x8_to_bf16x8
+(
+  const __nv_fp4x8_storage_t fp4x8
+)
+{
+  __nv_bf16x8_storage_t bf16x8_raw = {0, 0};
+  __nv_bf16x2_storage_t *bf16x2_raw = reinterpret_cast<__nv_bf16x2_storage_t *>(&bf16x8_raw);
+  
+  unsigned zero_padding = 0x00000000U;
+
+  unsigned h4b_em_fp4x4 = (fp4x8 & 0x77770000U) >> 16U;
+  unsigned l4b_em_fp4x4 = (fp4x8 & 0x00007777U);
+  
+  __nv_fp8x4_storage_t h4b_2to9_bits = cvt_lut_bf16(h4b_em_fp4x4); // 7654
+  __nv_fp8x4_storage_t l4b_2to9_bits = cvt_lut_bf16(l4b_em_fp4x4); // 3210
+
+  bf16x2_raw[0] = prmt(zero_padding, l4b_2to9_bits, 0x1707U) >> 2U; // 1 0
+  bf16x2_raw[1] = prmt(zero_padding, l4b_2to9_bits, 0x3727U) >> 2U; // 3 2
+  bf16x2_raw[2] = prmt(h4b_2to9_bits, zero_padding, 0x5040U) >> 2U; // 5 4
+  bf16x2_raw[3] = prmt(h4b_2to9_bits, zero_padding, 0x7060U) >> 2U; // 7 6
+
+  __nv_bf16x2_storage_t bf16x2_0to1_bits;
+
+  __nv_fp8x4_storage_t h_fp8x2_0to1_bits = (fp4x8 & 0x0000C0C0U);       // 3 1
+  __nv_fp8x4_storage_t l_fp8x2_0to1_bits = (fp4x8 & 0x00000C0CU) << 4U; // 2 0
+
+  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x4707U); // 1 0
+  bf16x2_raw[0] = bf16x2_raw[0] | bf16x2_0to1_bits;
+  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x5717U); // 3 2
+  bf16x2_raw[1] = bf16x2_raw[1] | bf16x2_0to1_bits;
+
+  h_fp8x2_0to1_bits = (fp4x8 & 0xC0C00000U);       // 7 5
+  l_fp8x2_0to1_bits = (fp4x8 & 0x0C0C0000U) << 4U; // 6 4
+
+  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x6020U); // 5 4
+  bf16x2_raw[2] = bf16x2_raw[2] | bf16x2_0to1_bits;
+  bf16x2_0to1_bits = prmt(h_fp8x2_0to1_bits, l_fp8x2_0to1_bits, 0x7030U); // 7 6
+  bf16x2_raw[3] = bf16x2_raw[3] | bf16x2_0to1_bits;
+
+  return bf16x8_raw;
+}
+
 template<class Collective>
 struct MixedInputUtils {
 private:
@@ -545,6 +623,7 @@ private:
   static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
   static constexpr auto ModeHasScales = Collective::ModeHasScales;
   static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
+  static constexpr auto UseFP4ToBF16LookupTable = Collective::UseFP4ToBF16LookupTable;
 
 public:
   static constexpr auto
@@ -729,6 +808,35 @@ public:
       );
     }
   }
+
+// The core converter uses a lookup table to converts i4 -> 8 bit value.
+  template <class EngineIn,
+            class LayoutIn,
+            class EngineOut,
+            class LayoutOut>
+  CUTLASS_DEVICE
+  static void fp4tobf16_lookup_table_convert( // Accept mutable temporaries
+    Tensor<EngineIn, LayoutIn>       const& src,
+    Tensor<EngineOut, LayoutOut>         && dst) {
+    fp4tobf16_lookup_table_convert(src, dst);
+  }
+
+  template <class EngineIn,
+            class LayoutIn,
+            class EngineOut,
+            class LayoutOut>
+  CUTLASS_DEVICE
+  static void fp4tobf16_lookup_table_convert(
+    Tensor<EngineIn, LayoutIn>       const& src,
+    Tensor<EngineOut, LayoutOut>          & dst) {
+
+    // View the input as reg
+    auto&& src_ = cute::recast<__nv_fp4x8_storage_t>(src)(0);
+    auto&& dst_ = cute::recast<__nv_bf16x8_storage_t>(dst)(0);
+    
+    dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8(src_);
+  }
+
 
   /// Utilities to dequantize A.
   template <class Layout>
@@ -918,7 +1026,13 @@ public:
     // KernelConversionMode == ConversionMode::DirectConvert
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size<1>(dst_vm); ++i) {
-      LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+      if constexpr (UseFP4ToBF16LookupTable) {
+      // if constexpr (false) {
+        fp4tobf16_lookup_table_convert(src_vm(_, i), dst_vm(_, i));
+      }
+      else {
+        LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
+      }
     }
   }
 

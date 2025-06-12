@@ -355,7 +355,7 @@ static bool pack_scale_fp32(ElementScale const *block_in, ElementScalePacked *bl
   ////////////////////////////////////////////////////////////////////////////////////////
   for (size_t i = 0; i < block_size; i++) {
     for (size_t j = 0; j < sub_k_tile_scale_num; j++) {
-      data_out[i][j] = ElementScale(data_in[i] * (j + 1));
+      data_out[i][j] = ElementScale(float(data_in[i]) * (j + 1));
     }
   }
   ////////////////////////////////////////////////////////////////////////////////////////

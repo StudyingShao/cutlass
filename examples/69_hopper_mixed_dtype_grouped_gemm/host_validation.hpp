@@ -63,7 +63,7 @@ __global__ void set_device(T *ptr, int count, int value = 0) {
     for (int i = 0; i < count; i++)
     {
       if (value == 0)
-        ptr[i] = static_cast<T>(i / 256 + 1);
+        ptr[i] = static_cast<T>(i / (16*128) + 1);
       else
         ptr[i] = static_cast<T>(value);
     }
@@ -80,6 +80,19 @@ __global__ void set_device_sequential(T *ptr, int count) {
     }
 }
 
+__global__ void set_device_ue8m0(cutlass::float_ue8m0_t *ptr, int count) {
+  if (thread0())
+    for (int i = 0; i < count; i++)
+    {
+      // 114 -> 0.000122
+      // 130 -> 8.000000
+      uint8_t value = 114 + (i % (131 - 114));
+      ptr[i] = *reinterpret_cast<cutlass::float_ue8m0_t *>(&value);
+
+      // printf("set_device_ue8m0 %d %f\n", int(value), static_cast<float>(ptr[i]));
+    }
+}
+
 
 template<typename T>
 __global__ void set_device_int4(T *ptr_, int count, uint8_t value = 0) {
@@ -92,7 +105,7 @@ __global__ void set_device_int4(T *ptr_, int count, uint8_t value = 0) {
       uint8_t low = 0;
 
       if (value == 0)
-        low = (i / 64) % 15 + 1; // 1~15
+        low = (i / (64 * 128)) % 15 + 1; // 1~15
       else
         low = value; // 0~14
 
@@ -165,6 +178,9 @@ __global__ void groupwise_verify_kernel(
     //     printf("scale %f %f\n", float(scale[0]), float(scale[1]));
     // }
 
+    float fp4_lut[] = {0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0, 
+                       0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
+
     ElementA A_ptr = A;
     uint8_t * B_ptr = reinterpret_cast<uint8_t *>(B);
     ElementScalePacked scale_ptr = scale;
@@ -193,8 +209,10 @@ __global__ void groupwise_verify_kernel(
                     float elem_A_1 = local_A_ptr[1];
                     uint8_t elem_B_low_ = (*local_B_ptr) & 0xF;
                     uint8_t elem_B_high_  = ((*local_B_ptr) & 0xF0) >> 4;
-                    float elem_B_low = (elem_B_low_ < 8) ? elem_B_low_ : (float)elem_B_low_ - 16;
-                    float elem_B_high = (elem_B_high_ < 8) ? elem_B_high_ : (float)elem_B_high_ - 16;
+                    // float elem_B_low = (elem_B_low_ < 8) ? elem_B_low_ : (float)elem_B_low_ - 16;
+                    // float elem_B_high = (elem_B_high_ < 8) ? elem_B_high_ : (float)elem_B_high_ - 16;
+                    float elem_B_low = fp4_lut[elem_B_low_];
+                    float elem_B_high = fp4_lut[elem_B_high_];
 
                     int scale_idx = (k % block_tile_k) / group_size;
                     float scale = static_cast<float>((*local_scale_ptr)[scale_idx]);

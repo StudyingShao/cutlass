@@ -93,8 +93,12 @@
 using namespace cute;
 
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M,N,K> per group
-using MmaType = cutlass::float_e4m3_t;
-using QuantType = cutlass::int4b_t;
+// using MmaType = cutlass::float_e4m3_t;
+// using QuantType = cutlass::int4b_t;
+
+using MmaType = cutlass::bfloat16_t;
+using QuantType = cutlass::float_e2m1_t;
+
 
 // constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
 //--------------------------------------------------------------------------------------------
@@ -106,10 +110,17 @@ using QuantType = cutlass::int4b_t;
 // using ElementScale = float;
 // using ElementScalePacked = cutlass::Array<ElementScale, 2>;
 //--------------------------------------------------------------------------------------------
-constexpr int TileShapeK = 512;
-using ElementScale = cutlass::half_t;
-using ElementScalePacked = cutlass::Array<ElementScale, 4>;
+// constexpr int TileShapeK = 512;
+// using ElementScale = cutlass::half_t;
+// using ElementScalePacked = cutlass::Array<ElementScale, 4>;
 //--------------------------------------------------------------------------------------------
+
+#define GROUP_SIZE 32
+// constexpr int TileShapeK = 512; // static_assert failed -> DispatchPolicy::Stages >= 2
+constexpr int TileShapeK = 256;
+// constexpr int TileShapeK = 128;
+using ElementScale = cutlass::float_ue8m0_t;
+using ElementScalePacked = cutlass::Array<ElementScale, TileShapeK / GROUP_SIZE>;
 
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 
@@ -527,7 +538,10 @@ void initialize(Options& options) {
   print_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 'B');
 
 
-  cutlass::unified_encode_int4b(block_B.get(), block_B_modified.get(), block_B.size());
+  cutlass::unified_encode_int4b(
+    reinterpret_cast<cutlass::int4b_t const *>(block_B.get()),
+    reinterpret_cast<cutlass::int4b_t *>(block_B_modified.get()),
+    block_B.size());
   
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
   
@@ -539,7 +553,9 @@ void initialize(Options& options) {
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
   
   // print("jiangs block_scale (size=%d)\n", int(block_scale.size())); // block_scale (size=16)
-  set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size());
+  // set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size());
+  set_device_ue8m0<<<1, 1>>>(block_scale.get(), block_scale.size());
+
   // initialize_scale(block_scale, options);
   print_device<<<1, 1>>>(block_scale.get(), block_scale.size(), 'S');
   cudaDeviceSynchronize();
@@ -553,7 +569,8 @@ void initialize(Options& options) {
     problem_sizes.get(),
     options.groups,
     block_A.get(), block_B.get(), block_scale_packed.get(), block_ref_D.get(),
-    TileShapeK, options.c,
+    TileShapeK, 
+    GROUP_SIZE, // options.c,
     stride_A.get(), stride_B.get()
   );
 
@@ -824,7 +841,14 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+// #include "BF16_MXFP4_Test.h"
+
 int main(int argc, char const **args) {
+
+  // FP4 -> BF16 Convertor
+  // MXFP4_test();
+  // return 0;
+
 
   // CUTLASS must be compiled with CUDA 12.3 Toolkit to run this example
   if (__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 3)) {
@@ -884,4 +908,4 @@ int main(int argc, char const **args) {
   return 0;
 }
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////
