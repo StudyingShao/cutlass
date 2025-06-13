@@ -72,11 +72,14 @@ __global__ void set_device(T *ptr, int count, int value = 0) {
 
 
 template<typename T>
-__global__ void set_device_sequential(T *ptr, int count) {
+__global__ void set_device_sequential(T *ptr, int count, int value = 0) {
   if (thread0())
     for (int i = 0; i < count; i++)
     {
-      ptr[i] = static_cast<T>((i + 1) % 50) * 0.1f;
+      if (value == 0)
+        ptr[i] = static_cast<T>((i + 1) % 50) * 0.1f;
+      else
+        ptr[i] = static_cast<T>(value);
     }
 }
 
@@ -136,6 +139,64 @@ __global__ void compare_device(T *out, T *ref, int count) {
 
 
 template <
+    typename ElementA,
+    typename ElementScalePacked,
+    typename ElementD
+>
+__device__ void single_gemm_varify(
+  int bid, int tid,
+  int block_tile_k, int group_size,
+  int M, int N, int K,
+  ElementA *A_ptr, uint8_t *B_ptr, ElementScalePacked *scale_ptr, ElementD *D_ptr) {
+
+  float fp4_lut[] = {0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0, 
+                      0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
+
+  for (int m = bid; m < M; m += gridDim.x) {
+    for (int n = tid; n < N; n += blockDim.x) {
+
+        float accum = 0.0f;
+
+        for (int k = 0; k < K; k += 2) {
+
+            ElementA *local_A_ptr = A_ptr + m * K + k;
+            uint8_t *local_B_ptr = B_ptr + n * K / 2 + k / 2;
+            ElementScalePacked *local_scale_ptr = scale_ptr + (k / block_tile_k) * N + n;
+
+            float elem_A_0 = local_A_ptr[0];
+            float elem_A_1 = local_A_ptr[1];
+            uint8_t elem_B_low_ = (*local_B_ptr) & 0xF;
+            uint8_t elem_B_high_  = ((*local_B_ptr) & 0xF0) >> 4;
+            // float elem_B_low = (elem_B_low_ < 8) ? elem_B_low_ : (float)elem_B_low_ - 16;
+            // float elem_B_high = (elem_B_high_ < 8) ? elem_B_high_ : (float)elem_B_high_ - 16;
+            float elem_B_low = fp4_lut[elem_B_low_];
+            float elem_B_high = fp4_lut[elem_B_high_];
+
+            int scale_idx = (k % block_tile_k) / group_size;
+            float scale = static_cast<float>((*local_scale_ptr)[scale_idx]);
+
+            accum += elem_A_0 * elem_B_low * scale + elem_A_1 * elem_B_high * scale;
+
+            // if (group_id == 0 && bid == 0 && tid == 0)
+            //     printf("A %f %f B %f %f scale %f accum %f\n",
+            //         elem_A_0,
+            //         elem_A_1,
+            //         elem_B_low,
+            //         elem_B_high,
+            //         scale,
+            //         accum
+            //     );
+        }
+
+        ElementD *local_D_ptr = D_ptr + m * N + n;
+        *local_D_ptr = accum;
+    }
+  }
+}
+
+
+
+template <
     typename ProblemSizes,
     typename ElementA, // fp8
     typename ElementB, // int4
@@ -147,7 +208,7 @@ template <
 __global__ void groupwise_verify_kernel(
     ProblemSizes problem_sizes,
     int group_num,
-    ElementA A, ElementB B, ElementScalePacked scale, ElementD D,
+    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementD *D,
     int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
@@ -178,13 +239,10 @@ __global__ void groupwise_verify_kernel(
     //     printf("scale %f %f\n", float(scale[0]), float(scale[1]));
     // }
 
-    float fp4_lut[] = {0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0, 
-                       0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
-
-    ElementA A_ptr = A;
-    uint8_t * B_ptr = reinterpret_cast<uint8_t *>(B);
-    ElementScalePacked scale_ptr = scale;
-    ElementD D_ptr = D;
+    ElementA *A_ptr = A;
+    uint8_t *B_ptr = reinterpret_cast<uint8_t *>(B);
+    ElementScalePacked *scale_ptr = scale;
+    ElementD *D_ptr = D;
 
     int bid = blockIdx.x;
     int tid = threadIdx.x;
@@ -194,52 +252,54 @@ __global__ void groupwise_verify_kernel(
         int N = get<1>(problem_sizes[group_id]);
         int K = get<2>(problem_sizes[group_id]);
 
-        for (int m = bid; m < M; m += gridDim.x) {
-            for (int n = tid; n < N; n += blockDim.x) {
-
-                float accum = 0.0f;
-
-                for (int k = 0; k < K; k += 2) {
-
-                    ElementA local_A_ptr = A_ptr + m * K + k;
-                    uint8_t * local_B_ptr = B_ptr + n * K / 2 + k / 2;
-                    ElementScalePacked local_scale_ptr = scale_ptr + (k / block_tile_k) * N + n;
-
-                    float elem_A_0 = local_A_ptr[0];
-                    float elem_A_1 = local_A_ptr[1];
-                    uint8_t elem_B_low_ = (*local_B_ptr) & 0xF;
-                    uint8_t elem_B_high_  = ((*local_B_ptr) & 0xF0) >> 4;
-                    // float elem_B_low = (elem_B_low_ < 8) ? elem_B_low_ : (float)elem_B_low_ - 16;
-                    // float elem_B_high = (elem_B_high_ < 8) ? elem_B_high_ : (float)elem_B_high_ - 16;
-                    float elem_B_low = fp4_lut[elem_B_low_];
-                    float elem_B_high = fp4_lut[elem_B_high_];
-
-                    int scale_idx = (k % block_tile_k) / group_size;
-                    float scale = static_cast<float>((*local_scale_ptr)[scale_idx]);
-
-                    accum += elem_A_0 * elem_B_low * scale + elem_A_1 * elem_B_high * scale;
-
-                    // if (group_id == 0 && bid == 0 && tid == 0)
-                    //     printf("A %f %f B %f %f scale %f accum %f\n",
-                    //         elem_A_0,
-                    //         elem_A_1,
-                    //         elem_B_low,
-                    //         elem_B_high,
-                    //         scale,
-                    //         accum
-                    //     );
-                }
-
-                ElementD local_D_ptr = D_ptr + m * N + n;
-                *local_D_ptr = accum;
-            }
-        }
+        single_gemm_varify(
+          bid, tid,
+          block_tile_k, group_size,
+          M, N, K,
+          A_ptr, B_ptr, scale_ptr, D_ptr
+        );
 
         A_ptr += M * K;
         B_ptr += N * K / 2;
         scale_ptr += N * K / block_tile_k;
         D_ptr += M * N;
     }
+}
+
+template <
+    typename ElementA,
+    typename ElementB,
+    typename ElementScalePacked,
+    typename ElementD,
+    typename StrideA,
+    typename StrideB
+>
+__global__ void groupwise_verify_kernel(
+    int M, int N, int K,
+    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementD *D,
+    int block_tile_k, int group_size,
+    StrideA stride_A, StrideB stride_B
+) {
+    ElementA *A_ptr = A;
+    uint8_t *B_ptr = reinterpret_cast<uint8_t *>(B);
+    ElementScalePacked *scale_ptr = scale;
+    ElementD *D_ptr = D;
+
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+
+    single_gemm_varify(
+      bid, tid,
+      block_tile_k, group_size,
+      M, N, K,
+      A_ptr, B_ptr, scale_ptr, D_ptr
+    );
+
+    // A_ptr += M * K;
+    // B_ptr += N * K / 2;
+    // scale_ptr += N * K / block_tile_k;
+    // D_ptr += M * N;
+    
 }
 
 
@@ -255,13 +315,35 @@ template <
 void groupwise_verify(
     ProblemSizes problem_sizes,
     int group_num,
-    ElementA A, ElementB B, ElementScalePacked scale, ElementD D,
+    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementD *D,
     int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
     groupwise_verify_kernel<<<1024, 1024>>>(
         problem_sizes, 
         group_num, 
+        A, B, scale, D,
+        block_tile_k, group_size,
+        stride_A, stride_B);
+    cudaDeviceSynchronize();
+}
+
+template <
+    typename ElementA,
+    typename ElementB,
+    typename ElementScalePacked,
+    typename ElementD,
+    typename StrideA,
+    typename StrideB
+>
+void groupwise_verify(
+    int M, int N, int K,
+    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementD *D,
+    int block_tile_k, int group_size,
+    StrideA stride_A, StrideB stride_B
+) {
+    groupwise_verify_kernel<<<1024, 1024>>>(
+        M, N, K,
         A, B, scale, D,
         block_tile_k, group_size,
         stride_A, stride_B);
