@@ -189,7 +189,7 @@ __device__ void single_gemm_varify(
         }
 
         ElementD *local_D_ptr = D_ptr + m * N + n;
-        *local_D_ptr = accum;
+        *local_D_ptr = ElementD(accum);
     }
   }
 }

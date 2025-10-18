@@ -1499,6 +1499,15 @@ public:
   tensormaps_cp_fence_release (
       TensorMapStorage& shared_tensormaps,
       cute::tuple<TMs...> const& input_tensormaps) {
+
+    // [None][fix] Fix W4A8 MoE kernel issue
+    // https://github.com/NVIDIA/TensorRT-LLM/pull/7072
+    if (cute::elect_one_sync())
+    {
+        cute::tma_desc_commit_group();
+        cute::tma_desc_wait_group();
+    }
+
     // Entire warp must do this (i.e. it's aligned)
     tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
     tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);

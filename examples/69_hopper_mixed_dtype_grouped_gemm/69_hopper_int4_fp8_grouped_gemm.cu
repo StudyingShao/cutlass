@@ -111,14 +111,14 @@ using QuantType = cutlass::float_e2m1_t;
 // using ElementScalePacked = cutlass::Array<ElementScale, 2>;
 //--------------------------------------------------------------------------------------------
 // constexpr int TileShapeK = 512;
-// using ElementScale = cutlass::half_t;
+// using ElementScale = cutlass::bfloat16_t;
 // using ElementScalePacked = cutlass::Array<ElementScale, 4>;
 //--------------------------------------------------------------------------------------------
 
 #define GROUP_SIZE 32
 // constexpr int TileShapeK = 512; // static_assert failed -> DispatchPolicy::Stages >= 2
-constexpr int TileShapeK = 256;
-// constexpr int TileShapeK = 128;
+// constexpr int TileShapeK = 256;
+constexpr int TileShapeK = 128;
 using ElementScale = cutlass::float_ue8m0_t;
 using ElementScalePacked = cutlass::Array<ElementScale, TileShapeK / GROUP_SIZE>;
 
@@ -157,7 +157,7 @@ using LayoutScale = cutlass::layout::RowMajor;
 
 // C/D matrix configuration
 // using         ElementC    = float;                                // Element type for C and D matrix operands
-using         ElementC    = cutlass::half_t;                                // Element type for C and D matrix operands
+using         ElementC    = cutlass::bfloat16_t;                                // Element type for C and D matrix operands
 using         LayoutC     = cutlass::layout::RowMajor;                      // Layout type for C and D matrix operands
 constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
 
