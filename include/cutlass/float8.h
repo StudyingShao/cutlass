@@ -1194,6 +1194,8 @@ struct float_ue8m0_t : public float_exmy_base<cutlass::detail::FpEncoding::UE8M0
       return f1;
     #else
       using FP32Bits = cutlass::detail::FpBitRepresentation<uint32_t, 32, 8, 23, cutlass::detail::NanInfEncoding::IEEE_754>;
+
+      ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
       if (x.storage == 0x00) {
         return cutlass::detail::copy_bits<FP32Bits::Storage, float>(0x00400000);
       }
@@ -1205,6 +1207,12 @@ struct float_ue8m0_t : public float_exmy_base<cutlass::detail::FpEncoding::UE8M0
         FP32Bits::Storage f = (f8 << FP32Bits::NUM_MANTISSA_BITS);
         return cutlass::detail::copy_bits<FP32Bits::Storage, float>(f);
       }
+      ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+      // // Only retain the part of the regular value, remove NAN and INF handling
+      // auto f8 = static_cast<FP32Bits::Storage>(x.storage);
+      // FP32Bits::Storage f = (f8 << FP32Bits::NUM_MANTISSA_BITS);
+      // return cutlass::detail::copy_bits<FP32Bits::Storage, float>(f);
+      ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     #endif
   }
 

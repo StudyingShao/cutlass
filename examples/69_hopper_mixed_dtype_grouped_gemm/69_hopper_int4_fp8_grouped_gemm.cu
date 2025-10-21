@@ -88,6 +88,8 @@
 #include "grouped_mixed_dtype_utils.hpp"
 #include "host_validation.hpp"
 
+#include "BF16_MXFP4_Test.h"
+
 // #define PROFILE
 
 using namespace cute;
@@ -96,8 +98,8 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M
 // using MmaType = cutlass::float_e4m3_t;
 // using QuantType = cutlass::int4b_t;
 
-using MmaType = cutlass::bfloat16_t;
-using QuantType = cutlass::float_e2m1_t;
+using MmaType = cutlass::bfloat16_t;     // activations
+using QuantType = cutlass::float_e2m1_t; // weights
 
 
 // constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
@@ -119,6 +121,7 @@ using QuantType = cutlass::float_e2m1_t;
 // constexpr int TileShapeK = 512; // static_assert failed -> DispatchPolicy::Stages >= 2
 // constexpr int TileShapeK = 256;
 constexpr int TileShapeK = 128;
+// constexpr int TileShapeK = 64;
 using ElementScale = cutlass::float_ue8m0_t;
 using ElementScalePacked = cutlass::Array<ElementScale, TileShapeK / GROUP_SIZE>;
 
@@ -841,12 +844,14 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-// #include "BF16_MXFP4_Test.h"
-
 int main(int argc, char const **args) {
 
   // FP4 -> BF16 Convertor
   // MXFP4_test();
+  // return 0;
+
+  // FP8 UE8M0 -> FP32 Convertor
+  // UE8M0_FP32_test();
   // return 0;
 
 

@@ -857,6 +857,24 @@ public:
     }
   }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  template <class T>
+  CUTLASS_DEVICE float 
+  scale_convertor(T scale) {
+    if constexpr (cute::is_same_v<ElementA, cutlass::float_e2m1_t>) {
+
+      cutlass::float_ue8m0_t scale_ue8m0 = scale;
+      // uint16_t scale_bits = *reinterpret_cast<uint8_t*>(&scale_ue8m0);
+      // printf("Scale value: %f, Scale bits: 0x%04x\n", static_cast<float>(scale), scale_bits);
+
+      uint32_t temp = 0;
+      temp = (temp | *reinterpret_cast<uint8_t*>(&scale_ue8m0)) << 23;
+      return *reinterpret_cast<float*>(&temp);
+    }
+    else {
+      return scale;
+    }
+  }
+
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Consumer Perspective
   template <
@@ -1103,10 +1121,10 @@ public:
                 auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
 
                 if (chunk_id_ == 0) {
-                  accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * static_cast<float>(tCrS(scale_coord)[0]);
+                  accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * scale_convertor(tCrS(scale_coord)[0]);
                 }
                 else {
-                  accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), static_cast<float>(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
+                  accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
                 }
               }
             }
@@ -1188,7 +1206,7 @@ public:
                       auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
                       auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
 
-                      accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), static_cast<float>(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
+                      accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
                     }
                   }
                 }
@@ -1266,7 +1284,7 @@ public:
                   auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
                   int scale_idx = k_block / NumMMAsPerChunk;
 
-                  accum(accum_coord) = fma(intermediate(accum_coord), static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
+                  accum(accum_coord) = fma(intermediate(accum_coord), scale_convertor(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
                 }
               }
             }
