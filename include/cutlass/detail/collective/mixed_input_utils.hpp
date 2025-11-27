@@ -605,6 +605,113 @@ psx_cvt_lut_prmt_fp4x8_to_bf16x8
   return bf16x8_raw;
 }
 
+__device__ __inline__
+__nv_bf16x8_storage_t
+psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved
+(
+    const __nv_fp4x8_storage_t fp4x8
+)
+{
+    // interleaved version
+    // input fp4x8: 7531 6420
+    // output bf16x8: 7654 3210
+
+    __nv_bf16x8_storage_t bf16x8_raw = {0, 0};
+    __nv_bf16x2_storage_t *bf16x2_raw = reinterpret_cast<__nv_bf16x2_storage_t *>(&bf16x8_raw);
+
+    unsigned h4b_em_fp4x4 = (fp4x8 & 0x77770000U) >> 16U;
+    unsigned l4b_em_fp4x4 = (fp4x8 & 0x00007777U);
+    
+    __nv_fp8x4_storage_t h4b_2to9_bits = cvt_lut_bf16(h4b_em_fp4x4); // 7531
+    __nv_fp8x4_storage_t l4b_2to9_bits = cvt_lut_bf16(l4b_em_fp4x4); // 6420
+    
+    __nv_fp8x4_storage_t h4b_2to9_bits_pad0 = h4b_2to9_bits & 0x00FFFFFF; // [0]531
+
+    bf16x2_raw[0] = prmt(h4b_2to9_bits_pad0, l4b_2to9_bits, 0x7470U) << 6U; // 1 0
+    bf16x2_raw[1] = prmt(h4b_2to9_bits_pad0, l4b_2to9_bits, 0x7571U) << 6U; // 3 2
+
+    h4b_2to9_bits_pad0 = h4b_2to9_bits & 0xFFFFFF00; // 753[0]
+
+    bf16x2_raw[2] = prmt(h4b_2to9_bits_pad0, l4b_2to9_bits, 0x4642U) << 6U; // 5 4
+    bf16x2_raw[3] = prmt(h4b_2to9_bits_pad0, l4b_2to9_bits, 0x4743U) << 6U; // 7 6
+
+    __nv_fp4x8_storage_t fp4x8_ = fp4x8;
+
+    bf16x2_raw[3] = (fp4x8_ & 0xC000C000U) | bf16x2_raw[3];
+    fp4x8_ = fp4x8_ << 4U;
+    bf16x2_raw[2] = (fp4x8_ & 0xC000C000U) | bf16x2_raw[2];
+    fp4x8_ = fp4x8_ << 4U;
+    bf16x2_raw[1] = (fp4x8_ & 0xC000C000U) | bf16x2_raw[1];
+    fp4x8_ = fp4x8_ << 4U;
+    bf16x2_raw[0] = (fp4x8_ & 0xC000C000U) | bf16x2_raw[0];
+
+    return bf16x8_raw;
+}
+
+__device__ __inline__
+__nv_bf16x8_storage_t
+psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved_v2
+(
+    const __nv_fp4x8_storage_t fp4x8
+)
+{
+    // interleaved version
+    // input fp4x8: 7362 5140
+    // output bf16x8: 7654 3210
+
+    __nv_bf16x8_storage_t bf16x8_raw;
+    __nv_bf16x2_storage_t *bf16x2_raw = reinterpret_cast<__nv_bf16x2_storage_t *>(&bf16x8_raw);
+
+    __nv_fp8x4_storage_t h_fp8x4_0to1_bits = (fp4x8 & 0xC0C0C0C0U) >> 6; // 7654
+    __nv_fp8x4_storage_t l_fp8x4_0to1_bits = (fp4x8 & 0x0C0C0C0CU) >> 2; // 3210
+    
+    unsigned h4b_em_fp4x4 = (fp4x8 & 0x77770000U) >> 16U;
+    unsigned l4b_em_fp4x4 = (fp4x8 & 0x00007777U);
+
+    __nv_fp8x4_storage_t h4b_2to9_bits = cvt_lut_bf16(h4b_em_fp4x4); // 7362
+    __nv_fp8x4_storage_t l4b_2to9_bits = cvt_lut_bf16(l4b_em_fp4x4); // 5140
+
+    bf16x2_raw[0] = prmt(l_fp8x4_0to1_bits, l4b_2to9_bits, 0x5240U) << 6U; // 1 0
+    bf16x2_raw[1] = prmt(l_fp8x4_0to1_bits, h4b_2to9_bits, 0x7260U) << 6U; // 3 2
+
+    bf16x2_raw[2] = prmt(h_fp8x4_0to1_bits, l4b_2to9_bits, 0x5341U) << 6U; // 5 4
+    bf16x2_raw[3] = prmt(h_fp8x4_0to1_bits, h4b_2to9_bits, 0x7361U) << 6U; // 7 6
+
+    return bf16x8_raw;
+}
+
+__device__ __inline__
+__nv_bf16x8_storage_t
+psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved_v3
+(
+    const __nv_fp4x8_storage_t fp4x8
+)
+{
+    // interleaved version
+    // input fp4x8: 7564 3120
+    // output bf16x8: 7654 3210
+
+    __nv_bf16x8_storage_t bf16x8_raw;
+    __nv_bf16x2_storage_t *bf16x2_raw = reinterpret_cast<__nv_bf16x2_storage_t *>(&bf16x8_raw);
+
+    __nv_fp8x4_storage_t h_fp8x4_0to1_bits = (fp4x8 & 0xC0C0C0C0U) >> 6; // 7632
+    __nv_fp8x4_storage_t l_fp8x4_0to1_bits = (fp4x8 & 0x0C0C0C0CU) >> 2; // 5410
+    
+    unsigned h4b_em_fp4x4 = (fp4x8 & 0x77770000U) >> 16U;
+    unsigned l4b_em_fp4x4 = (fp4x8 & 0x00007777U);
+
+    __nv_fp8x4_storage_t h4b_2to9_bits = cvt_lut_bf16(h4b_em_fp4x4); // 7564
+    __nv_fp8x4_storage_t l4b_2to9_bits = cvt_lut_bf16(l4b_em_fp4x4); // 3120
+
+    bf16x2_raw[0] = prmt(l_fp8x4_0to1_bits, l4b_2to9_bits, 0x5240U) << 6U; // 1 0
+    bf16x2_raw[1] = prmt(h_fp8x4_0to1_bits, l4b_2to9_bits, 0x5341U) << 6U; // 3 2
+
+    bf16x2_raw[2] = prmt(l_fp8x4_0to1_bits, h4b_2to9_bits, 0x7260U) << 6U; // 5 4
+    bf16x2_raw[3] = prmt(h_fp8x4_0to1_bits, h4b_2to9_bits, 0x7361U) << 6U; // 7 6
+
+    return bf16x8_raw;
+}
+
 template<class Collective>
 struct MixedInputUtils {
 private:
@@ -834,7 +941,11 @@ public:
     auto&& src_ = cute::recast<__nv_fp4x8_storage_t>(src)(0);
     auto&& dst_ = cute::recast<__nv_bf16x8_storage_t>(dst)(0);
     
-    dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8(src_);
+    // dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8(src_);
+    // dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved(src_);
+    // dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved_v2(src_);
+    dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved_v3(src_);
+
   }
 
 

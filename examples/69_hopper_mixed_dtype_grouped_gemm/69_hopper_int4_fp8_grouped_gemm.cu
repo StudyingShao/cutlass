@@ -268,6 +268,7 @@ cutlass::DeviceAllocation<typename ProblemShape::UnderlyingProblemShape> problem
 
 cutlass::DeviceAllocation<MmaType> block_A;
 cutlass::DeviceAllocation<QuantType> block_B;
+cutlass::DeviceAllocation<QuantType> block_B_interleaved;
 cutlass::DeviceAllocation<ElementB> block_B_modified;
 cutlass::DeviceAllocation<MmaType> block_B_dq;
 cutlass::DeviceAllocation<ElementScale> block_scale;
@@ -419,6 +420,7 @@ void allocate(Options const& options) {
 
   block_A.reset(total_elements_A);
   block_B.reset(total_elements_B);
+  block_B_interleaved.reset(total_elements_B);
   block_B_modified.reset(total_elements_B);
   block_B_dq.reset(total_elements_B_dq);
   block_C.reset(total_elements_C);
@@ -457,7 +459,8 @@ void initialize(Options& options) {
   for (int32_t i = 0; i < options.groups; ++i) {
     ptr_A_host.at(i) = block_A.get() + offset_A.at(i);
     // ptr_B_host.at(i) = block_B_modified.get() + offset_B.at(i);
-    ptr_B_host.at(i) = block_B.get() + offset_B.at(i);
+    // ptr_B_host.at(i) = block_B.get() + offset_B.at(i);
+    ptr_B_host.at(i) = block_B_interleaved.get() + offset_B.at(i);
     ptr_B_dq_host.at(i) = block_B_dq.get() + offset_B_dq.at(i);
     ptr_C_host.at(i) = block_C.get() + offset_C.at(i);
     ptr_D_host.at(i) = block_D.get() + offset_D.at(i);
@@ -538,8 +541,22 @@ void initialize(Options& options) {
   // print("jiangs block_B (size=%d) min=%f max=%f\n",
     // int(block_B.size()), scope_min, scope_max); // jiangs block_B (size=4096) min=-8.000000 max=7.000000
   set_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 1);
-  print_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 'B');
+  print_device_int4<<<1, 1>>>(block_B.get(), options.groups * options.n, options.k, 'B');
 
+  if (cute::is_same_v<QuantType, cutlass::float_e2m1_t> && 
+      cute::is_same_v<MmaType, cutlass::bfloat16_t>)
+  {
+    interleave_fp4_Hopper<QuantType>(
+      block_B.get(), 
+      block_B_interleaved.get(), 
+      options.groups * options.n, 
+      options.k);
+  }
+  else
+  {
+    block_B_interleaved.copy_from_device(block_B.get());
+  }
+  print_device_int4<<<1, 1>>>(block_B_interleaved.get(), options.groups * options.n, options.k, 'B');
 
   cutlass::unified_encode_int4b(
     reinterpret_cast<cutlass::int4b_t const *>(block_B.get()),
@@ -847,6 +864,8 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
 int main(int argc, char const **args) {
 
   // FP4 -> BF16 Convertor
+  // interleave_w4a16_Hopper_test();
+  // interleave_fp4_Hopper_test();
   // MXFP4_test();
   // return 0;
 

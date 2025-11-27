@@ -37,20 +37,33 @@ __global__ void print_device_packed(T *ptr, int count, const char str = ' ') {
 
 
 template <typename T>
-__global__ void print_device_int4(T *ptr_, int count, const char str = ' ') {
+__global__ void print_device_int4(T *ptr_, int rows, int cols, const char str = ' ') {
 #ifdef ENABLE_PRINT
+
+  float e2m1_values[] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+  };
+
   if (thread0()) {
     printf("print_device(int4) %c ", str);
-    for (int i = 0; i < count / 2; i++)
+
+    for (int i = 0; i < rows; i++)
     {
-      uint8_t *ptr = reinterpret_cast<uint8_t *>(&ptr_[i]);
-      uint8_t low = *ptr & 0x0F;
-      uint8_t high = (*ptr & 0xF0) >> 4;
-  
-      printf("(%d):%d ", 2 * i, int(low));
-      printf("(%d):%d ", 2 * i + 1, int(high));
+      printf("(%d):  ", i);
+      for (int j = 0; j < cols / 2; j++)
+      {
+        uint8_t *ptr = reinterpret_cast<uint8_t *>(&ptr_[i * cols / 2 + j]);
+        uint8_t low = *ptr & 0x0F;
+        uint8_t high = (*ptr & 0xF0) >> 4;
+    
+        // printf("(%d):%d ", 2 * i, int(low));
+        // printf("(%d):%d ", 2 * i + 1, int(high));
+        printf("(%d):%f ", 2 * j, e2m1_values[low]);
+        printf("(%d):%f ", 2 * j + 1, e2m1_values[high]);
+      }
+      printf("\n");
     }
-    printf("\n");
   }
 #endif
 }
@@ -83,16 +96,23 @@ __global__ void set_device_sequential(T *ptr, int count, int value = 0) {
     }
 }
 
-__global__ void set_device_ue8m0(cutlass::float_ue8m0_t *ptr, int count) {
+__global__ void set_device_ue8m0(cutlass::float_ue8m0_t *ptr, int count, int default_val = 0) {
   if (thread0())
     for (int i = 0; i < count; i++)
     {
-      // 114 -> 0.000122
-      // 130 -> 8.000000
-      uint8_t value = 114 + (i % (131 - 114));
-      ptr[i] = *reinterpret_cast<cutlass::float_ue8m0_t *>(&value);
-
-      // printf("set_device_ue8m0 %d %f\n", int(value), static_cast<float>(ptr[i]));
+      if (default_val == 0)
+      {
+        // 114 -> 0.000122
+        // 130 -> 8.000000
+        uint8_t value = 114 + (i % (131 - 114));
+        ptr[i] = *reinterpret_cast<cutlass::float_ue8m0_t *>(&value);
+  
+        // printf("set_device_ue8m0 %d %f\n", int(value), static_cast<float>(ptr[i]));
+      }
+      else
+      {
+        ptr[i] = static_cast<cutlass::float_ue8m0_t>(default_val);
+      }
     }
 }
 
@@ -103,20 +123,61 @@ __global__ void set_device_int4(T *ptr_, int count, uint8_t value = 0) {
   // N x K
   // 16 x 256
   if (thread0())
-    for (int i = 0; i < count / 2; i++)
+  {
+    // for (int i = 0; i < count / 2; i++)
+    // {
+    //   uint8_t low = 0;
+
+    //   if (value == 0)
+    //     low = (i / (64 * 128)) % 15 + 1; // 1~15
+    //   else
+    //     low = value; // 0~14
+
+    //   uint8_t high = low; // 1~15
+    //   // uint8_t high = low + 1; // 1~15
+    //   uint8_t *ptr = reinterpret_cast<uint8_t *>(ptr_);
+    //   ptr[i] = (high << 4) | low;
+    // }
+
+    // // fp4:    1 2 3 4
+    // // bits:   0010 0100 0101 0110
+    // // 16-bit: 0x2456U
+    // for (int i = 0; i < count / 4; i++)
+    // {
+    //   uint16_t value = 0x2456U;
+    //   uint16_t *ptr = reinterpret_cast<uint16_t *>(ptr_);
+    //   ptr[i] = value;
+    // }
+
+    uint32_t *ptr = reinterpret_cast<uint32_t *>(ptr_);
+
+    for (int i = 0; i < count / 8; i++)
     {
-      uint8_t low = 0;
-
-      if (value == 0)
-        low = (i / (64 * 128)) % 15 + 1; // 1~15
-      else
-        low = value; // 0~14
-
-      uint8_t high = low; // 1~15
-      // uint8_t high = low + 1; // 1~15
-      uint8_t *ptr = reinterpret_cast<uint8_t *>(ptr_);
-      ptr[i] = (high << 4) | low;
+      ptr[i] = 0xFFFFFFFFF;
     }
+  
+    // mma0
+    ptr[0] = 0x76543210U;   // 0-7
+    ptr[1] = 0xFEDCBA98U;   // 8-15
+    ptr[128] = 0xFEDCBA98U; // 1024-1031
+    ptr[129] = 0x76543210U; // 1032-1040
+    
+    // mma1
+    ptr[2] = 0x76543210U;   // 16-23
+    ptr[3] = 0xFEDCBA98U;   // 24-31
+    ptr[130] = 0xFEDCBA98U; // 1040-1047
+    ptr[131] = 0x76543210U; // 1048-1055
+    
+    
+    // mma4
+    ptr[8] = 0x76543210U;   // 64-71
+    ptr[9] = 0xFEDCBA98U;
+    ptr[136] = 0xFEDCBA98U;
+    ptr[137] = 0x76543210U;
+      
+   
+  }
+
 #endif
 }
 

@@ -531,10 +531,10 @@ void interleave_fp4(
     interleave_fp4_kernel<<<1024, 1024>>>(fp4_ptr, fp4_interleaved_ptr, rows, cols);
 }
 
-
+template<typename T>
 __global__ void interleave_fp4_Hopper_kernel(
-    cutlass::float_e2m1_t *fp4_ptr, 
-    cutlass::float_e2m1_t *fp4_interleaved_ptr, 
+    T *fp4_ptr, 
+    T *fp4_interleaved_ptr, 
     const int rows, 
     const int cols
 ) {
@@ -547,8 +547,8 @@ __global__ void interleave_fp4_Hopper_kernel(
         {
             int row_id = block_id / 8 * 16 + block_id % 8;
 
-            int index_a = row_id * cols / 2 + col_id; // column-major
-            int index_b = (row_id + 8) * cols / 2 + col_id; // column-major
+            int index_a = row_id * cols / 2 + col_id; // row-major
+            int index_b = (row_id + 8) * cols / 2 + col_id; // row-major
             
             uint8_t fp4x2_a = uint8_ptr[index_a];
             uint8_t fp4x2_b = uint8_ptr[index_b];
@@ -565,13 +565,15 @@ __global__ void interleave_fp4_Hopper_kernel(
     }
 }
 
+
+template<typename T>
 void interleave_fp4_Hopper(
-    cutlass::float_e2m1_t *fp4_ptr, 
-    cutlass::float_e2m1_t *fp4_interleaved_ptr, 
+    T *fp4_ptr, 
+    T *fp4_interleaved_ptr,
     const int rows, 
     const int cols
 ) {
-    // column-major input
+    // row-major input
     interleave_fp4_Hopper_kernel<<<1024, 1024>>>(fp4_ptr, fp4_interleaved_ptr, rows, cols);
 }
 
@@ -579,7 +581,10 @@ void interleave_fp4_Hopper(
 void interleave_fp4_Hopper_test()
 {
 
-    const int num = 64;
+    const int rows = 16;
+    const int cols = 128;
+
+    const int num = rows * cols;
 
     cutlass::float_e2m1_t fp4_a[num];
     cutlass::bfloat16_t   bf16_a[num];
@@ -599,7 +604,7 @@ void interleave_fp4_Hopper_test()
 
     cudaMemcpy(d_fp4_a, fp4_a, num * sizeof(cutlass::float_e2m1_t), cudaMemcpyHostToDevice);
 
-    interleave_fp4_Hopper(d_fp4_a, d_fp4_a_interleaved, 4, num / 4);
+    interleave_fp4_Hopper<cutlass::float_e2m1_t>(d_fp4_a, d_fp4_a_interleaved, 4, num / 4);
 
     printf("sizeof(cutlass::float_e2m1_t) = %lu\n", sizeof(cutlass::float_e2m1_t));
     
@@ -611,8 +616,6 @@ void interleave_fp4_Hopper_test()
             d_fp4_a_interleaved + 4 * i, d_bf16_a_interleaved + 8 * i
         );
     }
-        
-    
 
     cudaMemcpy(bf16_a, d_bf16_a, num * sizeof(cutlass::bfloat16_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(bf16_a_interleaved, d_bf16_a_interleaved, num * sizeof(cutlass::bfloat16_t), cudaMemcpyDeviceToHost);
@@ -620,11 +623,7 @@ void interleave_fp4_Hopper_test()
     for (int i=0; i < num; i++)
         printf("%d %d bf16  %f  %f\n", i / 16, i % 16, float(bf16_a[i]), float(bf16_a_interleaved[i]));
 
-
-
 }
-
-
 
 void MXFP4_test(){
 
