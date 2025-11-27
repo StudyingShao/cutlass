@@ -95,12 +95,6 @@
 using namespace cute;
 
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M,N,K> per group
-// using MmaType = cutlass::float_e4m3_t;
-// using QuantType = cutlass::int4b_t;
-
-using MmaType = cutlass::bfloat16_t;     // activations
-using QuantType = cutlass::float_e2m1_t; // weights
-
 
 // constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
 //--------------------------------------------------------------------------------------------
@@ -117,12 +111,33 @@ using QuantType = cutlass::float_e2m1_t; // weights
 // using ElementScalePacked = cutlass::Array<ElementScale, 4>;
 //--------------------------------------------------------------------------------------------
 
-#define GROUP_SIZE 32
 // constexpr int TileShapeK = 512; // static_assert failed -> DispatchPolicy::Stages >= 2
 // constexpr int TileShapeK = 256;
 constexpr int TileShapeK = 128;
 // constexpr int TileShapeK = 64;
+
+
+
+//--------------------------------------------------------------------------------------------
+
+// MXFP4 x BF16
+using MmaType = cutlass::bfloat16_t;     // activations
+using QuantType = cutlass::float_e2m1_t; // weights
+#define GROUP_SIZE 32
 using ElementScale = cutlass::float_ue8m0_t;
+
+//--------------------------------------------------------------------------------------------
+
+// // INT4 x FP8
+// using MmaType = cutlass::float_e4m3_t;      // activations
+// using QuantType = cutlass::int4b_t;         // weights
+// #define GROUP_SIZE 128
+// using ElementScale = cutlass::bfloat16_t;
+
+//--------------------------------------------------------------------------------------------
+
+
+// ElementScalePacked maximum 8xfp8 -> 64 bits
 using ElementScalePacked = cutlass::Array<ElementScale, TileShapeK / GROUP_SIZE>;
 
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
@@ -541,9 +556,9 @@ void initialize(Options& options) {
   // print("jiangs block_B (size=%d) min=%f max=%f\n",
     // int(block_B.size()), scope_min, scope_max); // jiangs block_B (size=4096) min=-8.000000 max=7.000000
   set_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 1);
-  print_device_int4<<<1, 1>>>(block_B.get(), options.groups * options.n, options.k, 'B');
+  print_device_4b<<<1, 1>>>(block_B.get(), options.groups * options.n, options.k, 'B');
 
-  if (cute::is_same_v<QuantType, cutlass::float_e2m1_t> && 
+  if constexpr (cute::is_same_v<QuantType, cutlass::float_e2m1_t> && 
       cute::is_same_v<MmaType, cutlass::bfloat16_t>)
   {
     interleave_fp4_Hopper<QuantType>(
@@ -556,7 +571,7 @@ void initialize(Options& options) {
   {
     block_B_interleaved.copy_from_device(block_B.get());
   }
-  print_device_int4<<<1, 1>>>(block_B_interleaved.get(), options.groups * options.n, options.k, 'B');
+  print_device_4b<<<1, 1>>>(block_B_interleaved.get(), options.groups * options.n, options.k, 'B');
 
   cutlass::unified_encode_int4b(
     reinterpret_cast<cutlass::int4b_t const *>(block_B.get()),
@@ -573,9 +588,12 @@ void initialize(Options& options) {
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
   
   // print("jiangs block_scale (size=%d)\n", int(block_scale.size())); // block_scale (size=16)
-  // set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size());
-  set_device_ue8m0<<<1, 1>>>(block_scale.get(), block_scale.size());
-
+  if constexpr (cute::is_same_v<ElementScale, cutlass::float_ue8m0_t>) {
+    set_device_ue8m0<<<1, 1>>>(block_scale.get(), block_scale.size());
+  }
+  else {
+    set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size());
+  }
   // initialize_scale(block_scale, options);
   print_device<<<1, 1>>>(block_scale.get(), block_scale.size(), 'S');
   cudaDeviceSynchronize();

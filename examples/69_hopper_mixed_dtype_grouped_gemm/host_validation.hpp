@@ -37,13 +37,23 @@ __global__ void print_device_packed(T *ptr, int count, const char str = ' ') {
 
 
 template <typename T>
-__global__ void print_device_int4(T *ptr_, int rows, int cols, const char str = ' ') {
+__global__ void print_device_4b(T *ptr_, int rows, int cols, const char str = ' ') {
 #ifdef ENABLE_PRINT
 
-  float e2m1_values[] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-  };
+  float lut[16];
+
+  if constexpr (cute::is_same_v<T, cutlass::float_e2m1_t>) {
+    // fp4 e2m1
+    float tmp[] = {0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0, 
+                   0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
+    memcpy(lut, tmp, sizeof(lut));
+  }
+  else {
+    // int4
+    float tmp[] = { 0.0,  1.0,  2.0,  3.0,  4.0,  5.0,  6.0,  7.0,
+                   -8.0, -7.0, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0};
+    memcpy(lut, tmp, sizeof(lut));
+  }
 
   if (thread0()) {
     printf("print_device(int4) %c ", str);
@@ -59,8 +69,8 @@ __global__ void print_device_int4(T *ptr_, int rows, int cols, const char str = 
     
         // printf("(%d):%d ", 2 * i, int(low));
         // printf("(%d):%d ", 2 * i + 1, int(high));
-        printf("(%d):%f ", 2 * j, e2m1_values[low]);
-        printf("(%d):%f ", 2 * j + 1, e2m1_values[high]);
+        printf("(%d):%f ", 2 * j, lut[low]);
+        printf("(%d):%f ", 2 * j + 1, lut[high]);
       }
       printf("\n");
     }
@@ -90,13 +100,16 @@ __global__ void set_device_sequential(T *ptr, int count, int value = 0) {
     for (int i = 0; i < count; i++)
     {
       if (value == 0)
-        ptr[i] = static_cast<T>((i + 1) % 50) * 0.1f;
+        ptr[i] = static_cast<T>(((i + 1) % 50) * 0.1f);
       else
         ptr[i] = static_cast<T>(value);
     }
 }
 
-__global__ void set_device_ue8m0(cutlass::float_ue8m0_t *ptr, int count, int default_val = 0) {
+__global__ void set_device_ue8m0(void *ptr_, int count, int default_val = 0) {
+
+  cutlass::float_ue8m0_t *ptr = reinterpret_cast<cutlass::float_ue8m0_t *>(ptr_);
+
   if (thread0())
     for (int i = 0; i < count; i++)
     {
@@ -201,6 +214,7 @@ __global__ void compare_device(T *out, T *ref, int count) {
 
 template <
     typename ElementA,
+    typename ElementB,
     typename ElementScalePacked,
     typename ElementD
 >
@@ -208,10 +222,23 @@ __device__ void single_gemm_varify(
   int bid, int tid,
   int block_tile_k, int group_size,
   int M, int N, int K,
-  ElementA *A_ptr, uint8_t *B_ptr, ElementScalePacked *scale_ptr, ElementD *D_ptr) {
+  ElementA *A_ptr, ElementB *B_ptr, ElementScalePacked *scale_ptr, ElementD *D_ptr) {
 
-  float fp4_lut[] = {0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0, 
-                      0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
+  float lut[16];
+
+  if constexpr (cute::is_same_v<ElementB, cutlass::float_e2m1_t>) {
+    // fp4 e2m1
+    float tmp[] = {0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0, 
+                   0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
+    memcpy(lut, tmp, sizeof(lut));
+  }
+  else {
+    // int4
+    float tmp[] = { 0.0,  1.0,  2.0,  3.0,  4.0,  5.0,  6.0,  7.0,
+                   -8.0, -7.0, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0};
+    memcpy(lut, tmp, sizeof(lut));
+  }
+
 
   for (int m = bid; m < M; m += gridDim.x) {
     for (int n = tid; n < N; n += blockDim.x) {
@@ -221,7 +248,7 @@ __device__ void single_gemm_varify(
         for (int k = 0; k < K; k += 2) {
 
             ElementA *local_A_ptr = A_ptr + m * K + k;
-            uint8_t *local_B_ptr = B_ptr + n * K / 2 + k / 2;
+            uint8_t *local_B_ptr = reinterpret_cast<uint8_t *>(B_ptr) + n * K / 2 + k / 2;
             ElementScalePacked *local_scale_ptr = scale_ptr + (k / block_tile_k) * N + n;
 
             float elem_A_0 = local_A_ptr[0];
@@ -230,8 +257,8 @@ __device__ void single_gemm_varify(
             uint8_t elem_B_high_  = ((*local_B_ptr) & 0xF0) >> 4;
             // float elem_B_low = (elem_B_low_ < 8) ? elem_B_low_ : (float)elem_B_low_ - 16;
             // float elem_B_high = (elem_B_high_ < 8) ? elem_B_high_ : (float)elem_B_high_ - 16;
-            float elem_B_low = fp4_lut[elem_B_low_];
-            float elem_B_high = fp4_lut[elem_B_high_];
+            float elem_B_low = lut[elem_B_low_];
+            float elem_B_high = lut[elem_B_high_];
 
             int scale_idx = (k % block_tile_k) / group_size;
             float scale = static_cast<float>((*local_scale_ptr)[scale_idx]);
@@ -250,7 +277,7 @@ __device__ void single_gemm_varify(
         }
 
         ElementD *local_D_ptr = D_ptr + m * N + n;
-        *local_D_ptr = ElementD(accum);
+        *local_D_ptr = static_cast<ElementD>(accum);
     }
   }
 }
@@ -301,7 +328,7 @@ __global__ void groupwise_verify_kernel(
     // }
 
     ElementA *A_ptr = A;
-    uint8_t *B_ptr = reinterpret_cast<uint8_t *>(B);
+    ElementB *B_ptr = B;
     ElementScalePacked *scale_ptr = scale;
     ElementD *D_ptr = D;
 
@@ -342,7 +369,7 @@ __global__ void groupwise_verify_kernel(
     StrideA stride_A, StrideB stride_B
 ) {
     ElementA *A_ptr = A;
-    uint8_t *B_ptr = reinterpret_cast<uint8_t *>(B);
+    ElementB *B_ptr = B;
     ElementScalePacked *scale_ptr = scale;
     ElementD *D_ptr = D;
 

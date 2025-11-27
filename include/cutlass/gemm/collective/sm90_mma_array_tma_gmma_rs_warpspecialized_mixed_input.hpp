@@ -871,7 +871,7 @@ public:
       return *reinterpret_cast<float*>(&temp);
     }
     else {
-      return scale;
+      return static_cast<float>(scale);
     }
   }
 
