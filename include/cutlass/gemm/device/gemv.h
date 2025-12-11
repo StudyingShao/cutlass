@@ -104,10 +104,10 @@ public:
   /// Computes the grid shape
   static dim3 get_grid_shape(Arguments const &args, dim3 const &block) { 
     if(platform::is_same<LayoutA, layout::ColumnMajor>::value) {
-      return dim3((args.problem_size.row() + (block.x - 1)) / block.x, 1, args.batch_count % 65536);
+      return dim3((args.M + (block.x - 1)) / block.x, 1, args.batch_count % 65536);
     }
     else {
-      return dim3((args.problem_size.row() + (block.y - 1)) / block.y, 1, args.batch_count % 65536);
+      return dim3((args.M / 4 + block.y - 1) / block.y, (args.max_N + 7) / 8, args.batch_count % 65536);
     }
   }
 
