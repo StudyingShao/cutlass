@@ -79,42 +79,42 @@ struct Gemv;
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T>
+template <typename T, int kElementsPerAccess>
 CUTLASS_GLOBAL
 void matrix_A_interleave_kernel(T *A_interleaved_, T *A_, int B, int M, int K) {
 
-  int kElementsAccess = 128 / cutlass::sizeof_bits<T>::value;
-  int interleave_block_k = blockDim.x * kElementsAccess;
+  int kPackedElements = 8 / cutlass::sizeof_bits<T>::value;
+  int interleave_block_k = blockDim.x * kElementsPerAccess;
 
   for (size_t b = blockIdx.y; b < B; b+= gridDim.y) {
     for (size_t m = blockIdx.x; m < M; m += gridDim.x) {
       for (size_t k = threadIdx.y * interleave_block_k; k < K; k+= blockDim.y * interleave_block_k) {
         
-        if (k + threadIdx.x * kElementsAccess >= K) {
+        if (k + threadIdx.x * kElementsPerAccess >= K) {
           break;
         }
 
-        T *A = A_;
-        T *A_interleaved = A_interleaved_;
+        uint8_t *A = reinterpret_cast<uint8_t *>(A_);
+        uint8_t *A_interleaved = reinterpret_cast<uint8_t *>(A_interleaved_);
 
         // move in the B dimension
-        A += b * M * K;
-        A_interleaved += b * M * K;
+        A += b * M * K / kPackedElements;
+        A_interleaved += b * M * K / kPackedElements;
 
         // move in the M dimension
-        A += m * K;
-        A_interleaved += (m / 2) * K * 2 + (m % 2) * interleave_block_k;
+        A += m * K / kPackedElements;
+        A_interleaved += (m / 2) * K * 2 / kPackedElements + (m % 2) * interleave_block_k / kPackedElements;
 
         // move in the K dimension
-        A += k + threadIdx.x * kElementsAccess;
-        A_interleaved += k * 2 + threadIdx.x * kElementsAccess;
+        A += k / kPackedElements + threadIdx.x * kElementsPerAccess / kPackedElements;
+        A_interleaved += k * 2 / kPackedElements + threadIdx.x * kElementsPerAccess / kPackedElements;
 
-        float4 *A_128b = reinterpret_cast<float4 *>(A);
-        float4 *A_interleaved_128b = reinterpret_cast<float4 *>(A_interleaved);
+        using ElementAccess = cutlass::Array<T, kElementsPerAccess>;
 
-        float4 temp1 = *A_128b;
+        ElementAccess *A_128b = reinterpret_cast<ElementAccess *>(A);
+        ElementAccess *A_interleaved_128b = reinterpret_cast<ElementAccess *>(A_interleaved);
 
-        *A_interleaved_128b = temp1;
+        *A_interleaved_128b = *A_128b;
       }
     }
   }
@@ -326,11 +326,11 @@ public:
 
 public:
 
-  template <typename T>
+  template <typename T, int kElementsPerAccess>
   static void matrix_A_interleave(T *A_interleaved, T* A, int B, int M, int K, CUstream_st *stream = 0) {
     dim3 grid(1024, 1024, 1);
     dim3 block(4, 64, 1);
-    matrix_A_interleave_kernel<<<grid, block, 0, stream>>>(A_interleaved, A, B, M, K);
+    matrix_A_interleave_kernel<T, kElementsPerAccess><<<grid, block, 0, stream>>>(A_interleaved, A, B, M, K);
     cudaStreamSynchronize(stream);
   }
 
