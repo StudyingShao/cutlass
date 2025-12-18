@@ -68,6 +68,7 @@ template <
                                           ///  It will be calculated automatically if set to 0.
   int kThreadsPerRow_ = 0,                ///< Number of threads in the k dimension.
                                           ///  It will be calculated automatically if set to 0.
+  int kSplitKSlices_ = 1,
   typename ElementSF_ = float,
   int kSFVecSize_ = 16
 >
@@ -131,6 +132,7 @@ template <
     int kElementsPerAccess_,
     int kThreadCount_,
     int kThreadsPerRow_,
+    int kSplitKSlices_,
     typename ElementSF_,
     int kSFVecSize_
 >
@@ -144,6 +146,7 @@ struct Gemv <
     kElementsPerAccess_,
     kThreadCount_,
     kThreadsPerRow_,
+    kSplitKSlices_,
     ElementSF_,
     kSFVecSize_
 >{
@@ -180,6 +183,7 @@ public:
   using FragmentB = Array<ElementB, kElementsPerAccess>;
 
   static int const kUnroll = 2;
+  static int const kSplitKSlices = kSplitKSlices_;
 
   using FragmentArrayA = Array<FragmentA, kUnroll>;
   using FragmentArrayB = Array<FragmentB, kUnroll>;
@@ -343,7 +347,7 @@ public:
 
   /// Determines whether kernel satisfies alignment
   static Status can_implement(int32_t K) {
-    if (K % (4 * kElementsPerAccess * kUnroll) != 0) {
+    if (K % (4 * kElementsPerAccess * kUnroll * kSplitKSlices) != 0) {
       return Status::kErrorMisalignedOperand;
     }
     return Status::kSuccess;
@@ -370,10 +374,14 @@ public:
   void operator()(Params const &params, SharedStorage &shared_storage) {
     
     // Loop over batch indices
-    for (int batch_idx = blockIdx.z; batch_idx < params.batch_count; batch_idx += gridDim.z) {
+    int batch_idx = blockIdx.z / kSplitKSlices;
+    int split_k_idx = blockIdx.z % kSplitKSlices;
+
+    for (; batch_idx < params.batch_count; batch_idx += gridDim.z) {
       int idx_col_k = threadIdx.x;
       int idx_row_m = 4 * (blockIdx.x * blockDim.y + threadIdx.y);
       int N = params.N[batch_idx];
+      int K_A_split = params.K * 2 / kSplitKSlices;
 
       int n_tile = blockIdx.y;
 
@@ -401,8 +409,8 @@ public:
         ElementC *ptr_D = params.ptr_D + batch_idx * params.batch_stride_D;
 
         // move in the k dimension
-        ptr_A += idx_col_k * kElementsPerAccess / kPackedElementsA;
-        ptr_B += (idx_col_k % 4) * kElementsPerAccess;
+        ptr_A += idx_col_k * kElementsPerAccess / kPackedElementsA + split_k_idx * K_A_split / kPackedElementsA;
+        ptr_B += (idx_col_k % 4) * kElementsPerAccess + split_k_idx * params.K / kSplitKSlices;
 
         // move in the m dimension
         ptr_A += idx_row_m * params.K / kPackedElementsA;
@@ -434,9 +442,9 @@ public:
         // cols of the rolling tile
         int const tileA_k = kThreadsPerRow * kElementsPerAccess;
         int unroll_tile_k = kUnroll * tileA_k;
-        int unroll_cols = params.K * 2 / unroll_tile_k * unroll_tile_k;
+        // int unroll_cols = params.K * 2 / unroll_tile_k * unroll_tile_k;
 
-        for (; unroll_col_k < unroll_cols; unroll_col_k += unroll_tile_k) {
+        for (; unroll_col_k < K_A_split; unroll_col_k += unroll_tile_k) {
 
           for (int unroll_idx = 0; unroll_idx < kUnroll; unroll_idx++) {
 
@@ -518,12 +526,28 @@ public:
             output_fragment = output_op(frag_mma_c);
           }
 
-          *ptr_D = output_fragment[0];
-          *(ptr_D + 2) = output_fragment[2];
-          if (n_CD + 1 < N) {
-            *(ptr_D + params.M) = output_fragment[1];
-            *(ptr_D + params.M + 2) = output_fragment[3];
+          if (kSplitKSlices > 1)
+          {
+            atomic_add<ElementC> atom_add;
+  
+            atom_add(ptr_D, output_fragment[0]);
+            atom_add(ptr_D + 2, output_fragment[2]);
+  
+            if (n_CD + 1 < N) {
+              atom_add(ptr_D + params.M, output_fragment[1]);
+              atom_add(ptr_D + params.M + 2, output_fragment[3]);
+            }
           }
+          else {
+            *ptr_D = output_fragment[0];
+            *(ptr_D + 2) = output_fragment[2];
+  
+            if (n_CD + 1 < N) {
+              *(ptr_D + params.M) = output_fragment[1];
+              *(ptr_D + params.M + 2) = output_fragment[3];
+            }
+          }
+          
         }
       }
     }
