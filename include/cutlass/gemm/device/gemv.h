@@ -76,7 +76,6 @@ public:
 
   static int const kThreadCount = GemvKernel::kThreadCount;
   static int const kThreadsPerRow = GemvKernel::kThreadsPerRow;
-  static int const kSplitKSlices = GemvKernel::kSplitKSlices;
 
   using Arguments = typename GemvKernel::Arguments;
   using Params = typename GemvKernel::Params;
@@ -108,7 +107,7 @@ public:
       return dim3((args.M + (block.x - 1)) / block.x, 1, args.batch_count % 65536);
     }
     else {
-      return dim3((args.M / 4 + block.y - 1) / block.y, (args.max_N + 7) / 8, (kSplitKSlices * args.batch_count) % 65536);
+      return dim3((args.M / 4 + block.y - 1) / block.y, (args.max_N + 7) / 8, (args.split_k_slices * args.batch_count) % 65536);
     }
   }
 
@@ -141,7 +140,7 @@ public:
 
     int smem_size = int(sizeof(typename GemvKernel::SharedStorage));
     
-    if (kSplitKSlices > 1) {
+    if (params_.split_k_slices > 1) {
         cudaMemset(params_.ptr_D, 0, params_.batch_count * params_.M * params_.max_N * sizeof(ElementC));
     }
 

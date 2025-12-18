@@ -68,7 +68,6 @@ template <
                                           ///  It will be calculated automatically if set to 0.
   int kThreadsPerRow_ = 0,                ///< Number of threads in the k dimension.
                                           ///  It will be calculated automatically if set to 0.
-  int kSplitKSlices_ = 1,
   typename ElementSF_ = float,
   int kSFVecSize_ = 16
 >
@@ -132,7 +131,6 @@ template <
     int kElementsPerAccess_,
     int kThreadCount_,
     int kThreadsPerRow_,
-    int kSplitKSlices_,
     typename ElementSF_,
     int kSFVecSize_
 >
@@ -146,7 +144,6 @@ struct Gemv <
     kElementsPerAccess_,
     kThreadCount_,
     kThreadsPerRow_,
-    kSplitKSlices_,
     ElementSF_,
     kSFVecSize_
 >{
@@ -183,7 +180,6 @@ public:
   using FragmentB = Array<ElementB, kElementsPerAccess>;
 
   static int const kUnroll = 2;
-  static int const kSplitKSlices = kSplitKSlices_;
 
   using FragmentArrayA = Array<FragmentA, kUnroll>;
   using FragmentArrayB = Array<FragmentB, kUnroll>;
@@ -208,6 +204,7 @@ public:
     int32_t        *N;
     int32_t         K;
     int32_t         max_N;
+    int32_t         split_k_slices;
 
     int32_t         batch_count;
     typename EpilogueOutputOp::Params output_op;
@@ -238,6 +235,7 @@ public:
       int32_t         *N,
       int32_t          K,
       int32_t          max_N,
+      int32_t          split_k_slices,
       int32_t          batch_count,
       typename EpilogueOutputOp::Params output_op,
       TensorRefA       ref_A,
@@ -256,6 +254,7 @@ public:
       N(N),
       K(K),
       max_N(max_N),
+      split_k_slices(split_k_slices),
       batch_count(batch_count),
       output_op(output_op),
       ref_A(ref_A),
@@ -276,6 +275,7 @@ public:
       int32_t *N,
       int32_t  K,
       int32_t  max_N,
+      int32_t  split_k_slices,
       typename EpilogueOutputOp::Params output_op,
       TensorRefA  ref_A,
       void const *ptr_B,
@@ -288,6 +288,7 @@ public:
         N,
         K,
         max_N,
+        split_k_slices,
         1,
         output_op,
         ref_A,
@@ -306,6 +307,7 @@ public:
       N = args.N;
       K = args.K;
       max_N = args.max_N;
+      split_k_slices = args.split_k_slices;
       batch_count = args.batch_count;
       output_op = args.output_op;
       ref_A = ref_A;
@@ -346,15 +348,11 @@ public:
   Gemv() {}
 
   /// Determines whether kernel satisfies alignment
-  static Status can_implement(int32_t K) {
-    if (K % (4 * kElementsPerAccess * kUnroll * kSplitKSlices) != 0) {
+  static Status can_implement(Arguments const &args) {
+    if (args.K % (4 * kElementsPerAccess * kUnroll * args.split_k_slices) != 0) {
       return Status::kErrorMisalignedOperand;
     }
     return Status::kSuccess;
-  }
-
-  static Status can_implement(Arguments const &args) {
-    return can_implement(args.K);
   }
 
   using MMA_16x8x16_F32F16F16 = cutlass::arch::Mma<
@@ -374,14 +372,14 @@ public:
   void operator()(Params const &params, SharedStorage &shared_storage) {
     
     // Loop over batch indices
-    int batch_idx = blockIdx.z / kSplitKSlices;
-    int split_k_idx = blockIdx.z % kSplitKSlices;
+    int batch_idx = blockIdx.z / params.split_k_slices;
+    int split_k_idx = blockIdx.z % params.split_k_slices;
 
     for (; batch_idx < params.batch_count; batch_idx += gridDim.z) {
       int idx_col_k = threadIdx.x;
       int idx_row_m = 4 * (blockIdx.x * blockDim.y + threadIdx.y);
       int N = params.N[batch_idx];
-      int K_A_split = params.K * 2 / kSplitKSlices;
+      int K_A_split = params.K * 2 / params.split_k_slices;
 
       int n_tile = blockIdx.y;
 
@@ -410,7 +408,7 @@ public:
 
         // move in the k dimension
         ptr_A += idx_col_k * kElementsPerAccess / kPackedElementsA + split_k_idx * K_A_split / kPackedElementsA;
-        ptr_B += (idx_col_k % 4) * kElementsPerAccess + split_k_idx * params.K / kSplitKSlices;
+        ptr_B += (idx_col_k % 4) * kElementsPerAccess + split_k_idx * params.K / params.split_k_slices;
 
         // move in the m dimension
         ptr_A += idx_row_m * params.K / kPackedElementsA;
@@ -526,7 +524,7 @@ public:
             output_fragment = output_op(frag_mma_c);
           }
 
-          if (kSplitKSlices > 1)
+          if (params.split_k_slices > 1)
           {
             atomic_add<ElementC> atom_add;
   
