@@ -171,12 +171,11 @@ public:
   // number of return elements in a global access
   static int const kElementsPerAccess = kElementsPerAccess_;
   static int const kSFVecSize = kSFVecSize_;
-  static_assert(kSFVecSize == 16, 
-    "Only SFVecSize = 16 is supported");
-  static int const kSFPerAccess = std::max(1, kElementsPerAccess / kSFVecSize);
-  static_assert(kSFPerAccess <= 4, 
-    "kElementsPerAccess cannot exceed 64");
+  // static_assert(kSFVecSize == 16, "Only SFVecSize = 16 is supported");
+  // static int const kSFPerAccess = std::max(1, kElementsPerAccess / kSFVecSize);
+  // static_assert(kSFPerAccess <= 4, "kElementsPerAccess cannot exceed 64");
   
+  static bool const kDequantizeA = cutlass::sizeof_bits<ElementA>::value == 4;
   static int const kPackedElementsA = cutlass::sizeof_bits<ElementA>::value == 4 ? 2 : 1;
 
   using FragmentA = Array<ElementA, kElementsPerAccess>;
@@ -191,11 +190,19 @@ public:
 
   // using FragmentCompute = Array<ElementAccumulator, kElementsPerAccess>;
   using FragmentCompute = Array<cutlass::half_t, kElementsPerAccess>;
-  using FragmentSF = Array<ElementSF, kSFPerAccess>;
+  // using FragmentSF = Array<ElementSF, kSFPerAccess>;
+
+  static_assert(!kDequantizeA || kSFVecSize == 128, "Only kSFVecSize = 128 is supported");
+  // static_assert(!kDequantizeA || kElementsPerAccess == 16, "Only kElementsPerAccess = 16 is supported");
+  // static_assert(!kDequantizeA || kUnroll == 2, "Only kUnroll = 2 is supported");
+  // static_assert(!kDequantizeA || kUnroll * 4 * kElementsPerAccess == kSFVecSize);
 
   // thread block shape (kThreadsPerRow, kThreadCount / kThreadsPerRow, 1)
   static int const kThreadCount = (kThreadCount_ <= 0) ? 128 : kThreadCount_;
   static int const kThreadsPerRow = 8; // fixed to 4 for mma.sync.aligned.m16n8k32. changed to 8 for interleaved format
+
+  static constexpr uint32_t MaxThreadsPerBlock = kThreadCount;
+  static constexpr uint32_t MinBlocksPerMultiprocessor = 8;
 
   //
   // Structures
@@ -223,8 +230,7 @@ public:
     int64_t         batch_stride_C;
     int64_t         batch_stride_D;
 
-    ElementSF const *ptr_SF_A;
-    ElementSF const *ptr_SF_B;
+    ElementSF const *ptr_SFA;
 
     //
     // Methods
@@ -248,8 +254,7 @@ public:
       int64_t          batch_stride_B,
       int64_t          batch_stride_C,
       int64_t          batch_stride_D,
-      ElementSF const *ptr_SF_A = nullptr,
-      ElementSF const *ptr_SF_B = nullptr
+      ElementSF const *ptr_SFA = nullptr
     ):
       // problem_size(problem_size),
       M(M),
@@ -266,8 +271,7 @@ public:
       batch_stride_B(batch_stride_B),
       batch_stride_C(batch_stride_C),
       batch_stride_D(batch_stride_D),
-      ptr_SF_A(ptr_SF_A),
-      ptr_SF_B(ptr_SF_B)
+      ptr_SFA(ptr_SFA)
     { }
 
     Arguments(
@@ -370,8 +374,9 @@ public:
 
 
   /// Executes one GEMV
+  // void operator()(Params const &params, SharedStorage &shared_storage) {
   CUTLASS_DEVICE
-  void operator()(Params const &params, SharedStorage &shared_storage) {
+  void operator()(Params const &params, char* smem_buf) {
     
     // Loop over batch indices
     int batch_idx = blockIdx.z / kSplitKSlices;
@@ -427,6 +432,18 @@ public:
         ptr_C += n_CD * params.M;
         ptr_D += n_CD * params.M;
 
+        ElementSF const *ptr_SFA;
+        if constexpr (kDequantizeA) {
+          // move in the batch dimension
+          ptr_SFA = params.ptr_SFA + batch_idx * params.batch_stride_A / kSFVecSize;
+
+          // move in the k dimension
+          ptr_SFA += split_k_idx * params.K / kSplitKSlices / kSFVecSize;
+
+          // move in the m dimension
+          ptr_SFA += (idx_row_m + idx_col_k / 4) * params.K / kSFVecSize;
+        }
+
         FragmentArrayC frag_mma_c;
         frag_mma_c.clear();
 
@@ -434,8 +451,7 @@ public:
         FragmentArrayA frag_array_A_row1;
         FragmentArrayB frag_array_B;
 
-        FragmentSF fragSFA;
-        FragmentSF fragSFB;
+        ElementSF SFA_row0, SFA_row1;
 
         int unroll_col_k = 0;
 
@@ -446,7 +462,28 @@ public:
 
         for (; unroll_col_k < K_A_split; unroll_col_k += unroll_tile_k) {
 
+
+          if constexpr (kDequantizeA) {
+            SFA_row0 = *ptr_SFA;
+            SFA_row1 = *(ptr_SFA + 2 * params.K / kSFVecSize);
+            ptr_SFA += 1;
+          }
+
+          FragmentArrayC frag_mma_accum;
+          frag_mma_accum.clear();
+
+          CUTLASS_PRAGMA_UNROLL
           for (int unroll_idx = 0; unroll_idx < kUnroll; unroll_idx++) {
+
+            // if constexpr (kDequantizeA) {
+            //   if constexpr (unroll_idx % (kSFVecSize / 4 / kElementsPerAccess) == 0) {
+            //     frag_mma_accum.clear();
+
+            //     SFA_row0 = *ptr_SFA;
+            //     SFA_row1 = *(ptr_SFA + 2 * params.K / kSFVecSize);
+            //     ptr_SFA += 1;
+            //   }
+            // }
 
             int unroll_col_k_ = unroll_col_k + unroll_idx * tileA_k;
 
@@ -472,6 +509,7 @@ public:
           NumericArrayConverter<cutlass::half_t, ElementB, kElementsPerAccess, Round> srcB_converter;
           MMA_16x8x16_F32F16F16 mma_op;
 
+          CUTLASS_PRAGMA_UNROLL
           for (int unroll_idx = 0; unroll_idx < kUnroll; unroll_idx++) {
   
             FragmentCompute fragA_compute_row0 = srcA_converter(frag_array_A_row0[unroll_idx]);
@@ -498,8 +536,20 @@ public:
               mma_2xfp16_B[0] = frag_2xfp16_B[0];
               mma_2xfp16_B[1] = frag_2xfp16_B[1];
 
-              mma_op(frag_mma_c, frag_mma_a, frag_mma_b, frag_mma_c);
+              if constexpr (kDequantizeA) {
+                mma_op(frag_mma_accum, frag_mma_a, frag_mma_b, frag_mma_accum);
+              }
+              else {
+                mma_op(frag_mma_c, frag_mma_a, frag_mma_b, frag_mma_c);
+              }
             }
+          }
+
+          if constexpr (kDequantizeA) {
+            frag_mma_c[0] += frag_mma_accum[0] * float(SFA_row0);
+            frag_mma_c[1] += frag_mma_accum[1] * float(SFA_row0);
+            frag_mma_c[2] += frag_mma_accum[2] * float(SFA_row1);
+            frag_mma_c[3] += frag_mma_accum[3] * float(SFA_row1);
           }
         }
 

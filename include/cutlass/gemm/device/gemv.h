@@ -147,7 +147,7 @@ public:
 
     // Launch
     cutlass::arch::synclog_setup();
-    cutlass::Kernel<GemvKernel><<<grid, block, smem_size, stream>>>(params_);
+    cutlass::device_kernel<GemvKernel><<<grid, block, smem_size, stream>>>(params_);
 
     //
     // Query for errors
