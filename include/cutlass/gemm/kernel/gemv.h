@@ -80,45 +80,96 @@ struct Gemv;
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T, int kElementsPerAccess>
+template <typename ElementA, 
+          typename ElementSF, 
+          int kElementsPerAccess,
+          int kSFVecSize>
 CUTLASS_GLOBAL
-void matrix_A_interleave_kernel(T *A_interleaved_, T *A_, int B, int M, int K) {
+void matrix_A_interleave_kernel(
+  ElementA *A_interleaved_, 
+  ElementA *A_, 
+  ElementSF *SFA_padded_,
+  ElementSF *SFA_,
+  int B, 
+  int M, 
+  int K) {
 
-  int kPackedElements = 8 / cutlass::sizeof_bits<T>::value;
-  int interleave_block_k = blockDim.x * kElementsPerAccess;
+    int kPackedElements = 8 / cutlass::sizeof_bits<ElementA>::value;
+    int interleave_block_k = blockDim.x * kElementsPerAccess;
 
-  for (size_t b = blockIdx.y; b < B; b+= gridDim.y) {
-    for (size_t m = blockIdx.x; m < M; m += gridDim.x) {
-      for (size_t k = threadIdx.y * interleave_block_k; k < K; k+= blockDim.y * interleave_block_k) {
-        
-        if (k + threadIdx.x * kElementsPerAccess >= K) {
-          break;
+    for (size_t b = blockIdx.y; b < B; b+= gridDim.y) {
+      for (size_t m = blockIdx.x; m < M; m += gridDim.x) {
+        for (size_t k = threadIdx.y * interleave_block_k; k < K; k+= blockDim.y * interleave_block_k) {
+          
+          if (k + threadIdx.x * kElementsPerAccess >= K) {
+            break;
+          }
+
+          uint8_t *A = reinterpret_cast<uint8_t *>(A_);
+          uint8_t *A_interleaved = reinterpret_cast<uint8_t *>(A_interleaved_);
+
+          // move in the B dimension
+          A += b * M * K / kPackedElements;
+          A_interleaved += b * M * K / kPackedElements;
+
+          // move in the M dimension
+          A += m * K / kPackedElements;
+          A_interleaved += (m / 2) * K * 2 / kPackedElements + (m % 2) * interleave_block_k / kPackedElements;
+
+          // move in the K dimension
+          A += k / kPackedElements + threadIdx.x * kElementsPerAccess / kPackedElements;
+          A_interleaved += k * 2 / kPackedElements + threadIdx.x * kElementsPerAccess / kPackedElements;
+
+          using ElementAccess = cutlass::Array<ElementA, kElementsPerAccess>;
+
+          if constexpr (cutlass::sizeof_bits<ElementA>::value == 4) {
+            // INT4 x FP8
+
+            const int num_uint32_t = cutlass::sizeof_bits<ElementAccess>::value / 32;
+
+            Array<uint32_t, num_uint32_t> results;
+            results.fill(0);
+
+            uint32_t *ptr = reinterpret_cast<uint32_t *>(A);
+            const int interleave_map[8] = {0, 4, 1, 5, 2, 6, 3, 7}; // {7, 3, 6, 2, 5, 1, 4, 0};
+            
+            for (int i = 0; i < num_uint32_t; i++) {
+              uint32_t value = ptr[i];
+          
+              for (int j = 0; j < 8; j++) {
+                  uint32_t int4_value = (value >> (j * 4)) & 0xF;                
+                  results[i] |= (int4_value << (interleave_map[j] * 4));
+              }
+            }
+
+            *reinterpret_cast<ElementAccess *>(A_interleaved) = *reinterpret_cast<ElementAccess *>(&results);
+
+            if (k % kSFVecSize == 0) {
+              int SFsPerRow = K / kSFVecSize;
+              int PaddedSFsPerRow = (K / kSFVecSize + 7) / 8 * 8;
+
+              // move in the B dimension
+              ElementSF *SFA = SFA_ + b * M * SFsPerRow;
+              ElementSF *SFA_padded = SFA_padded_ + b * M * PaddedSFsPerRow;
+
+              // move in the M dimension
+              SFA += m * SFsPerRow;
+              SFA_padded += m * PaddedSFsPerRow;
+
+              // move in the K dimension
+              SFA += k / kSFVecSize;
+              SFA_padded += k / kSFVecSize;
+
+              *SFA_padded = *SFA;
+            }
+          }
+          else {
+            // FP8 x FP8
+            *reinterpret_cast<ElementAccess *>(A_interleaved) = *reinterpret_cast<ElementAccess *>(A);
+          }
         }
-
-        uint8_t *A = reinterpret_cast<uint8_t *>(A_);
-        uint8_t *A_interleaved = reinterpret_cast<uint8_t *>(A_interleaved_);
-
-        // move in the B dimension
-        A += b * M * K / kPackedElements;
-        A_interleaved += b * M * K / kPackedElements;
-
-        // move in the M dimension
-        A += m * K / kPackedElements;
-        A_interleaved += (m / 2) * K * 2 / kPackedElements + (m % 2) * interleave_block_k / kPackedElements;
-
-        // move in the K dimension
-        A += k / kPackedElements + threadIdx.x * kElementsPerAccess / kPackedElements;
-        A_interleaved += k * 2 / kPackedElements + threadIdx.x * kElementsPerAccess / kPackedElements;
-
-        using ElementAccess = cutlass::Array<T, kElementsPerAccess>;
-
-        ElementAccess *A_128b = reinterpret_cast<ElementAccess *>(A);
-        ElementAccess *A_interleaved_128b = reinterpret_cast<ElementAccess *>(A_interleaved);
-
-        *A_interleaved_128b = *A_128b;
       }
     }
-  }
 }
 
 
@@ -171,15 +222,14 @@ public:
   // number of return elements in a global access
   static int const kElementsPerAccess = kElementsPerAccess_;
   static int const kSFVecSize = kSFVecSize_;
-  // static_assert(kSFVecSize == 16, "Only SFVecSize = 16 is supported");
-  // static int const kSFPerAccess = std::max(1, kElementsPerAccess / kSFVecSize);
-  // static_assert(kSFPerAccess <= 4, "kElementsPerAccess cannot exceed 64");
   
   static bool const kDequantizeA = cutlass::sizeof_bits<ElementA>::value == 4;
   static int const kPackedElementsA = cutlass::sizeof_bits<ElementA>::value == 4 ? 2 : 1;
+  static int const kSFsPerAccess = 128 / cutlass::sizeof_bits<ElementSF>::value;
 
   using FragmentA = Array<ElementA, kElementsPerAccess>;
   using FragmentB = Array<ElementB, kElementsPerAccess>;
+  using FragmentSF = Array<ElementSF, kSFsPerAccess>;
 
   static int const kUnroll = 2;
   static int const kSplitKSlices = kSplitKSlices_;
@@ -190,12 +240,10 @@ public:
 
   // using FragmentCompute = Array<ElementAccumulator, kElementsPerAccess>;
   using FragmentCompute = Array<cutlass::half_t, kElementsPerAccess>;
-  // using FragmentSF = Array<ElementSF, kSFPerAccess>;
 
   static_assert(!kDequantizeA || kSFVecSize == 128, "Only kSFVecSize = 128 is supported");
-  // static_assert(!kDequantizeA || kElementsPerAccess == 16, "Only kElementsPerAccess = 16 is supported");
-  // static_assert(!kDequantizeA || kUnroll == 2, "Only kUnroll = 2 is supported");
-  // static_assert(!kDequantizeA || kUnroll * 4 * kElementsPerAccess == kSFVecSize);
+  static_assert(!kDequantizeA || cutlass::sizeof_bits<ElementSF>::value == 16, "Only ElementSF of type BF16/FP16 is supported");
+  static_assert(!kDequantizeA || kUnroll * 4 * kElementsPerAccess == kSFVecSize);
 
   // thread block shape (kThreadsPerRow, kThreadCount / kThreadsPerRow, 1)
   static int const kThreadCount = (kThreadCount_ <= 0) ? 128 : kThreadCount_;
@@ -329,17 +377,41 @@ public:
 
   /// Shared memory storage structure
   union SharedStorage {
+    public:
+    //
+    // Type definitions
+    //
 
+    using ShapeSFA = MatrixShape<kThreadsPerRow + 1, kThreadCount / kThreadsPerRow * 2>;
+
+    //
+    // Data members
+    //
+
+    /// Buffer for SFA operand
+    AlignedBuffer<float4, ShapeSFA::kCount> SFA;
   };
 
 public:
 
-  template <typename T, int kElementsPerAccess>
-  static void matrix_A_interleave(T *A_interleaved, T* A, int B, int M, int K, CUstream_st *stream = 0) {
-    dim3 grid(1024, 1024, 1);
-    dim3 block(4, 64, 1);
-    matrix_A_interleave_kernel<T, kElementsPerAccess><<<grid, block, 0, stream>>>(A_interleaved, A, B, M, K);
-    cudaStreamSynchronize(stream);
+  static void matrix_A_interleave(
+    ElementA *A_interleaved, 
+    ElementA *A,
+    ElementSF *SFA_padded,
+    ElementSF *SFA,
+    int B, 
+    int M, 
+    int K, 
+    CUstream_st *stream = 0) {
+      dim3 grid(1024, 1024, 1);
+      dim3 block(4, 64, 1);
+      matrix_A_interleave_kernel<ElementA, ElementSF, kElementsPerAccess, kSFVecSize><<<grid, block, 0, stream>>>(
+        A_interleaved, A, SFA_padded, SFA, B, M, K);
+      cudaStreamSynchronize(stream);
+  }
+
+  static unsigned int get_SF_mem_size(int B, int M, int K) {
+    return B * M * ((K / kSFVecSize * sizeof(ElementSF) + 15) / 16 * 16);
   }
 
   //
@@ -374,10 +446,13 @@ public:
 
 
   /// Executes one GEMV
-  // void operator()(Params const &params, SharedStorage &shared_storage) {
+  // CUTLASS_DEVICE
+  // void operator()(Params const &params, char* smem_buf) {
   CUTLASS_DEVICE
-  void operator()(Params const &params, char* smem_buf) {
+  void operator()(Params const &params, SharedStorage &shared_storage) {
     
+    uint8_t *smem = reinterpret_cast<uint8_t *>(&shared_storage) + threadIdx.y * 16 * (kThreadsPerRow + 1);
+
     // Loop over batch indices
     int batch_idx = blockIdx.z / kSplitKSlices;
     int split_k_idx = blockIdx.z % kSplitKSlices;
@@ -393,12 +468,6 @@ public:
       if (n_tile >= (N + 7) / 8)
         return;
 
-      // if(threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-      //   for(int b = 0; b < params.batch_count; b++) {
-      //     printf("batch_idx %d, N %d\n", b, params.N[b]);
-      //   }
-      // }
-
       if (idx_row_m < params.M) {
         // problem_size (row = m, column = k)
         // matrix A (batch, m, k)
@@ -412,6 +481,9 @@ public:
 
         ElementC const *ptr_C = params.ptr_C + batch_idx * params.batch_stride_C;
         ElementC *ptr_D = params.ptr_D + batch_idx * params.batch_stride_D;
+
+        ElementSF *s_SFA_row0 = (ElementSF *)(smem + threadIdx.x / 4 * 64);
+        ElementSF *s_SFA_row1 = (ElementSF *)(smem + threadIdx.x / 4 * 64 + SharedStorage::ShapeSFA::kCount * 16 / 2);
 
         // move in the k dimension
         ptr_A += idx_col_k * kElementsPerAccess / kPackedElementsA + split_k_idx * K_A_split / kPackedElementsA;
@@ -434,14 +506,30 @@ public:
 
         ElementSF const *ptr_SFA;
         if constexpr (kDequantizeA) {
-          // move in the batch dimension
-          ptr_SFA = params.ptr_SFA + batch_idx * params.batch_stride_A / kSFVecSize;
+          if ((idx_col_k % 4) * kSFsPerAccess * kSFVecSize * 2 < K_A_split) {
+            
+            int PaddedSFsPerRow = (params.K / kSFVecSize + 7) / 8 * 8;
 
-          // move in the k dimension
-          ptr_SFA += split_k_idx * params.K / kSplitKSlices / kSFVecSize;
+            // move in the batch dimension
+            ptr_SFA = params.ptr_SFA + batch_idx * params.M * PaddedSFsPerRow;
 
-          // move in the m dimension
-          ptr_SFA += (idx_row_m + idx_col_k / 4) * params.K / kSFVecSize;
+            // move in the k dimension
+            ptr_SFA += split_k_idx * params.K / kSplitKSlices / kSFVecSize;
+
+            // move in the m dimension
+            ptr_SFA += (idx_row_m + idx_col_k / 4) * PaddedSFsPerRow;
+
+            ptr_SFA += (idx_col_k % 4) * kSFsPerAccess;
+
+            smem += threadIdx.x * 16;
+
+            arch::cp_async<16, arch::CacheOperation::Global>(
+                smem,
+                reinterpret_cast<uint8_t const *>(ptr_SFA));
+            arch::cp_async<16, arch::CacheOperation::Global>(
+                smem + SharedStorage::ShapeSFA::kCount * 16 / 2,
+                reinterpret_cast<uint8_t const *>(ptr_SFA + 2 * PaddedSFsPerRow));
+          }
         }
 
         FragmentArrayC frag_mma_c;
@@ -450,8 +538,6 @@ public:
         FragmentArrayA frag_array_A_row0;
         FragmentArrayA frag_array_A_row1;
         FragmentArrayB frag_array_B;
-
-        ElementSF SFA_row0, SFA_row1;
 
         int unroll_col_k = 0;
 
@@ -462,28 +548,11 @@ public:
 
         for (; unroll_col_k < K_A_split; unroll_col_k += unroll_tile_k) {
 
-
-          if constexpr (kDequantizeA) {
-            SFA_row0 = *ptr_SFA;
-            SFA_row1 = *(ptr_SFA + 2 * params.K / kSFVecSize);
-            ptr_SFA += 1;
-          }
-
           FragmentArrayC frag_mma_accum;
           frag_mma_accum.clear();
 
           CUTLASS_PRAGMA_UNROLL
           for (int unroll_idx = 0; unroll_idx < kUnroll; unroll_idx++) {
-
-            // if constexpr (kDequantizeA) {
-            //   if constexpr (unroll_idx % (kSFVecSize / 4 / kElementsPerAccess) == 0) {
-            //     frag_mma_accum.clear();
-
-            //     SFA_row0 = *ptr_SFA;
-            //     SFA_row1 = *(ptr_SFA + 2 * params.K / kSFVecSize);
-            //     ptr_SFA += 1;
-            //   }
-            // }
 
             int unroll_col_k_ = unroll_col_k + unroll_idx * tileA_k;
 
@@ -546,10 +615,21 @@ public:
           }
 
           if constexpr (kDequantizeA) {
+
+            cutlass::arch::cp_async_fence();
+            cutlass::arch::cp_async_wait<0>();
+            // __syncthreads();
+
+            ElementSF SFA_row0 = *(s_SFA_row0);
+            ElementSF SFA_row1 = *(s_SFA_row1);
+
             frag_mma_c[0] += frag_mma_accum[0] * float(SFA_row0);
             frag_mma_c[1] += frag_mma_accum[1] * float(SFA_row0);
             frag_mma_c[2] += frag_mma_accum[2] * float(SFA_row1);
             frag_mma_c[3] += frag_mma_accum[3] * float(SFA_row1);
+
+            s_SFA_row0++;
+            s_SFA_row1++;
           }
         }
 

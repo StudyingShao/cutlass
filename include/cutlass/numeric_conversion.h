@@ -5874,11 +5874,80 @@ private:
     return reinterpret_cast<const uint32_t&>(source);
   }
 
+  // Interleaved version of the converter
+  template <typename PackedResultType, typename PackedSrcType>
+  CUTLASS_DEVICE
+  static PackedResultType packed_convert(PackedSrcType const &source) {
+
+    static_assert((platform::is_same<PackedSrcType, source_type_packed_2>::value &&
+                   platform::is_same<PackedResultType, result_type_packed_2>::value) ||
+                  (platform::is_same<PackedSrcType, source_type_packed_4>::value &&
+                   platform::is_same<PackedResultType, result_type_packed_4>::value) ||
+                  (platform::is_same<PackedSrcType, source_type_packed_8>::value &&
+                   platform::is_same<PackedResultType, result_type_packed_8>::value),
+                  "Invalid PackedSrcType/PackedResultType must be 2, 4 or 8 to use private convert dispatch.");
+
+    // Hold output FP16s in reg. We need 1 reg for every 2 elements
+    using RegArray = cutlass::AlignedArray<uint32_t, PackedResultType::kElements / 2, sizeof(PackedResultType)>;
+    RegArray r;
+
+    // View the input as reg
+    uint32_t src_reg = to_reg(source);
+    
+    static constexpr uint32_t immLut = (0xf0 & 0xcc) ^ 0xaa;
+  
+    static constexpr uint32_t bottom_and_mask = 0x000F000F;
+    static constexpr uint32_t top_and_mask = 0x00F000F0;
+    static constexpr uint32_t bottom_xor_mask = 0x64086408;
+    static constexpr uint32_t top_xor_mask = 0x64806480;
+
+    asm volatile(
+        "{\n"
+        "  lop3.b32 %0, %1, %2, %3, %4;\n"
+        "}\n"
+        : "=r"(r[0])
+        : "r"(src_reg), "n"(bottom_and_mask), "n"(bottom_xor_mask), "n"(immLut));
+    asm volatile(
+        "{\n"
+        "  lop3.b32 %0, %1, %2, %3, %4;\n"
+        "}\n"
+        : "=r"(r[1])
+        : "r"(src_reg), "n"(top_and_mask), "n"(top_xor_mask), "n"(immLut));
+
+    src_reg >>= 8;
+    asm volatile(
+        "{\n"
+        "  lop3.b32 %0, %1, %2, %3, %4;\n"
+        "}\n"
+        : "=r"(r[2])
+        : "r"(src_reg), "n"(bottom_and_mask), "n"(bottom_xor_mask), "n"(immLut));
+    asm volatile(
+        "{\n"
+        "  lop3.b32 %0, %1, %2, %3, %4;\n"
+        "}\n"
+        : "=r"(r[3])
+        : "r"(src_reg), "n"(top_and_mask), "n"(top_xor_mask), "n"(immLut));
+
+    // This is the half2 {1032, 1032} represented as an integer.
+    static constexpr uint32_t FP16_TOP_MAGIC_NUM = 0x64086408;
+    // This is the half2 {1 / 16, 1 / 16} represented as an integer.
+    static constexpr uint32_t ONE_SIXTEENTH = 0x2c002c00;
+    // This is the half2 {-72, -72} represented as an integer.
+    static constexpr uint32_t NEG_72 = 0xd480d480;
+
+    asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(r[0]) : "r"(r[0]), "r"(FP16_TOP_MAGIC_NUM));
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(r[1]) : "r"(r[1]), "r"(ONE_SIXTEENTH), "r"(NEG_72));
+    asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(r[2]) : "r"(r[2]), "r"(FP16_TOP_MAGIC_NUM));
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(r[3]) : "r"(r[3]), "r"(ONE_SIXTEENTH), "r"(NEG_72));
+
+    return reinterpret_cast<PackedResultType&>(r);
+  }
+
   // The core converter uses bit tricks to construct a known FP16 number, then does a
   // subtraction in FP16 for the final result.
   template <typename PackedResultType, typename PackedSrcType>
   CUTLASS_DEVICE
-  static PackedResultType packed_convert(PackedSrcType const &source) {
+  static PackedResultType packed_convert_(PackedSrcType const &source) {
 
     static_assert((platform::is_same<PackedSrcType, source_type_packed_2>::value &&
                    platform::is_same<PackedResultType, result_type_packed_2>::value) ||
