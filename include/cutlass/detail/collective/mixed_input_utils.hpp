@@ -797,6 +797,62 @@ public:
     }
   }
 
+  /// Utilities to copy A from smem to RF
+  template <class SmemTiledCopyA,
+            class TensorASmemView,
+            class TensorACopyView
+            >
+  CUTLASS_DEVICE
+  static void copy_tensors_A(
+    SmemTiledCopyA const& smem_tiled_copy_A,
+    TensorASmemView const& tCsA,
+    TensorACopyView& tCrA_copy_view,
+    int k_block,
+    int read_stage) {
+
+    if (k_block < size<2>(tCsA.shape())) {
+      copy(smem_tiled_copy_A, tCsA(_,_,k_block,read_stage), tCrA_copy_view(_,_,k_block));
+    }
+  }
+
+
+  /// Utilities to copy Scales for A from smem to RF
+  template <class... Ts,
+            class... Us
+            >
+  CUTLASS_DEVICE
+  static void copy_tensors_SFA(
+    cute::tuple<Ts...> const& partitioned_mma_extra_info,
+    cute::tuple<Us...> const& tiled_copy_and_views,
+    int k_block,
+    int read_stage) {
+
+    // We are starting a new k-tile so copy the scale
+    if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
+      // nothing to do
+    }
+    else if constexpr (ModeHasScales) {
+      auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
+      auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
+      auto tCsS              = cute::get<0>(partitioned_mma_extra_info);
+
+      copy(smem_tiled_copy_S, tCsS(_,_,k_block,read_stage), tCrS_copy_view(_,_,k_block));
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+        // Nothing extra to do
+      } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        auto tCsZ              = cute::get<2>(partitioned_mma_extra_info);
+        auto tCrZ_copy_view    = cute::get<2>(tiled_copy_and_views);
+        copy(smem_tiled_copy_S, tCsZ(_,_,k_block,read_stage), tCrZ_copy_view(_,_,k_block));
+      } else {
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
+      }
+    } 
+    else {
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
+    }
+  }
+
+
   /// Utilities to copy A and extra inputs from smem to RF
   template <class SmemTiledCopyA,
             class TensorASmemView,
@@ -814,7 +870,9 @@ public:
     int k_block,
     int read_stage) {
 
-    copy(smem_tiled_copy_A, tCsA(_,_,k_block,read_stage), tCrA_copy_view(_,_,k_block));
+    if (k_block < size<2>(tCsA.shape())) {
+      copy(smem_tiled_copy_A, tCsA(_,_,k_block,read_stage), tCrA_copy_view(_,_,k_block));
+    }
 
     if (k_block == 0) {
       // We are starting a new k-tile so copy the scale

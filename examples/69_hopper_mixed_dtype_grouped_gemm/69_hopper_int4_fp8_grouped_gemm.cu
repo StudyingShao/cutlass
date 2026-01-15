@@ -111,28 +111,23 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M
 // using ElementScalePacked = cutlass::Array<ElementScale, 4>;
 //--------------------------------------------------------------------------------------------
 
-// constexpr int TileShapeK = 512; // static_assert failed -> DispatchPolicy::Stages >= 2
-// constexpr int TileShapeK = 256;
-constexpr int TileShapeK = 128;
-// constexpr int TileShapeK = 64;
-
-
-
-//--------------------------------------------------------------------------------------------
-
 // MXFP4 x BF16
-using MmaType = cutlass::bfloat16_t;     // activations
-using QuantType = cutlass::float_e2m1_t; // weights
-#define GROUP_SIZE 32
-using ElementScale = cutlass::float_ue8m0_t;
+// using MmaType = cutlass::bfloat16_t;     // activations
+// using QuantType = cutlass::float_e2m1_t; // weights
+// #define GROUP_SIZE 32
+// using ElementScale = cutlass::float_ue8m0_t;
+// constexpr int TileShapeK = 128;
 
 //--------------------------------------------------------------------------------------------
 
-// // INT4 x FP8
-// using MmaType = cutlass::float_e4m3_t;      // activations
-// using QuantType = cutlass::int4b_t;         // weights
-// #define GROUP_SIZE 128
-// using ElementScale = cutlass::bfloat16_t;
+// INT4 x FP8
+using MmaType = cutlass::float_e4m3_t;      // activations
+using QuantType = cutlass::int4b_t;         // weights
+#define GROUP_SIZE 128
+using ElementScale = cutlass::bfloat16_t;
+constexpr int TileShapeK = 512;
+// constexpr int TileShapeK = 256;
+// constexpr int TileShapeK = 128;
 
 //--------------------------------------------------------------------------------------------
 
@@ -561,7 +556,21 @@ void initialize(Options& options) {
   if constexpr (cute::is_same_v<QuantType, cutlass::float_e2m1_t> && 
       cute::is_same_v<MmaType, cutlass::bfloat16_t>)
   {
-    interleave_fp4_Hopper<QuantType>(
+    interleave_fp4xbf16_Hopper<QuantType>(
+      block_B.get(), 
+      block_B_interleaved.get(), 
+      options.groups * options.n, 
+      options.k);
+    // interleave_fp4_Hopper<QuantType>(
+    //   block_B.get(), 
+    //   block_B_interleaved.get(), 
+    //   options.groups * options.n, 
+    //   options.k);
+  }
+  else if constexpr (cute::is_same_v<QuantType, cutlass::int4b_t> && 
+    cute::is_same_v<MmaType, cutlass::float_e4m3_t>)
+  {
+    interleave_int4xfp8_Hopper<QuantType>(
       block_B.get(), 
       block_B_interleaved.get(), 
       options.groups * options.n, 
@@ -708,7 +717,7 @@ typename Gemm::Arguments args_from_options(Options const& options, bool host_pro
   arguments = Args {
     cutlass::gemm::GemmUniversalMode::kGrouped,
     {options.groups, problem_sizes.get(), nullptr},
-    {ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_scale_packed.get(), stride_S.get(), options.c},
+    {ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_scale_packed.get(), stride_S.get(), GROUP_SIZE},
     {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
     hw_info
   };

@@ -48,6 +48,8 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+#define JIANGS_PRINT false
+
 namespace cutlass::gemm::collective {
 using namespace cute;
 
@@ -762,6 +764,50 @@ public:
     uint16_t mcast_mask_b = 0;
     uint16_t mcast_mask_s = 0;
 
+    // if (block0() && threadIdx.x == 0) {
+    //   printf("TileShape: ");
+    //   print(TileShape{});
+    //   printf("\n");
+    //   printf("ClusterShape: ");
+    //   print(ClusterShape{});
+    //   printf("\n");
+    //   printf("CtaShape_MNK: ");
+    //   print(CtaShape_MNK{});
+    //   printf("\n");
+      
+    //   printf("//////////////////////////\n");
+      
+    //   printf("SmemLayoutA: ");
+    //   print(SmemLayoutA{});
+    //   printf("\n");
+    //   printf("SmemLayoutB: ");
+    //   print(SmemLayoutB{});
+    //   printf("\n");
+
+    //   printf("//////////////////////////\n");
+      
+    //   printf("gA_mkl: ");
+    //   print(gA_mkl.layout());
+    //   printf("\n");
+    //   printf("gA: ");
+    //   print(gA.layout());
+    //   printf("\n");
+    //   printf("tAgA: ");
+    //   print(tAgA.layout());
+    //   printf("\n");
+    //   printf("tAsA: ");
+    //   print(tAsA.layout());
+    //   printf("\n");
+    //   printf("sA: ");
+    //   print(sA.layout());
+    //   printf("\n");
+      
+    //   printf("//////////////////////////\n");
+    // }
+
+
+
+
     // Issue TmaLoads
     // Maps the tile -> block, value
     if constexpr (cute::is_same_v<GmemTiledCopyA, SM90_TMA_LOAD_MULTICAST>) {
@@ -968,66 +1014,191 @@ public:
     CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sB));                                         // PIPE
     
 
-    // if (block0() && threadIdx.x == 160) {
-    //   printf("TileShape: ");
-    //   print(TileShape{});
-    //   printf("\n");
-    //   printf("ClusterShape: ");
-    //   print(ClusterShape{});
-    //   printf("\n");
-    //   printf("CtaShape_MNK: ");
-    //   print(CtaShape_MNK{});
-    //   printf("\n");
-      
-    //   printf("//////////////////////////\n");
-      
-    //   printf("SmemLayoutA: ");
-    //   print(SmemLayoutA{});
-    //   printf("\n");
-    //   printf("SmemLayoutB: ");
-    //   print(SmemLayoutB{});
-    //   printf("\n");
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    
+    // Convert tCsA to uint16_t tensor for smem load
+    // auto&& [shape_mma, shape_mma_m, shape_mma_k, shape_stage] = tCsA.shape();
+    // auto shape_mma_k_16b = size(shape_mma_k) / _4{};
+    // auto shape_16b = make_shape(shape_mma, shape_mma_m, shape_mma_k_16b, shape_stage);
+    
+    // auto&& [stride_mma, stride_mma_m, stride_mma_k, stride_stage] = tCsA.stride();
+    // auto stride_mma_thr_m = get<1>(stride_mma) / _4{};
+    // auto stride_mma_16b = replace<1>(stride_mma, stride_mma_thr_m);
+    // auto stride_mma_k_16b = get<0>(stride_mma_k);
+    // auto stride_stage_16b = replace<1>(stride_stage, get<1>(stride_stage) / _4{});
 
-    //   printf("//////////////////////////\n");
-      
-    //   printf("sA: ");
-    //   print(sA.layout());
-    //   printf("\n");
-    //   printf("tCsA: ");
-    //   print(tCsA.layout());
-    //   printf("\n");
-    //   printf("tCrA_mma: ");
-    //   print(tCrA_mma.layout());
-    //   printf("\n");
-    //   printf("tCrA_load: ");
-    //   print(tCrA_load.layout());
-    //   printf("\n");
-      
-    //   printf("//////////////////////////\n");
-      
-    //   printf("tCsB: ");
-    //   print(tCsB.layout());
-    //   printf("\n");
-    //   printf("tCrB: ");
-    //   print(tCrB.layout());
-    //   printf("\n");
-    //   printf("tCrB: ");
-    //   print(tCrB);
-    //   printf("\n");
-      
-    //   printf("//////////////////////////\n");
-      
-    //   printf("tCrA_mma: ");
-    //   print(tCrA_mma);
-    //   printf("\n");
+    // auto stride_16b = make_stride(stride_mma_16b, stride_mma_m, stride_mma_k_16b, stride_stage_16b);
+    // auto layout_16b = make_layout(shape_16b, stride_16b);
 
-    //   printf("accum: ");
-    //   print(accum);
-    //   printf("\n");
+    // auto tCsA_LDSM = make_tensor(recast<uint16_t>(tCsA).data(), layout_16b);
 
-    // }
 
-    // if (threadIdx.x == 160) {
+  
+    // using SmemCopyAtomA16b = Copy_Atom<SM75_U32x1_LDSM_N, uint16_t>;
+    // using SmemCopyAtomA16b = Copy_Atom<SM75_U32x2_LDSM_N, uint16_t>;
+    // using SmemCopyAtomA16b = Copy_Atom<SM75_U32x4_LDSM_N, uint16_t>;
+    using SmemCopyAtomA_LDSM = Copy_Atom<SM75_U32x4_LDSM_N, ElementB>;
+  
+    auto smem_tiled_copy_A_LDSM = make_tiled_copy_A(SmemCopyAtomA_LDSM{}, tiled_mma);
+    auto smem_thr_copy_A_LDSM   = smem_tiled_copy_A_LDSM.get_thread_slice(thread_idx);
+    
+    Tensor sA_LDSM = recast<ElementB>(sA);
+    auto tCsA_LDSM   = smem_thr_copy_A_LDSM.partition_S(sA_LDSM);
+
+    using ABBitWidthRatio = Int<sizeof_bits_v<ElementB> / sizeof_bits_v<ElementA>>;
+    auto tCrA_load_LDSM_shape = replace<2>(tCrA_mma.shape(), size(get<2>(tCrA_mma.shape())) / ABBitWidthRatio{});
+    Tensor tCrA_load_LDSM = make_fragment_like<ElementB>(tCrA_load_LDSM_shape);
+    Tensor tCrA_copy_view_LDSM  = smem_thr_copy_A_LDSM.retile_D(tCrA_load_LDSM); // (CPY,CPY_M,CPY_K)
+    
+    auto ptr = recast_ptr<RealSwappedElementA>(tCrA_load_LDSM.data());
+    auto old_shape = tCrA_load_LDSM.shape();
+    auto new_shape = make_shape(size<0>(old_shape), get<1>(old_shape), size<2>(old_shape) * ABBitWidthRatio{});
+    Tensor tCrA_load_4b_packed = make_tensor(ptr, make_layout(new_shape));
+
+    // auto tiler = Layout<Shape<_2, _2, _2>, Stride<_1, _8, _16>>{};
+    // Tensor tCrA_copy_view_4b_packed = zipped_divide(tCrA_load_4b_packed, tiler); // (MMA, (PACK, MMA_K))
+
+
+    
+    
+    // Tensor tCsA_16b_copy_view  = smem_thr_copy_A_LDSM.retile_S(tCsA_LDSM); // (CPY,CPY_M,CPY_K)
+
+    // auto *ptr16 = tCrA_load_LDSM.data();
+    // RealSwappedElementA *ptr = reinterpret_cast<RealSwappedElementA *>(ptr16);
+  
+    // auto old_shape = tCrA_load_LDSM.shape();
+    // auto new_shape = replace<0>(old_shape, replace<0>(get<0>(old_shape), get<0, 0>(old_shape) * Int<4>{})); 
+    // auto new_layout = make_layout(new_shape);
+    // auto new_tensor = make_tensor(ptr, new_layout);
+
+    // auto *ptr16 = tCrA_load_LDSM.data();
+    // RealSwappedElementA *ptr = reinterpret_cast<RealSwappedElementA *>(ptr16);
+
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    if constexpr (JIANGS_PRINT)
+    {
+      if (block0() && threadIdx.x == 128) {
+        printf("tiled_mma: ");
+        print(tiled_mma);
+        printf("\n");
+        printf("mma_thread_slice: ");
+        print(mma_thread_slice);
+        printf("\n");
+        printf("TileShape: ");
+        print(TileShape{});
+        printf("\n");
+        printf("ClusterShape: ");
+        print(ClusterShape{});
+        printf("\n");
+        printf("CtaShape_MNK: ");
+        print(CtaShape_MNK{});
+        printf("\n");
+        
+        printf("//////////////////////////\n");
+        
+        printf("SmemLayoutA: ");
+        print(SmemLayoutA{});
+        printf("\n");
+        printf("SmemLayoutB: ");
+        print(SmemLayoutB{});
+        printf("\n");
+
+        printf("SwappedSmemCopyAtomA: ");
+        print(SwappedSmemCopyAtomA{});
+        printf("\n");
+        printf("smem_tiled_copy_A: ");
+        print(smem_tiled_copy_A);
+        printf("\n");
+        printf("smem_thr_copy_A: ");
+        print(smem_thr_copy_A);
+        printf("\n");
+        printf("SmemCopyAtomA_LDSM{}: ");
+        print(SmemCopyAtomA_LDSM{});
+        printf("\n");
+        printf("smem_tiled_copy_A_LDSM: ");
+        print(smem_tiled_copy_A_LDSM);
+        printf("\n");
+        // printf("smem_tiled_copy_A_LDSM: latex\n");
+        // print_latex(smem_tiled_copy_A_LDSM);
+        // printf("\n");
+        printf("smem_thr_copy_A_LDSM: ");
+        print(smem_thr_copy_A_LDSM);
+        printf("\n");
+        // printf("tCsA_16b_copy_view: ");
+        // print(tCsA_16b_copy_view);
+        // printf("\n");
+        printf("tCrA_copy_view_LDSM: ");
+        print(tCrA_copy_view_LDSM);
+        printf("\n");
+        printf("sA_LDSM: ");
+        print(sA_LDSM);
+        printf("\n");
+        printf("tCrA_load_LDSM: ");
+        print(tCrA_load_LDSM);
+        printf("\n");
+        // printf("new_tensor: ");
+        // print(new_tensor);
+        // printf("\n");
+
+        printf("//////////////////////////\n");
+        
+        printf("sA: ");
+        print(sA);
+        printf("\n");
+        printf("tCsA: ");
+        print(tCsA);
+        printf("\n");
+        printf("tCsA.data(): ");
+        print(tCsA.data());
+        printf("\n");
+        // printf("tCsA_LDSM: ");
+        // print(tCsA_LDSM);
+        // printf("\n");
+        printf("tCrA_mma: ");
+        print(tCrA_mma.layout());
+        printf("\n");
+        printf("tCrA_load: ");
+        print(tCrA_load);
+        printf("\n");
+        printf("tCrA_copy_view: ");
+        print(tCrA_copy_view);
+        printf("\n");
+        printf("tCsA_LDSM: ");
+        print(tCsA_LDSM);
+        printf("\n");
+        printf("tCrA_load_4b_packed: ");
+        print(tCrA_load_4b_packed);
+        printf("\n");
+        // printf("tCrA_copy_view_4b_packed: ");
+        // print(tCrA_copy_view_4b_packed);
+        // printf("\n");
+        
+        printf("//////////////////////////\n");
+        
+        printf("tCsB: ");
+        print(tCsB.layout());
+        printf("\n");
+        printf("tCrB: ");
+        print(tCrB.layout());
+        printf("\n");
+        printf("tCrB: ");
+        print(tCrB);
+        printf("\n");
+        
+        printf("//////////////////////////\n");
+        
+        printf("tCrA_mma: ");
+        print(tCrA_mma);
+        printf("\n");
+
+        printf("accum: ");
+        print(accum);
+        printf("\n");
+
+      }
+    }
+
+    // if (threadIdx.x == 128) {
     //   printf("block (%d %d %d) %f %f\n",
     //     blockIdx.z, blockIdx.y, blockIdx.x, 
     //     float(tCsB(0,0,0,0)),
@@ -1066,15 +1237,94 @@ public:
 
       // copy smem->rmem for A operand
 
-      Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-        partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+      if constexpr (JIANGS_PRINT)
+      {
+        if (block0() && threadIdx.x == 128) {
+          printf("smem_tiled_copy_A_LDSM START\n");
+        }
+      }
+      // copy(smem_tiled_copy_A_LDSM, tCsA_LDSM(_,_,0,read_stage), tCrA_copy_view_LDSM(_,_,0));
+      // copy(smem_tiled_copy_A_LDSM, tCsA_LDSM(_,_,1,read_stage), tCrA_copy_view_LDSM(_,_,1));
+      // copy(smem_tiled_copy_A_LDSM, tCsA_LDSM(_,_,2,read_stage), tCrA_copy_view_LDSM(_,_,2));
+      // copy(smem_tiled_copy_A_LDSM, tCsA_LDSM(_,_,3,read_stage), tCrA_copy_view_LDSM(_,_,3));
+      if constexpr (JIANGS_PRINT)
+      {
+        if (block0() && threadIdx.x == 128) {
+          printf("smem_tiled_copy_A_LDSM END\n");
+        }
+      }
+
+      if constexpr (JIANGS_PRINT)
+      {
+        if (block0() && (threadIdx.x == 128 || threadIdx.x == 257)) {
+          // tCrA_copy_view_4b_packed (MMA, (PACK, MMA_K))
+          // tCrA_load (MMA,MMA_N,MMA_K)
+          // copy(tCrA_copy_view_4b_packed(_, make_tuple(0, 0)), tCrA_load(_, 0, 0));
+          // copy(tCrA_copy_view_4b_packed(_, make_tuple(1, 0)), tCrA_load(_, 0, 1));
+          // copy(tCrA_copy_view_4b_packed(_, make_tuple(2, 0)), tCrA_load(_, 0, 2));
+          // copy(tCrA_copy_view_4b_packed(_, make_tuple(3, 0)), tCrA_load(_, 0, 3));
+
+          auto&& src_1 = cute::recast<uint32_t>(tCrA_load_LDSM)(0);
+          auto&& src_2 = cute::recast<uint32_t>(tCrA_load_LDSM)(1);
+          auto&& src_3 = cute::recast<uint32_t>(tCrA_load_LDSM)(2);
+          auto&& src_4 = cute::recast<uint32_t>(tCrA_load_LDSM)(4);
+          auto&& src_1_ = cute::recast<uint32_t>(tCrA_load_4b_packed)(0);
+          auto&& src_2_ = cute::recast<uint32_t>(tCrA_load_4b_packed)(1);
+          auto&& src_3_ = cute::recast<uint32_t>(tCrA_load_4b_packed)(2);
+          auto&& src_4_ = cute::recast<uint32_t>(tCrA_load_4b_packed)(4);
+          // auto&& src_1_ = cute::recast<uint32_t>(tCrA_load)(0);
+          // auto&& src_2_ = cute::recast<uint32_t>(tCrA_load)(1);
+          // auto&& src_3_ = cute::recast<uint32_t>(tCrA_load)(2);
+          // auto&& src_4_ = cute::recast<uint32_t>(tCrA_load)(3);
+          printf("tCrA_load_LDSM (hex)  0x%X  0x%X  0x%X  0x%X | 0x%X  0x%X  0x%X  0x%X\n",
+            src_1, src_2, src_3, src_4,
+            src_1_, src_2_, src_3_, src_4_
+          );
+          
+          
+          copy(smem_tiled_copy_A, tCsA(_,_,0,0), tCrA_copy_view(_,_,0));
+          copy(smem_tiled_copy_A, tCsA(_,_,1,0), tCrA_copy_view(_,_,1));
+          copy(smem_tiled_copy_A, tCsA(_,_,2,0), tCrA_copy_view(_,_,2));
+          copy(smem_tiled_copy_A, tCsA(_,_,3,0), tCrA_copy_view(_,_,3));
+          
+          auto&& src_1__ = cute::recast<uint32_t>(tCrA_load)(0);
+          auto&& src_2__ = cute::recast<uint32_t>(tCrA_load)(1);
+          auto&& src_3__ = cute::recast<uint32_t>(tCrA_load)(2);
+          auto&& src_4__ = cute::recast<uint32_t>(tCrA_load)(3);
+          printf("tCrA_load (hex)  0x%X  0x%X  0x%X  0x%X\n",
+            src_1__, src_2__, src_3__, src_4__
+          );
+        }
+      }
+
+      // Utils::copy_tensors_MK(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 
+      //   partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+      Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, read_stage);
       if (K_BLOCK_MAX > 1) {
-        Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-          partitioned_extra_info, copy_partitions_extra_info, 1, read_stage);
+        // Utils::copy_tensors_MK(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 
+        //   partitioned_extra_info, copy_partitions_extra_info, 1, read_stage);
+        Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, read_stage);
       }
       
       // src: tCrA_load, dst: tCrA_mma
-      Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+      Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
+
+      // if (threadIdx.x == 128 || threadIdx.x == 257) {
+        
+      //   auto cord0 = make_coord(make_coord(0,0,0),0,0);
+      //   auto cord1 = make_coord(make_coord(1,0,0),0,0);
+
+      //   printf("device block %d %d %d  thread %d   %f %f\n", 
+      //     blockIdx.z, blockIdx.y, blockIdx.x,
+      //     threadIdx.x,
+      //     float(tCrA_mma(cord0)), 
+      //     float(tCrA_mma(cord1))
+      //   );
+      // }
+
+      // if (threadIdx.x % 128 == 0) {
+      //   printf("block id %d %d %d thread id %d\n", blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x);
+      // }
 
       // Unroll the K mode manually to set scale D to 1
       CUTLASS_PRAGMA_UNROLL
@@ -1093,12 +1343,17 @@ public:
 
           warpgroup_commit_batch();
 
+          if (k_block == 0) {
+            Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+          }
+
           if (k_block < K_BLOCK_MAX - 2) {
-            Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-              partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+            // Utils::copy_tensors_MK(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 
+            //   partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+            Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
           }
           if (k_block < K_BLOCK_MAX - 1) {
-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
           }
         }
       }
@@ -1137,14 +1392,17 @@ public:
         // Wait for K_BLOCK_MAX - 1 to be in flight to ensure that it is safe to overwrite the A registers for the first mma. 
         pipeline.consumer_wait(smem_pipe_read, barrier_token);
         
-        Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-          partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read.index());
+        // Utils::copy_tensors_MK(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 
+        //   partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read.index());
         
-        Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-          partitioned_extra_info, copy_partitions_extra_info, 1, smem_pipe_read.index());
+        // Utils::copy_tensors_MK(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 
+        //   partitioned_extra_info, copy_partitions_extra_info, 1, smem_pipe_read.index());
+
+        Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, smem_pipe_read.index());
+        Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, smem_pipe_read.index());
         
         // warpgroup_wait<K_WAIT_MAX>(); 
-        Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+        Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
       }
     }
 
@@ -1186,10 +1444,15 @@ public:
 
           if (k_block == 0) {
             barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
+            Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
           }
 
           if (k_block == K_BLOCK_MAX - 1) {
             // The last k_block
+
+            pipeline.consumer_wait(smem_pipe_read, barrier_token);
+            Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, smem_pipe_read.index());
+            Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, smem_pipe_read.index());
 
             warpgroup_wait<0>();
 
@@ -1213,21 +1476,22 @@ public:
               }
             }
 
-            pipeline.consumer_wait(smem_pipe_read, barrier_token);
+            // pipeline.consumer_wait(smem_pipe_read, barrier_token);
 
             // copy scales when passing k_block=0
-            Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-              partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read.index());
-            Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-              partitioned_extra_info, copy_partitions_extra_info, 1, smem_pipe_read.index());
-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+            // Utils::copy_tensors_MK(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 
+            //   partitioned_extra_info, copy_partitions_extra_info, 0, smem_pipe_read.index());
+            // Utils::copy_tensors_MK(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 
+            //   partitioned_extra_info, copy_partitions_extra_info, 1, smem_pipe_read.index());
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
           }
           else {
             if (k_block < K_BLOCK_MAX - 2) {
-              Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-                partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+              // Utils::copy_tensors_MK(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 
+              //   partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+              Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
             }
-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
           }
         }
       }
@@ -1253,6 +1517,10 @@ public:
         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
         warpgroup_commit_batch();
 
+        if (k_block == 0) {
+          Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+        }
+
         // warpgroup_wait<K_WAIT_MAX>();
         if (k_block == K_BLOCK_MAX - 1) {
           // release prior barrier
@@ -1261,11 +1529,12 @@ public:
         }
 
         if (k_block < K_BLOCK_MAX - 2) {
-          Utils::copy_tensors_MK(smem_tiled_copy_A, tCsA, tCrA_copy_view, 
-            partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+          // Utils::copy_tensors_MK(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 
+          //   partitioned_extra_info, copy_partitions_extra_info, k_block + 2, read_stage);
+          Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
         }
         if (k_block < K_BLOCK_MAX - 1) {
-          Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+          Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
         }
 
         if ((k_block + 1) % NumMMAsPerChunk == 0) {

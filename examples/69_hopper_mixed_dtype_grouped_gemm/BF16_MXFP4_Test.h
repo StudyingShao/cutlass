@@ -2,6 +2,7 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/float_subbyte.h"
+#include "cutlass/integer_subbyte.h"
 #include "cutlass/numeric_conversion.h"
 
 #include <cuda_bf16.h>
@@ -565,6 +566,166 @@ __global__ void interleave_fp4_Hopper_kernel(
     }
 }
 
+template<typename T>
+__global__ void interleave_w4a16_Hopper_kernel(
+    T *fp4_ptr, 
+    T *fp4_interleaved_ptr, 
+    const int rows, 
+    const int cols
+) {
+    uint8_t *uint8_ptr = reinterpret_cast<uint8_t *>(fp4_ptr);
+    uint8_t *uint8_interleaved_ptr = reinterpret_cast<uint8_t *>(fp4_interleaved_ptr);
+    // int64_t *uint8_ptr = reinterpret_cast<int64_t *>(fp4_ptr);
+    // int64_t *uint8_interleaved_ptr = reinterpret_cast<int64_t *>(fp4_interleaved_ptr);
+
+    for (int row_id = blockIdx.x; row_id < rows; row_id += gridDim.x)
+    {
+        for (int partition_id = threadIdx.y; partition_id < cols / 64; partition_id += blockDim.y)
+        {
+            int lane_id = threadIdx.x;
+            int interleaved_lane_id = ((lane_id / 4) % 2) * 16 + (lane_id % 4) * 4 + lane_id / 8;
+
+            int src_id = row_id * cols / 2 + partition_id * 32 + lane_id; // row-major
+            int dst_id = row_id * cols / 2 + partition_id * 32 + interleaved_lane_id; // row-major
+
+            uint8_interleaved_ptr[dst_id] = uint8_ptr[src_id];
+        }
+    }
+}
+
+
+
+template<typename T>
+__global__ void interleave_w4a16_Hopper_kernel_combine(
+    T *ptr_4b, 
+    T *ptr_4b_interleaved, 
+    const int rows, 
+    const int cols
+) {
+    uint8_t *uint8_ptr = reinterpret_cast<uint8_t *>(ptr_4b);
+    uint8_t *uint8_interleaved_ptr = reinterpret_cast<uint8_t *>(ptr_4b_interleaved);
+
+    for (int block_id = blockIdx.x; block_id < rows / 2; block_id += gridDim.x)
+    {
+        for (int partition_id = threadIdx.y; partition_id < cols / 64; partition_id += blockDim.y)
+        {
+            int lane_id = threadIdx.x;
+            int interleaved_lane_id = ((lane_id / 4) % 2) * 16 + (lane_id % 4) * 4 + lane_id / 8;
+
+            int col_id = partition_id * 32 + lane_id;
+            int row_id = block_id / 8 * 16 + block_id % 8;
+
+            int index_a = row_id * cols / 2 + col_id;
+            int index_b = (row_id + 8) * cols / 2 + col_id;
+            
+            uint8_t fp4x2_a = uint8_ptr[index_a];
+            uint8_t fp4x2_b = uint8_ptr[index_b];
+
+            uint8_t fp4_temp_a = (fp4x2_a & 0xF0U) >> 4;
+            uint8_t fp4_temp_b = (fp4x2_b & 0x0FU) << 4;
+
+            fp4x2_a = (fp4x2_a & 0x0FU) | fp4_temp_b;
+            fp4x2_b = (fp4x2_b & 0xF0U) | fp4_temp_a;
+
+            int dst_col_id = partition_id * 32 + interleaved_lane_id;
+
+            index_a = row_id * cols / 2 + dst_col_id;
+            index_b = (row_id + 8) * cols / 2 + dst_col_id;
+
+            uint8_interleaved_ptr[index_a] = fp4x2_a;
+            uint8_interleaved_ptr[index_b] = fp4x2_b;
+        }
+    }
+}
+
+
+template<typename T>
+__global__ void interleave_fp4xbf16_Hopper_kernel_combine_opt(
+    T *ptr_4b, 
+    T *ptr_4b_interleaved, 
+    const int rows, 
+    const int cols
+) {
+    // int64_t *uint8_ptr = reinterpret_cast<int64_t *>(ptr_4b);
+    // int64_t *uint8_interleaved_ptr = reinterpret_cast<int64_t *>(ptr_4b_interleaved);
+    uint8_t *uint8_ptr = reinterpret_cast<uint8_t *>(ptr_4b);
+    uint8_t *uint8_interleaved_ptr = reinterpret_cast<uint8_t *>(ptr_4b_interleaved);
+
+    for (int block_id = blockIdx.x; block_id < rows / 2; block_id += gridDim.x)
+    {
+        for (int partition_id = threadIdx.y; partition_id < cols / 64; partition_id += blockDim.y)
+        {
+            int lane_id = threadIdx.x;
+            int row_id = block_id / 8 * 16 + block_id % 8;
+            
+            int mma_id = lane_id / 8;
+            int dst_row_id = row_id + (mma_id % 2) * 8;
+
+            int interleaved_lane_id = lane_id / 16 * 16 + (lane_id % 4) * 4 + (lane_id % 8) / 4 * 2;
+            
+            int col_id = partition_id * 32 + lane_id;
+            int dst_col_id = partition_id * 32 + interleaved_lane_id;
+
+            int index_a = row_id * cols / 2 + col_id;
+            int index_b = (row_id + 8) * cols / 2 + col_id;
+            
+            uint8_t fp4x2_a = uint8_ptr[index_a];
+            uint8_t fp4x2_b = uint8_ptr[index_b];
+
+            uint8_t fp4_temp_a = (fp4x2_a & 0xF0U) >> 4;
+            uint8_t fp4_temp_b = (fp4x2_b & 0x0FU) << 4;
+
+            fp4x2_a = (fp4x2_a & 0x0FU) | fp4_temp_b;
+            fp4x2_b = (fp4x2_b & 0xF0U) | fp4_temp_a;
+
+            int dst_id = dst_row_id * cols / 2 + dst_col_id;
+
+            uint8_interleaved_ptr[dst_id] = fp4x2_a;
+            uint8_interleaved_ptr[dst_id + 1] = fp4x2_b;
+        }
+    }
+}
+
+
+template<typename T>
+__global__ void interleave_int4xfp8_Hopper_kernel(
+    T *ptr_4b, 
+    T *ptr_4b_interleaved, 
+    const int rows, 
+    const int cols
+) {
+    uint16_t *uint16_ptr = reinterpret_cast<uint16_t *>(ptr_4b);
+    uint16_t *uint16_interleaved_ptr = reinterpret_cast<uint16_t *>(ptr_4b_interleaved);
+
+    for (int block_id = blockIdx.x; block_id < rows / 2; block_id += gridDim.x)
+    {
+        for (int partition_id = threadIdx.y; partition_id < cols / 64; partition_id += blockDim.y)
+        {
+            int lane_id = threadIdx.x;
+            
+            int row_id = block_id / 8 * 16 + block_id % 8;
+            int dst_row_id = row_id + (lane_id % 8) / 4 * 8;
+
+            int mma_id = lane_id / 8;
+            int interleaved_lane_id = mma_id * 8 + lane_id % 4 * 2;
+                        
+            int col_id = partition_id * 16 + lane_id;
+            int dst_col_id = partition_id * 16 + interleaved_lane_id;
+
+            int src_id_a = row_id * cols / 4 + col_id;
+            int src_id_b = (row_id + 8) * cols / 4 + col_id;
+            
+            uint16_t fp4x2_a = uint16_ptr[src_id_a];
+            uint16_t fp4x2_b = uint16_ptr[src_id_b];
+
+            int dst_id = dst_row_id * cols / 4 + dst_col_id;
+
+            uint16_interleaved_ptr[dst_id] = fp4x2_a;
+            uint16_interleaved_ptr[dst_id + 1] = fp4x2_b;
+        }
+    }
+}
+
 
 template<typename T>
 void interleave_fp4_Hopper(
@@ -575,6 +736,90 @@ void interleave_fp4_Hopper(
 ) {
     // row-major input
     interleave_fp4_Hopper_kernel<<<1024, 1024>>>(fp4_ptr, fp4_interleaved_ptr, rows, cols);
+
+    // // row-major input
+    // dim3 block(32, 32);
+    // interleave_w4a16_Hopper_kernel<<<1024, block>>>(fp4_interleaved_ptr, fp4_interleaved_ptr_, rows, cols);
+}
+
+
+template<typename T>
+void interleave_fp4xbf16_Hopper(
+    T *fp4_ptr, 
+    T *fp4_interleaved_ptr,
+    const int rows, 
+    const int cols
+) {
+    // row-major input
+    dim3 block(32, 32);
+    // interleave_w4a16_Hopper_kernel_combine<<<1024, block>>>(fp4_ptr, fp4_interleaved_ptr, rows, cols);
+    interleave_fp4xbf16_Hopper_kernel_combine_opt<<<1024, block>>>(fp4_ptr, fp4_interleaved_ptr, rows, cols);
+}
+
+
+template<typename T>
+void interleave_int4xfp8_Hopper(
+    T *int4_ptr, 
+    T *int4_interleaved_ptr,
+    const int rows, 
+    const int cols
+) {
+    // row-major input
+    dim3 block(16, 32);
+    interleave_int4xfp8_Hopper_kernel<<<1024, block>>>(int4_ptr, int4_interleaved_ptr, rows, cols);
+}
+
+
+void interleave_w4a16_Hopper_test()
+{
+    const int rows = 32;
+    const int cols = 128;
+
+    using T = cutlass::uint4b_t;
+
+    T a[rows * cols];
+    T a_interleaved[rows * cols];
+
+    T *d_a;
+    T *d_a_interleaved;
+
+    cudaMalloc((void **)&d_a, rows * cols * sizeof(T));
+    cudaMalloc((void **)&d_a_interleaved, rows * cols * sizeof(T));
+
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols / 2; j++) {
+            uint8_t *ptr = reinterpret_cast<uint8_t *>(a);
+            ptr[i * cols / 2 + j] = uint8_t((2 * j) % 16) | (uint8_t((2 * j + 1) % 16) << 4);
+        }
+    }
+    
+    cudaMemcpy(d_a, a, rows * cols * sizeof(T), cudaMemcpyHostToDevice);
+
+    // interleave_fp4_Hopper(d_a, d_a_interleaved, rows, cols);
+    // interleave_fp4xbf16_Hopper(d_a, d_a_interleaved, rows, cols);
+    interleave_int4xfp8_Hopper(d_a, d_a_interleaved, rows, cols);
+
+    cudaMemcpy(a_interleaved, d_a_interleaved, rows * cols * sizeof(T), cudaMemcpyDeviceToHost);
+    
+    for (int i = 0; i < rows; i++) {
+        printf("row %d:  ", i);
+        for (int j = 0; j < cols / 2; j++) {
+            uint8_t *ptr = reinterpret_cast<uint8_t *>(a);
+            printf("(%d): %d ", 2 * j, ptr[i * cols / 2 + j] & 0x0F);
+            printf("(%d): %d ", 2 * j + 1, (ptr[i * cols / 2 + j] & 0xF0) >> 4);
+        }
+        printf("\n");
+    }
+
+    for (int i = 0; i < rows; i++) {
+        printf("row %d:  ", i);
+        for (int j = 0; j < cols / 2; j++) {
+            uint8_t *ptr = reinterpret_cast<uint8_t *>(a_interleaved);
+            printf("(%d): %d ", 2 * j, ptr[i * cols / 2 + j] & 0x0F);
+            printf("(%d): %d ", 2 * j + 1, (ptr[i * cols / 2 + j] & 0xF0) >> 4);
+        }
+        printf("\n");
+    }
 }
 
 
@@ -604,7 +849,7 @@ void interleave_fp4_Hopper_test()
 
     cudaMemcpy(d_fp4_a, fp4_a, num * sizeof(cutlass::float_e2m1_t), cudaMemcpyHostToDevice);
 
-    interleave_fp4_Hopper<cutlass::float_e2m1_t>(d_fp4_a, d_fp4_a_interleaved, 4, num / 4);
+    interleave_fp4xbf16_Hopper<cutlass::float_e2m1_t>(d_fp4_a, d_fp4_a_interleaved, 4, num / 4);
 
     printf("sizeof(cutlass::float_e2m1_t) = %lu\n", sizeof(cutlass::float_e2m1_t));
     

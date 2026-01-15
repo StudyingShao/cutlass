@@ -194,7 +194,7 @@ void grouped_mixed_dtype_profiling(
             std::cout << "    " << options.problem_sizes_host[i] << ", " << alpha_host[i] << ", " << beta_host[i] << '\n';
         }
         std::cout << "  Groups      : " << options.groups << '\n'
-                  << "  Avg runtime : " << result.avg_runtime_ms << " ms\n"
+                  << "  Avg runtime : " << result.avg_runtime_ms * 1000.0 << " us\n"
                   << "  GFLOPS      : " << result.gflops << '\n';
     }
 }
