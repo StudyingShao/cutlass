@@ -265,6 +265,8 @@ private:
     }
   }  
 
+  bool TensormapUpdateShapesStridesForAandScale = true;
+
 public:
   static constexpr ConversionMode KernelConversionMode = get_conversion_mode();
   static constexpr bool ModeHasScales = KernelConversionMode == ConversionMode::ConvertAndScale ||
@@ -1643,28 +1645,49 @@ public:
   }
 
   // Replace address for the global tensor (to be done by single thread)
+  template <class... TMs>
   CUTLASS_DEVICE
   void
   tensormaps_replace_global_address(
       TensorMapStorage& shared_tensormaps,
       Params const& mainloop_params,
+      cute::tuple<TMs...> const& input_tensormaps,
       int32_t next_batch) {
     // Replacing global_address for the next batch
-    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
-                                                    mainloop_params.ptr_A[next_batch]);
     cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_B,
                                                     mainloop_params.ptr_B[next_batch]);
-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_scale,
-                                                    mainloop_params.ptr_S[next_batch]);
+
+    if (TensormapUpdateShapesStridesForAandScale) {
+      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
+                                                      mainloop_params.ptr_A[next_batch]);
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+        cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_scale,
+                                                      mainloop_params.ptr_S[next_batch]);
+      }
+      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_zero,
+                                                      mainloop_params.ptr_Z[next_batch]);
+      }
+      else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_address.");
+      }
     }
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_zero,
-                                                    mainloop_params.ptr_Z[next_batch]);
+    else {
+      cute::tma_descriptor_replace_addr_in_global_mem(get<0>(input_tensormaps),
+                                                      mainloop_params.ptr_A[next_batch]);
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+        cute::tma_descriptor_replace_addr_in_global_mem(get<2>(input_tensormaps),
+                                                      mainloop_params.ptr_S[next_batch]);
+      }
+      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        cute::tma_descriptor_replace_addr_in_global_mem(get<3>(input_tensormaps),
+                                                      mainloop_params.ptr_Z[next_batch]);
+      }
+      else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_address.");
+      }
     }
-    else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_address.");
-    }
+
   }
 
   // Replace dim and strides for the global tensor - used only for Grouped GEMM (to be done by single thread)
@@ -1691,72 +1714,72 @@ public:
     cute::array<uint32_t, MaxTensorRank> prob_shape_zero   = {1,1,1,1,1};
     cute::array<uint64_t, MaxTensorRank> prob_stride_zero  = {0,0,0,0,0};
 
-    SwappedElementA const* ptr_A = nullptr;
-    Tensor tensor_a = make_tensor(ptr_A, detail::get_gmem_layout(make_shape(M,K,Int<1>{}), mainloop_params.ptr_dA[next_group]));
-
     SwappedElementB const* ptr_B = nullptr;
     Tensor tensor_b = make_tensor(ptr_B, detail::get_gmem_layout(make_shape(N,K,Int<1>{}), mainloop_params.ptr_dB[next_group]));
-
-    cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a, 
-                                             prob_shape_A, prob_stride_A);
     cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b, 
-                                             prob_shape_B, prob_stride_B);
+                                            prob_shape_B, prob_stride_B);
 
-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      NonVoidElementScale const* ptr_S = nullptr;
-      // auto scale_k = K / mainloop_params.chunk_size;
-      auto scale_k = K / ScalingGroupSize;
-      Tensor tensor_scale = make_tensor(detail::get_logical_ptr(ptr_S), make_shape(M,scale_k,Int<1>{}), mainloop_params.dS[next_group]);
-      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_scale, tensor_scale, 
-                                             prob_shape_scale, prob_stride_scale);
-    }
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      ElementZero const* ptr_Z = nullptr;
-      // auto scale_k = K / mainloop_params.chunk_size;
-      auto scale_k = K / ScalingGroupSize;
-      Tensor tensor_zero = make_tensor(detail::get_logical_ptr(ptr_Z), make_shape(M,scale_k,Int<1>{}), mainloop_params.dS[next_group]);
-      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_zero, tensor_zero, 
-                                               prob_shape_zero, prob_stride_zero);
-    }
-    else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_tensor_properties.");
-    }
-
-    // Convert strides to byte strides
-    for (uint64_t& stride : prob_stride_A) {
-      stride = (stride * sizeof_bits_v<SwappedElementA>) / 8;
-    }
     for (uint64_t& stride : prob_stride_B) {
       stride = (stride * sizeof_bits_v<SwappedElementB>) / 8;
     }
-    for (uint64_t& stride : prob_stride_scale) {
-      stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
-    }
-    for (uint64_t& stride : prob_stride_zero) {
-      stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
-    }
 
-
-    cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_A,
-                                                            prob_shape_A,
-                                                            prob_stride_A);
     cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_B,
                                                             prob_shape_B,
                                                             prob_stride_B);
 
-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_scale,
-                                                            prob_shape_scale,
-                                                            prob_stride_scale);
+    if (TensormapUpdateShapesStridesForAandScale) {
+
+      SwappedElementA const* ptr_A = nullptr;
+      Tensor tensor_a = make_tensor(ptr_A, detail::get_gmem_layout(make_shape(M,K,Int<1>{}), mainloop_params.ptr_dA[next_group]));
+      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a, 
+                                              prob_shape_A, prob_stride_A);
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+        NonVoidElementScale const* ptr_S = nullptr;
+        // auto scale_k = K / mainloop_params.chunk_size;
+        auto scale_k = K / ScalingGroupSize;
+        Tensor tensor_scale = make_tensor(detail::get_logical_ptr(ptr_S), make_shape(M,scale_k,Int<1>{}), mainloop_params.dS[next_group]);
+        cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_scale, tensor_scale, 
+                                              prob_shape_scale, prob_stride_scale);
+      }
+      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        ElementZero const* ptr_Z = nullptr;
+        // auto scale_k = K / mainloop_params.chunk_size;
+        auto scale_k = K / ScalingGroupSize;
+        Tensor tensor_zero = make_tensor(detail::get_logical_ptr(ptr_Z), make_shape(M,scale_k,Int<1>{}), mainloop_params.dS[next_group]);
+        cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_zero, tensor_zero, 
+                                                prob_shape_zero, prob_stride_zero);
+      }
+      else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_tensor_properties.");
+      }
+
+      // Convert strides to byte strides
+      for (uint64_t& stride : prob_stride_A) {
+        stride = (stride * sizeof_bits_v<SwappedElementA>) / 8;
+      }
+      cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_A,
+                                                              prob_shape_A,
+                                                              prob_stride_A);
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+        for (uint64_t& stride : prob_stride_scale) {
+          stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
+        }
+        cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_scale,
+                                                              prob_shape_scale,
+                                                              prob_stride_scale);
+      }
+      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        for (uint64_t& stride : prob_stride_zero) {
+          stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
+        }
+        cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_zero,
+                                                              prob_shape_zero,
+                                                              prob_stride_zero);
+      }
+      else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_tensor_properties.");
+      } 
     }
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_zero,
-                                                            prob_shape_zero,
-                                                            prob_stride_zero);
-    }
-    else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_tensor_properties.");
-    } 
   }
 
   template <class... TMs, class ProblemShape_MNKL>
@@ -1770,7 +1793,7 @@ public:
       int32_t next_batch) {
     if (cute::elect_one_sync()) {
       // Replacing global_address for the next batch
-      tensormaps_replace_global_address(shared_tensormaps, mainloop_params, next_batch);
+      tensormaps_replace_global_address(shared_tensormaps, mainloop_params, input_tensormaps, next_batch);
 
       if constexpr (IsGroupedGemmKernel) {
         // Replacing global dims and strides for the next batch
@@ -1796,16 +1819,24 @@ public:
     }
 
     // Entire warp must do this (i.e. it's aligned)
-    tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
     tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);
-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      tma_descriptor_cp_fence_release(get<2>(input_tensormaps), shared_tensormaps.smem_tensormap_scale);
+
+    if (TensormapUpdateShapesStridesForAandScale) {
+      TensormapUpdateShapesStridesForAandScale = false;
+
+      tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+        tma_descriptor_cp_fence_release(get<2>(input_tensormaps), shared_tensormaps.smem_tensormap_scale);
+      }
+      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        tma_descriptor_cp_fence_release(get<3>(input_tensormaps), shared_tensormaps.smem_tensormap_zero);
+      }
+      else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
+        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_cp_fence_release.");
+      }
     }
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      tma_descriptor_cp_fence_release(get<3>(input_tensormaps), shared_tensormaps.smem_tensormap_zero);
-    }
-    else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_cp_fence_release.");
+    else {
+      tma_descriptor_fence_release();
     }
   }
 
