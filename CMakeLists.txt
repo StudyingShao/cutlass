@@ -452,6 +452,8 @@ endif()
 if(UNIX)
   list(APPEND CUTLASS_CUDA_NVCC_FLAGS -Xcompiler=-Wconversion)
   list(APPEND CUTLASS_CUDA_NVCC_FLAGS -Xcompiler=-fno-strict-aliasing)
+  # Suppress CUDA header deprecation warnings (e.g., long4/ulong4/double4)
+  list(APPEND CUTLASS_CUDA_NVCC_FLAGS -Xcompiler=-Wno-deprecated-declarations)
 endif()
 
 # jiangs TODO for debug
