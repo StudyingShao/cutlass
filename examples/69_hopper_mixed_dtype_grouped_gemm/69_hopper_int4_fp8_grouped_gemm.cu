@@ -116,6 +116,8 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M
 // using QuantType = cutlass::float_e2m1_t; // weights
 // #define GROUP_SIZE 32
 // using ElementScale = cutlass::float_ue8m0_t;
+// constexpr int TileShapeM = 128;
+// constexpr int TileShapeN = 16;
 // constexpr int TileShapeK = 128;
 
 //--------------------------------------------------------------------------------------------
@@ -125,9 +127,13 @@ using MmaType = cutlass::float_e4m3_t;      // activations
 using QuantType = cutlass::int4b_t;         // weights
 #define GROUP_SIZE 128
 using ElementScale = cutlass::bfloat16_t;
-constexpr int TileShapeK = 512;
+// constexpr int TileShapeK = 512;
 // constexpr int TileShapeK = 256;
 // constexpr int TileShapeK = 128;
+
+constexpr int  TileShapeM = 128;
+constexpr int  TileShapeN = 16;
+constexpr int  TileShapeK = 8192 / TileShapeN;
 
 //--------------------------------------------------------------------------------------------
 
@@ -183,7 +189,7 @@ constexpr int AlignmentD  = 128 / cutlass::sizeof_bits<ElementD>::value;
 using ElementAccumulator  = float;                                          // Element type for internal accumulation
 using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<_128,_16,cute::Int<TileShapeK>>;          // Threadblock-level tile size
+using TileShape           = Shape<cute::Int<TileShapeM>,cute::Int<TileShapeN>,cute::Int<TileShapeK>>;          // Threadblock-level tile size
 // using TileShape           = Shape<_64,_64,cute::Int<TileShapeK>>;          // Threadblock-level tile size
 using ClusterShape        = Shape<_2,_1,_1>;                                // Shape of the threadblocks in a cluster
 using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
