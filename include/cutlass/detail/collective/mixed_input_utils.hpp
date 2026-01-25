@@ -530,6 +530,8 @@ auto get_gmem_layout(Shape const& shape, Stride const& stride) {
 
 typedef uint32_t            __nv_fp4x8_storage_t;
 typedef uint32_t            __nv_bf16x2_storage_t;
+typedef uint32_t            __nv_int4x8_storage_t;
+typedef uint64_t            __nv_fp8x8_storage_t;
 typedef cutlass::uint128_t  __nv_bf16x8_storage_t;
 
 inline __device__ unsigned
@@ -593,6 +595,69 @@ psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved
     return bf16x8_raw;
 }
 
+
+// [ 0,  1,  2,  3] encoded as FP8
+__constant__ static uint32_t POS_E4M3s_REG1_[2] = {0x44403800, 0x44403800};
+// [ 4,  5,  6,  7] encoded as FP8
+__constant__ static uint32_t POS_E4M3s_REG2_[2] = {0x4E4C4A48, 0x4E4C4A48};
+// [-8, -7, -6, -5] encoded as FP8
+__constant__ static uint32_t NEG_E4M3s_REG1_[2] = {0xCACCCED0, 0xCACCCED0};
+// [-4, -3, -2, -1] encoded as FP8
+__constant__ static uint32_t NEG_E4M3s_REG2_[2] = {0xB8C0C4C8, 0xB8C0C4C8};
+
+
+__device__ __inline__
+__nv_fp8x8_storage_t
+psx_cvt_lut_prmt_int4x8_to_fp8x8
+(
+    const __nv_int4x8_storage_t int4x8
+)
+{
+    __nv_fp8x8_storage_t fp8x8_raw;
+    __nv_fp8x4_storage_t *fp8x4_raw = reinterpret_cast<__nv_fp8x4_storage_t *>(&fp8x8_raw);
+
+    // View the input as reg
+    uint32_t reg = reinterpret_cast<const uint32_t&>(int4x8);
+
+    // Determines if to get from the signed or unsigned candidates
+    uint32_t sign = (reg & 0x88888888) >> 1;
+
+    // Ignore sign bit when indexing into LUT
+    uint32_t lut_idx = (reg & 0x77777777);
+
+    // Signed is OR'd with 0x32103210 to find the correct value in the LUT
+    const uint32_t final_prmt_base = 0x32103210;
+
+    auto lane_id = threadIdx.x & 0x1;
+    uint32_t POS_E4M3s_REG1 = POS_E4M3s_REG1_[lane_id];
+    uint32_t POS_E4M3s_REG2 = POS_E4M3s_REG2_[lane_id];
+    uint32_t NEG_E4M3s_REG1 = NEG_E4M3s_REG1_[lane_id];
+    uint32_t NEG_E4M3s_REG2 = NEG_E4M3s_REG2_[lane_id];
+
+    asm volatile(
+      "{\n"
+      "  .reg .b32 pos_f8s, neg_f8s;\n"
+      "  .reg .b32 lut1, sign1, prmt0, prmt1;\n"
+      "  or.b32 prmt0, %4, %3;\n"
+      "  prmt.b32 pos_f8s, %5, %6, %2;\n"
+      "  prmt.b32 neg_f8s, %7, %8, %2;\n"
+      "  prmt.b32 %0, pos_f8s, neg_f8s, prmt0;\n"
+      "  shr.u32 lut1, %2, 16;\n"
+      "  shr.u32 sign1, %3, 16;\n"
+      "  or.b32 prmt1, %4, sign1;\n"
+      "  prmt.b32 pos_f8s, %5, %6, lut1;\n"
+      "  prmt.b32 neg_f8s, %7, %8, lut1;\n"
+      "  prmt.b32 %1, pos_f8s, neg_f8s, prmt1;\n"
+      "}\n"
+      : "=r"(fp8x4_raw[0]), "=r"(fp8x4_raw[1])
+      : "r"(lut_idx), "r"(sign), "r"(final_prmt_base),
+        "r"(POS_E4M3s_REG1), "r"(POS_E4M3s_REG2),
+        "r"(NEG_E4M3s_REG1), "r"(NEG_E4M3s_REG2)
+    );
+
+    return fp8x8_raw;
+}
+
 template<class Collective>
 struct MixedInputUtils {
 private:
@@ -612,6 +677,7 @@ private:
   static constexpr auto ModeHasScales = Collective::ModeHasScales;
   static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
   static constexpr auto UseFP4ToBF16LookupTable = Collective::UseFP4ToBF16LookupTable;
+  static constexpr auto UseInt4ToFP8LookupTable = Collective::UseInt4ToFP8LookupTable;
 
 public:
   static constexpr auto
@@ -881,9 +947,35 @@ public:
     auto&& dst_ = cute::recast<__nv_bf16x8_storage_t>(dst)(0);
     
     dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved(src_);
-
   }
 
+
+  template <class EngineIn,
+            class LayoutIn,
+            class EngineOut,
+            class LayoutOut>
+  CUTLASS_DEVICE
+  static void int4tofp8_lookup_table_convert( // Accept mutable temporaries
+    Tensor<EngineIn, LayoutIn>       const& src,
+    Tensor<EngineOut, LayoutOut>         && dst) {
+    int4tofp8_lookup_table_convert(src, dst);
+  }
+
+  template <class EngineIn,
+            class LayoutIn,
+            class EngineOut,
+            class LayoutOut>
+  CUTLASS_DEVICE
+  static void int4tofp8_lookup_table_convert(
+    Tensor<EngineIn, LayoutIn>       const& src,
+    Tensor<EngineOut, LayoutOut>          & dst) {
+
+    // View the input as reg
+    auto&& src_ = cute::recast<__nv_int4x8_storage_t>(src)(0);
+    auto&& dst_ = cute::recast<__nv_fp8x8_storage_t>(dst)(0);
+    
+    dst_ = psx_cvt_lut_prmt_int4x8_to_fp8x8(src_);
+  }
 
   /// Utilities to dequantize A.
   template <class Layout>
@@ -1075,6 +1167,9 @@ public:
     for (int i = 0; i < size<1>(dst_vm); ++i) {
       if constexpr (UseFP4ToBF16LookupTable) {
         fp4tobf16_lookup_table_convert(src_vm(_, i), dst_vm(_, i));
+      }
+      else if constexpr (UseInt4ToFP8LookupTable) {
+        int4tofp8_lookup_table_convert(src_vm(_, i), dst_vm(_, i));
       }
       else {
         LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
