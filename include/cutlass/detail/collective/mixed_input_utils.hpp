@@ -726,12 +726,13 @@ public:
       return 0;
     }
     else if constexpr (ModeHasScales) {
-      constexpr uint32_t act_scale_tx_bytes = cutlass::bits_to_bytes(size<0>(SmemLayoutActScale{}) * size<1>(SmemLayoutActScale{}) * static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
+      // constexpr uint32_t act_scale_tx_bytes = cutlass::bits_to_bytes(size<0>(SmemLayoutActScale{}) * size<1>(SmemLayoutActScale{}) * static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
       constexpr uint32_t scale_tx_bytes = cutlass::bits_to_bytes(size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) * static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
-      static_assert(act_scale_tx_bytes % 128 == 0, "Each scale stage must be 128B aligned."); // required by TMA
+      // static_assert(act_scale_tx_bytes % 128 == 0, "Each scale stage must be 128B aligned."); // required by TMA
       static_assert(scale_tx_bytes % 128 == 0, "Each scale stage must be 128B aligned."); // required by TMA
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return act_scale_tx_bytes + scale_tx_bytes;
+        // return act_scale_tx_bytes + scale_tx_bytes;
+        return scale_tx_bytes;
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         // Scale and zero share smem layout

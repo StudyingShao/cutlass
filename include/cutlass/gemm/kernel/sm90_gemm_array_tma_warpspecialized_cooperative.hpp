@@ -592,7 +592,8 @@ public:
             k_tile_iter, work_k_tile_count,
             lane_idx,
             block_rank_in_cluster,
-            shared_storage.tensors.mainloop
+            shared_storage.tensors.mainloop,
+            curr_batch
           );
           // Update starting pipeline state for the next tile
           // Wait for the last TMA stage to complete loading, before issuing tensormap updates

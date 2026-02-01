@@ -40,6 +40,7 @@
 
 #include "cute/arch/cluster_sm90.hpp"
 #include "cute/arch/copy_sm90.hpp"
+#include "cute/arch/copy_sm80.hpp"
 #include "cute/algorithm/functional.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/algorithm/gemm.hpp"
@@ -174,6 +175,13 @@ public:
   using SmemCopyAtomB = SmemCopyAtomB_;
   using SmemCopyAtomActScale = Copy_Atom<cute::AutoVectorizingCopy, NonVoidElementScale>;
   using SmemCopyAtomScale = Copy_Atom<cute::AutoVectorizingCopy, NonVoidElementScale>;
+
+  static constexpr int ActScaleElemBytes = sizeof(NonVoidElementScale);
+  static constexpr int ActScaleCpAsyncBytes = 
+      (ActScaleElemBytes >= 16) ? 16 :
+      (ActScaleElemBytes >= 8)  ? 8  : 4;
+  using CpAsyncVecType = cute::uint_bit_t<ActScaleCpAsyncBytes * 8>;
+  using GmemCopyAtomActScale = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<CpAsyncVecType>, CpAsyncVecType>;
 
   // We must ensure the type to be scaled goes to RF
   static constexpr bool SwapAB = !IsATransformed;
@@ -754,7 +762,8 @@ public:
       KTileIterator k_tile_iter, int k_tile_count,
       int thread_idx,
       uint32_t block_rank_in_cluster,
-      TensorStorage& shared_tensors) {
+      TensorStorage& shared_tensors,
+      int32_t curr_batch = 0) {
 
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       static_assert(sizeof... (Ts) == 2, "Direct convert needs two inputs");
@@ -804,7 +813,7 @@ public:
 
     uint16_t mcast_mask_a = 0;
     uint16_t mcast_mask_b = 0;
-    uint16_t mcast_mask_act_s = 0;
+    // uint16_t mcast_mask_act_s = 0;
     uint16_t mcast_mask_s = 0;
 
     // Issue TmaLoads
@@ -849,8 +858,8 @@ public:
       }
       else if constexpr (ModeHasScales) {
         // scale copy
-        auto tActSgActS = get<2>(extra_input_partitions);
-        auto tActSsActS = get<3>(extra_input_partitions);
+        // auto tActSgActS = get<2>(extra_input_partitions);
+        // auto tActSsActS = get<3>(extra_input_partitions);
         auto tSgS = get<0>(extra_input_partitions);
         auto tSsS = get<1>(extra_input_partitions);
 
@@ -860,9 +869,57 @@ public:
         // is a multiple of the threadblock tile K
         const int scale_load_k = *k_tile_iter / 1;
         // const int scale_load_k = *k_tile_iter / mainloop_params.reload_factor; // This will always be 0 when chunk_size == K.
+        
+        // LDGSTS (cp.async) for ActScale
+        {
+          NonVoidElementScale const* ptr_act_scale = mainloop_params.ptr_ActS[curr_batch]; // Act scale pointer
+          auto dActS = mainloop_params.dActS[curr_batch]; // Act scale stride
+          
+          constexpr int TileN = cute::size<0>(ActScaleTileShape{});
+          int64_t act_scale_offset = n_coord * TileN * get<0>(dActS) + 
+                                     scale_load_k * get<1>(dActS);
+          
+          static_assert(sizeof(NonVoidElementScale) == sizeof(CpAsyncVecType),
+              "NonVoidElementScale size must match CpAsyncVecType for cp.async");
+          
+          CpAsyncVecType const* ptr_act_scale_vec = reinterpret_cast<CpAsyncVecType const*>(
+              ptr_act_scale + act_scale_offset);
+          
+          Tensor gActS = make_tensor(
+              make_gmem_ptr(ptr_act_scale_vec),
+              make_layout(make_shape(Int<TileN>{}), make_stride(Int<1>{}))
+          );
+          
+          Tensor sActS = make_tensor(make_smem_ptr(shared_tensors.smem_act_scale.begin()), SmemLayoutActScale{});
+          CpAsyncVecType* smem_act_scale_vec = reinterpret_cast<CpAsyncVecType*>(
+              sActS(_,Int<0>{},write_stage).data().get());
+          Tensor sActS_dst = make_tensor(
+              make_smem_ptr(smem_act_scale_vec),
+              make_layout(make_shape(Int<TileN>{}), make_stride(Int<1>{}))
+          );
+          
+          constexpr int NumThreads = (TileN < 128) ? TileN : 128;
+          constexpr int ElemsPerThread = (TileN + NumThreads - 1) / NumThreads;
+          
+          auto tiled_copy_act_scale = cute::make_tiled_copy(
+              GmemCopyAtomActScale{},
+              cute::Layout<cute::Shape<cute::Int<NumThreads>>>{},
+              cute::Layout<cute::Shape<cute::Int<ElemsPerThread>>>{}
+          );
+          
+          if (thread_idx < NumThreads) {
+            auto thr_copy = tiled_copy_act_scale.get_slice(thread_idx);
+            auto tActSgActS = thr_copy.partition_S(gActS);
+            auto tActSsActS = thr_copy.partition_D(sActS_dst);
+            
+            cute::copy(tiled_copy_act_scale, tActSgActS, tActSsActS);
+          }
+          cute::cp_async_fence();
+        }
+        
         if (cute::elect_one_sync()) {
           copy(mainloop_params.tma_load_scale.with(get<2>(input_tensormaps), *tma_barrier, mcast_mask_s), tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
-          copy(mainloop_params.tma_load_act_scale.with(get<3>(input_tensormaps), *tma_barrier, mcast_mask_act_s), tActSgActS(_,_,_,scale_load_k), tActSsActS(_,_,_,write_stage));
+          // copy(mainloop_params.tma_load_act_scale.with(get<3>(input_tensormaps), *tma_barrier, mcast_mask_act_s), tActSgActS(_,_,_,scale_load_k), tActSsActS(_,_,_,write_stage));
         }
 
         if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
@@ -1057,6 +1114,11 @@ public:
     {
       barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
       pipeline.consumer_wait(smem_pipe_read, barrier_token);
+      
+      // LDGSTS (cp.async) for ActScale
+      if constexpr (ModeHasScales) {
+        cute::cp_async_wait<DispatchPolicy::Stages - 1>();
+      }
 
       int read_stage = smem_pipe_read.index();
 
@@ -1136,6 +1198,11 @@ public:
       if (k_tile_count > 0) {
         // Wait for K_BLOCK_MAX - 1 to be in flight to ensure that it is safe to overwrite the A registers for the first mma. 
         pipeline.consumer_wait(smem_pipe_read, barrier_token);
+        
+        // LDGSTS (cp.async) for ActScale
+        if constexpr (ModeHasScales) {
+          cute::cp_async_wait<DispatchPolicy::Stages - 1>();
+        }
 
         Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, smem_pipe_read.index());
         Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, smem_pipe_read.index());
@@ -1188,6 +1255,12 @@ public:
             // The last k_block
 
             pipeline.consumer_wait(smem_pipe_read, barrier_token);
+            
+            // LDGSTS (cp.async) for ActScale
+            if constexpr (ModeHasScales) {
+              cute::cp_async_wait<DispatchPolicy::Stages - 1>();
+            }
+            
             Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, smem_pipe_read.index());
             Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, smem_pipe_read.index());
 
