@@ -262,6 +262,7 @@ std::vector<int64_t> offset_B;
 std::vector<int64_t> offset_B_dq;
 std::vector<int64_t> offset_C;
 std::vector<int64_t> offset_D;
+std::vector<int64_t> offset_act_scale;
 std::vector<int64_t> offset_scale;
 std::vector<int64_t> offset_zero;
 
@@ -272,6 +273,7 @@ std::vector<StrideD> stride_D_host;
 std::vector<StrideC_ref> stride_C_host_ref;
 std::vector<StrideD_ref> stride_D_host_ref;
 std::vector<StrideS> stride_S_host;
+std::vector<StrideS> stride_act_S_host;
 std::vector<StrideS_ref> stride_S_host_ref;
 
 std::vector<ElementAccumulator> alpha_host;
@@ -287,6 +289,8 @@ cutlass::DeviceAllocation<QuantType> block_B;
 cutlass::DeviceAllocation<QuantType> block_B_interleaved;
 cutlass::DeviceAllocation<ElementB> block_B_modified;
 cutlass::DeviceAllocation<MmaType> block_B_dq;
+cutlass::DeviceAllocation<ElementScale> block_act_scale;
+cutlass::DeviceAllocation<ElementScalePacked> block_act_scale_packed;
 cutlass::DeviceAllocation<ElementScale> block_scale;
 cutlass::DeviceAllocation<ElementScalePacked> block_scale_packed;
 cutlass::DeviceAllocation<ElementZero> block_zero;
@@ -297,6 +301,7 @@ cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutpu
 cutlass::DeviceAllocation<const MmaType *> ptr_A;
 cutlass::DeviceAllocation<const QuantType *> ptr_B;
 cutlass::DeviceAllocation<const MmaType *> ptr_B_dq;
+cutlass::DeviceAllocation<const ElementScalePacked *> ptr_act_scale_packed;
 cutlass::DeviceAllocation<const ElementScalePacked *> ptr_scale_packed;
 cutlass::DeviceAllocation<const ElementZero *> ptr_zero;
 cutlass::DeviceAllocation<const ElementC *> ptr_C;
@@ -310,6 +315,7 @@ cutlass::DeviceAllocation<StrideD> stride_D;
 cutlass::DeviceAllocation<StrideC_ref> stride_C_ref;
 cutlass::DeviceAllocation<StrideD_ref> stride_D_ref;
 cutlass::DeviceAllocation<StrideS_ref> stride_S_ref;
+cutlass::DeviceAllocation<StrideS> stride_act_S;
 cutlass::DeviceAllocation<StrideS> stride_S;
 
 // Note, this is an array of pointers to alpha and beta scaling values per group
@@ -387,6 +393,7 @@ void allocate(Options const& options) {
   int64_t total_elements_B_dq = 0;
   int64_t total_elements_C = 0;
   int64_t total_elements_D = 0;
+  int64_t total_elements_act_scale = 0;
   int64_t total_elements_scale = 0;
   int64_t total_elements_zero = 0;
 
@@ -405,6 +412,7 @@ void allocate(Options const& options) {
     offset_B_dq.push_back(total_elements_B_dq);
     offset_C.push_back(total_elements_C);
     offset_D.push_back(total_elements_D);
+    offset_act_scale.push_back(total_elements_act_scale);
     offset_scale.push_back(total_elements_scale);
     offset_zero.push_back(total_elements_zero);
 
@@ -413,6 +421,7 @@ void allocate(Options const& options) {
     int64_t elements_B_dq = K * N;
     int64_t elements_C = M * N;
     int64_t elements_D = M * N;
+    int64_t elements_act_scale = scale_k * M;
     int64_t elements_scale = scale_k * N;
     int64_t elements_zero = scale_k * N;
 
@@ -421,6 +430,7 @@ void allocate(Options const& options) {
     total_elements_B_dq += elements_B_dq;
     total_elements_C += elements_C;
     total_elements_D += elements_D;
+    total_elements_act_scale += elements_act_scale;
     total_elements_scale += elements_scale;
     total_elements_zero += elements_zero;
 
@@ -432,6 +442,7 @@ void allocate(Options const& options) {
     stride_D_host_ref.push_back(cutlass::make_cute_packed_stride(StrideD_ref{}, {M, N, 1}));
     stride_S_host_ref.push_back(cutlass::make_cute_packed_stride(StrideS_ref{}, {N, scale_k, 1}));
     stride_S_host.push_back(cutlass::make_cute_packed_stride(StrideS{}, {N, scale_k, 1}));
+    stride_act_S_host.push_back(cutlass::make_cute_packed_stride(StrideS{}, {M, scale_k, 1}));
   }
 
   block_A.reset(total_elements_A);
@@ -442,6 +453,8 @@ void allocate(Options const& options) {
   block_C.reset(total_elements_C);
   block_D.reset(total_elements_D);
   block_ref_D.reset(total_elements_D);
+  block_act_scale.reset(total_elements_act_scale);
+  block_act_scale_packed.reset(total_elements_act_scale);
   block_scale.reset(total_elements_scale);
   block_scale_packed.reset(total_elements_scale);
   block_zero.reset(total_elements_zero);
@@ -467,6 +480,7 @@ void initialize(Options& options) {
   std::vector<MmaType *> ptr_B_dq_host(options.groups);
   std::vector<ElementC *> ptr_C_host(options.groups);
   std::vector<ElementC *> ptr_D_host(options.groups);
+  std::vector<ElementScalePacked *> ptr_act_scale_packed_host(options.groups);
   std::vector<ElementScalePacked *> ptr_scale_packed_host(options.groups);
   std::vector<ElementZero *> ptr_zero_host(options.groups);
   std::vector<ElementAccumulator *> ptr_alpha_host(options.groups);
@@ -480,6 +494,7 @@ void initialize(Options& options) {
     ptr_B_dq_host.at(i) = block_B_dq.get() + offset_B_dq.at(i);
     ptr_C_host.at(i) = block_C.get() + offset_C.at(i);
     ptr_D_host.at(i) = block_D.get() + offset_D.at(i);
+    ptr_act_scale_packed_host.at(i) = block_act_scale_packed.get() + offset_act_scale.at(i);
     ptr_scale_packed_host.at(i) = block_scale_packed.get() + offset_scale.at(i);
     ptr_zero_host.at(i) = block_zero.get() + offset_zero.at(i);
     alpha_host.push_back((options.alpha == FLT_MAX) ? static_cast<ElementAccumulator>((rand() % 5) + 1) : options.alpha);
@@ -502,6 +517,9 @@ void initialize(Options& options) {
 
   ptr_D.reset(options.groups);
   ptr_D.copy_from_host(ptr_D_host.data());
+
+  ptr_act_scale_packed.reset(options.groups);
+  ptr_act_scale_packed.copy_from_host(ptr_act_scale_packed_host.data());
 
   ptr_scale_packed.reset(options.groups);
   ptr_scale_packed.copy_from_host(ptr_scale_packed_host.data());
@@ -526,6 +544,9 @@ void initialize(Options& options) {
 
   stride_D_ref.reset(options.groups);
   stride_D_ref.copy_from_host(stride_D_host_ref.data());
+
+  stride_act_S.reset(options.groups);
+  stride_act_S.copy_from_host(stride_act_S_host.data());
 
   stride_S_ref.reset(options.groups);
   stride_S_ref.copy_from_host(stride_S_host_ref.data());
@@ -607,21 +628,27 @@ void initialize(Options& options) {
     set_device_ue8m0<<<1, 1>>>(block_scale.get(), block_scale.size());
   }
   else {
-    set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size());
+    set_device_sequential<<<1, 1>>>(block_act_scale.get(), block_act_scale.size(), 1234);
+    set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size(), 5678);
   }
   // initialize_scale(block_scale, options);
+  print_device<<<1, 1>>>(block_act_scale.get(), block_act_scale.size(), 'S');
   print_device<<<1, 1>>>(block_scale.get(), block_scale.size(), 'S');
   cudaDeviceSynchronize();
   
   // cutlass::pack_scale_fp8(block_scale.get(), block_scale_packed.get(), block_scale.size());
+  cutlass::pack_scale_fp32(block_act_scale.get(), block_act_scale_packed.get(), block_act_scale.size(), ElementScalePacked::kElements);
   cutlass::pack_scale_fp32(block_scale.get(), block_scale_packed.get(), block_scale.size(), ElementScalePacked::kElements);  
+  print_device_packed<<<1, 1>>>(block_act_scale_packed.get(), block_act_scale.size(), 'P');
   print_device_packed<<<1, 1>>>(block_scale_packed.get(), block_scale.size(), 'P');
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
   groupwise_verify(
     problem_sizes.get(),
     options.groups,
-    block_A.get(), block_B.get(), block_scale_packed.get(), block_ref_D.get(),
+    block_A.get(), block_B.get(), 
+    block_scale_packed.get(), block_act_scale_packed.get(), 
+    block_ref_D.get(),
     TileShapeK, 
     GROUP_SIZE, // options.c,
     stride_A.get(), stride_B.get()
@@ -723,7 +750,7 @@ typename Gemm::Arguments args_from_options(Options const& options, bool host_pro
   arguments = Args {
     cutlass::gemm::GemmUniversalMode::kGrouped,
     {options.groups, problem_sizes.get(), nullptr},
-    {ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_scale_packed.get(), stride_S.get(), GROUP_SIZE},
+    {ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_act_scale_packed.get(), stride_act_S.get(), ptr_scale_packed.get(), stride_S.get(), GROUP_SIZE},
     {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
     hw_info
   };

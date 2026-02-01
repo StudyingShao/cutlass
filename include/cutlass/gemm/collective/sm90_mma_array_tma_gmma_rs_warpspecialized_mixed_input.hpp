@@ -172,6 +172,7 @@ public:
   using SmemLayoutAtomB = SmemLayoutAtomB_;
   using SmemCopyAtomA = SmemCopyAtomA_;
   using SmemCopyAtomB = SmemCopyAtomB_;
+  using SmemCopyAtomActScale = Copy_Atom<cute::AutoVectorizingCopy, NonVoidElementScale>;
   using SmemCopyAtomScale = Copy_Atom<cute::AutoVectorizingCopy, NonVoidElementScale>;
 
   // We must ensure the type to be scaled goes to RF
@@ -211,6 +212,8 @@ public:
 
   static constexpr int NumProducerThreadEvents = 1;
 
+  using SmemLayoutAtomActScale = Layout<Shape<decltype(cute::shape<0>(SmemLayoutAtomB{})), cute::Int<1>>>;
+  using ActScaleTileShape = decltype(make_shape(shape<1>(TileShape{}), shape<1>(SmemLayoutAtomActScale{})));
   using SmemLayoutAtomScale = Layout<Shape<decltype(cute::shape<0>(SwappedSmemLayoutAtomA{})), cute::Int<1>>>;
   using ScaleTileShape = decltype(make_shape(shape<0>(TileShape{}), shape<1>(SmemLayoutAtomScale{})));
 
@@ -230,6 +233,10 @@ public:
   using SmemLayoutA = decltype(detail::get_smem_layout<DispatchPolicy::Stages>(SwappedSmemLayoutAtomA{}, select<0,2>(TileShape{}), InternalSwappedStrideA{}));
   using SmemLayoutB = decltype(detail::get_smem_layout<DispatchPolicy::Stages>(SwappedSmemLayoutAtomB{}, select<1,2>(TileShape{}), InternalSwappedStrideB{}));
   
+  using SmemLayoutActScale = decltype(tile_to_shape(
+    SmemLayoutAtomActScale{}, 
+    make_shape(shape<0>(ActScaleTileShape{}), shape<1>(ActScaleTileShape{}), Int<Stages>{}),
+    cute::conditional_t< ::cutlass::gemm::detail::is_major<0,NonVoidStrideScale>(), Step<_2,_1,_3>, Step<_1,_2,_3>>{}));
   // It is assumed that the scales and zero-points share the same smem layout
   using SmemLayoutScale = decltype(tile_to_shape(
     SmemLayoutAtomScale{}, 
@@ -284,11 +291,13 @@ public:
   static_assert(SmemAlignmentA >= 128 and SmemAlignmentB >= 128, "Require at least 128B alignment");
 
   struct SharedStorage {
+    static constexpr int act_scale_elements = cute::cosize_v<SmemLayoutActScale>;
     static constexpr int scale_elements = Utils::elements_per_smem_scale();
     static constexpr int zero_elements = Utils::elements_per_smem_zero();
     struct TensorStorage {
       CUTE_ALIGNAS(SmemAlignmentA) cute::ArrayEngine<RealSwappedElementA, cute::cosize_v<SmemLayoutA>> smem_A;
       CUTE_ALIGNAS(SmemAlignmentB) cute::ArrayEngine<typename TiledMma::ValTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
+      cute::ArrayEngine<NonVoidElementScale, act_scale_elements> smem_act_scale;
       cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
       cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
     } tensors;
@@ -296,6 +305,7 @@ public:
     struct TensorMapStorage {
       cute::TmaDescriptor smem_tensormap_A;
       cute::TmaDescriptor smem_tensormap_B;
+      cute::TmaDescriptor smem_tensormap_act_scale;
       cute::TmaDescriptor smem_tensormap_scale;
       cute::TmaDescriptor smem_tensormap_zero;
     };
@@ -316,6 +326,8 @@ public:
     StrideA dA;
     ElementB const** ptr_B;
     StrideB dB;
+    ElementScale const** ptr_ActS = nullptr;
+    NonVoidStrideScale const* dActS{};
     ElementScale const** ptr_S = nullptr;
     NonVoidStrideScale const* dS{};
     int chunk_size = 0;
@@ -342,6 +354,13 @@ public:
         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
         size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
 
+    using TMA_ActScale = decltype(make_tma_copy<TmaElementScale>(
+        GmemTiledCopyScale{},
+        make_tensor(detail::get_logical_ptr(static_cast<NonVoidElementScale const*>(nullptr)), repeat_like(NonVoidStrideScale{}, int32_t(0)), NonVoidStrideScale{}),
+        SmemLayoutActScale{}(_,_,cute::Int<0>{}),
+        ActScaleTileShape{},
+        _1{}));
+
     using TMA_Scale = decltype(make_tma_copy<TmaElementScale>(
         GmemTiledCopyScale{},
         make_tensor(detail::get_logical_ptr(static_cast<NonVoidElementScale const*>(nullptr)), repeat_like(NonVoidStrideScale{}, int32_t(0)), NonVoidStrideScale{}),
@@ -350,15 +369,16 @@ public:
         _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
 
     using TMA_Zero = decltype(make_tma_copy(
-          GmemTiledCopyScale{},
-          make_tensor(detail::get_logical_ptr(static_cast<NonVoidElementZero const*>(nullptr)), repeat_like(NonVoidStrideScale{}, int32_t(0)), NonVoidStrideScale{}),
-          SmemLayoutScale{}(_,_,cute::Int<0>{}),
-          ScaleTileShape{},
-          _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
+        GmemTiledCopyScale{},
+        make_tensor(detail::get_logical_ptr(static_cast<NonVoidElementZero const*>(nullptr)), repeat_like(NonVoidStrideScale{}, int32_t(0)), NonVoidStrideScale{}),
+        SmemLayoutScale{}(_,_,cute::Int<0>{}),
+        ScaleTileShape{},
+        _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
     
     TMA_A tma_load_a;
     TMA_B tma_load_b;
     uint32_t tma_transaction_bytes = TmaTransactionBytes;
+    TMA_ActScale tma_load_act_scale;
     TMA_Scale tma_load_scale;
     TMA_Zero tma_load_zero;
     void* tensormaps;
@@ -366,6 +386,8 @@ public:
     SwappedStrideA ptr_dA;
     SwappedElementB const** ptr_B;
     SwappedStrideB ptr_dB;
+    NonVoidElementScale const** ptr_ActS;
+    NonVoidStrideScale const* dActS;
     NonVoidElementScale const** ptr_S;
     NonVoidStrideScale const* dS;
     NonVoidElementZero const** ptr_Z;
@@ -473,6 +495,7 @@ public:
         SmemLayoutB{}(_,_,cute::Int<0>{}),
         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
         size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+    typename Params::TMA_ActScale tma_load_act_scale{};
     typename Params::TMA_Scale tma_load_scale{};
     typename Params::TMA_Zero tma_load_zero{};
 
@@ -482,6 +505,7 @@ public:
           tma_load_a,
           tma_load_b,
           TmaTransactionBytes,
+          tma_load_act_scale,
           tma_load_scale,
           tma_load_zero,
           tensormaps,
@@ -489,6 +513,8 @@ public:
           ptr_dA,
           reinterpret_cast<SwappedElementB const**>(ptr_B),
           ptr_dB,
+          reinterpret_cast<NonVoidElementScale const**>(args.ptr_ActS),
+          args.dActS,
           reinterpret_cast<NonVoidElementScale const**>(args.ptr_S),
           args.dS,
           reinterpret_cast<NonVoidElementZero const**>(args.ptr_Z),
@@ -506,8 +532,19 @@ public:
     }
     else if constexpr (ModeHasScales) {
       auto fake_scale_k = 1;
+      ElementScale const* ptr_ActS = reinterpret_cast<ElementScale const*>(args.ptr_ActS);
       ElementScale const* ptr_S = reinterpret_cast<ElementScale const*>(args.ptr_S);
+      StrideScale dActS{};
       StrideScale dS{};
+
+      Tensor tensor_act_scale = make_tensor(detail::get_logical_ptr(ptr_ActS), make_layout(make_shape(init_N, fake_scale_k, mock_L), dActS));
+      tma_load_act_scale = make_tma_copy<TmaElementScale>(
+          GmemTiledCopyScale{},
+          tensor_act_scale,
+          SmemLayoutActScale{}(_,_,cute::Int<0>{}),
+          ActScaleTileShape{},
+          _1{});
+
       Tensor tensor_scale = make_tensor(detail::get_logical_ptr(ptr_S), make_layout(make_shape(init_M, fake_scale_k, mock_L), dS));
       tma_load_scale = make_tma_copy<TmaElementScale>(
           GmemTiledCopyScale{},
@@ -558,11 +595,11 @@ public:
     } 
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       // Allocate gmem space for input tensormaps per each SM, A tensormap copies followed by B tensormap copies, followed by scale tensormap copies
-      return calculate_workspace_size(3);
+      return calculate_workspace_size(4);
     } 
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       // Allocate gmem space for input tensormaps per each SM, A tensormap copies followed by B tensormap copies, followed by scale and zeros tensormap copies
-      return calculate_workspace_size(4);
+      return calculate_workspace_size(5);
     } 
     else {
         static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in get_workspace_size.");
@@ -677,10 +714,12 @@ public:
       // auto scale_k = K / mainloop_params.chunk_size;
       auto scale_k = K / ScalingGroupSize;
 
+      Tensor mActS_mkl = mainloop_params.tma_load_act_scale.get_tma_tensor(make_shape(N,scale_k,L));      // (n,scale_k,l)
+      Tensor gActS_mkl = local_tile(mActS_mkl, ActScaleTileShape{}, make_coord(_,_));       // (BLK_N,BLK_Scale_K,n,scale_k,l)
       Tensor mS_mkl = mainloop_params.tma_load_scale.get_tma_tensor(make_shape(M,scale_k,L));      // (m,scale_k,l)
       Tensor gS_mkl = local_tile(mS_mkl, ScaleTileShape{}, make_coord(_,_));       // (BLK_M,BLK_Scale_K,m,scale_k,l)
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(gA_mkl, gB_nkl, gS_mkl);
+        return cute::make_tuple(gA_mkl, gB_nkl, gS_mkl, gActS_mkl);
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor mZ_mkl = mainloop_params.tma_load_zero.get_tma_tensor(make_shape(M,scale_k,L));      // (m,scale_k,l)
@@ -722,8 +761,8 @@ public:
       static_assert(sizeof... (TMs) == 2, "Direct convert needs two tensormaps");
     } 
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      static_assert(sizeof... (Ts) == 3, "Scaled convert needs three inputs");
-      static_assert(sizeof... (TMs) == 3, "Scaled convert needs three tensormaps");
+      static_assert(sizeof... (Ts) == 4, "Scaled convert needs four inputs");
+      static_assert(sizeof... (TMs) == 4, "Scaled convert needs four tensormaps");
     } 
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       static_assert(sizeof... (Ts) == 4, "Scaled and zero convert needs four inputs");
@@ -765,6 +804,7 @@ public:
 
     uint16_t mcast_mask_a = 0;
     uint16_t mcast_mask_b = 0;
+    uint16_t mcast_mask_act_s = 0;
     uint16_t mcast_mask_s = 0;
 
     // Issue TmaLoads
@@ -783,7 +823,7 @@ public:
       }
     }
 
-    auto extra_input_partitions = Utils::partition_extra_tma_inputs(mainloop_params, load_inputs, shared_tensors, cluster_local_block_id, m_coord, l_coord);
+    auto extra_input_partitions = Utils::partition_extra_tma_inputs(mainloop_params, load_inputs, shared_tensors, cluster_local_block_id, m_coord, n_coord, l_coord);
 
     // Mainloop
     CUTLASS_PRAGMA_NO_UNROLL
@@ -809,6 +849,8 @@ public:
       }
       else if constexpr (ModeHasScales) {
         // scale copy
+        auto tActSgActS = get<2>(extra_input_partitions);
+        auto tActSsActS = get<3>(extra_input_partitions);
         auto tSgS = get<0>(extra_input_partitions);
         auto tSsS = get<1>(extra_input_partitions);
 
@@ -820,6 +862,7 @@ public:
         // const int scale_load_k = *k_tile_iter / mainloop_params.reload_factor; // This will always be 0 when chunk_size == K.
         if (cute::elect_one_sync()) {
           copy(mainloop_params.tma_load_scale.with(get<2>(input_tensormaps), *tma_barrier, mcast_mask_s), tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
+          copy(mainloop_params.tma_load_act_scale.with(get<3>(input_tensormaps), *tma_barrier, mcast_mask_act_s), tActSgActS(_,_,_,scale_load_k), tActSsActS(_,_,_,write_stage));
         }
 
         if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
@@ -1068,18 +1111,20 @@ public:
         // tCrS  ((4, _2, _2), MMA_M, _1)
         // accum ((2, _2, _2), MMA_M, _1)
         auto tCrS = cute::get<1>(partitioned_extra_info);
+        auto tCrActS = cute::get<3>(partitioned_extra_info);
         for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
           for (int m = 0; m < size<0, 1>(accum); m++) {
+            auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
             for (int n = 0; n < size<0, 2>(accum); n++) {
               for (int e = 0; e < size<0, 0>(accum); e++) {
                 auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                auto act_scale_coord = make_coord(e, n, mma_m, 0);
 
                 if (chunk_id_ == 0) {
-                  accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * scale_convertor(tCrS(scale_coord)[0]);
+                  accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * scale_convertor(tCrS(scale_coord)[0] * tCrActS(act_scale_coord)[0]);
                 }
                 else {
-                  accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
+                  accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_] * tCrActS(act_scale_coord)[chunk_id_]), accum(accum_coord));
                 }
               }
             }
@@ -1153,15 +1198,17 @@ public:
               warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
               // Apply the group-wise scaling
+              auto tCrActS = cute::get<3>(partitioned_extra_info);
               auto tCrS = cute::get<1>(partitioned_extra_info);
               for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
                 for (int m = 0; m < size<0, 1>(accum); m++) {
+                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
                   for (int n = 0; n < size<0, 2>(accum); n++) {
                     for (int e = 0; e < size<0, 0>(accum); e++) {
                       auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                      auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                      auto act_scale_coord = make_coord(e, n, mma_m, 0);
 
-                      accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
+                      accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_] * tCrActS(act_scale_coord)[chunk_id_]), accum(accum_coord));
                     }
                   }
                 }
@@ -1225,15 +1272,17 @@ public:
 
           // Apply the group-wise scaling
           auto tCrS = cute::get<1>(partitioned_extra_info);
+          auto tCrActS = cute::get<3>(partitioned_extra_info);
           for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
             for (int m = 0; m < size<0, 1>(accum); m++) {
+              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
               for (int n = 0; n < size<0, 2>(accum); n++) {
                 for (int e = 0; e < size<0, 0>(accum); e++) {
                   auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                  auto act_scale_coord = make_coord(e, n, mma_m, 0);
                   int scale_idx = k_block / NumMMAsPerChunk;
 
-                  accum(accum_coord) = fma(intermediate(accum_coord), scale_convertor(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
+                  accum(accum_coord) = fma(intermediate(accum_coord), scale_convertor(tCrS(scale_coord)[scale_idx] * tCrActS(act_scale_coord)[scale_idx]), accum(accum_coord));
                 }
               }
             }
@@ -1271,8 +1320,9 @@ public:
 
     cute::TmaDescriptor* tma_desc_a = &gmem_tensormap[sm_idx];
     cute::TmaDescriptor* tma_desc_b = &gmem_tensormap[sm_idx + sm_count];
-    cute::TmaDescriptor* tma_desc_scale = &gmem_tensormap[sm_idx + 2*sm_count];
-    cute::TmaDescriptor* tma_desc_zero = &gmem_tensormap[sm_idx + 3*sm_count];
+    cute::TmaDescriptor* tma_desc_act_scale = &gmem_tensormap[sm_idx + 2*sm_count];
+    cute::TmaDescriptor* tma_desc_scale = &gmem_tensormap[sm_idx + 3*sm_count];
+    cute::TmaDescriptor* tma_desc_zero = &gmem_tensormap[sm_idx + 4*sm_count];
 
     // Bringing tensormaps from params to smem for modification later
     Tensor pA_tensormap = make_tensor(mainloop_params.tma_load_a.get_tma_descriptor(), Int<1>{}, Int<1>{});
@@ -1286,9 +1336,12 @@ public:
     }
     
     if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+      Tensor pActS_tensormap = make_tensor(mainloop_params.tma_load_act_scale.get_tma_descriptor(), Int<1>{}, Int<1>{});
+      Tensor sActS_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_act_scale), Int<1>{}, Int<1>{});
       Tensor pS_tensormap = make_tensor(mainloop_params.tma_load_scale.get_tma_descriptor(), Int<1>{}, Int<1>{});
       Tensor sS_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_scale), Int<1>{}, Int<1>{});
       if (cute::elect_one_sync()) {
+        copy(recast<uint128_t>(pActS_tensormap), recast<uint128_t>(sActS_tensormap));
         copy(recast<uint128_t>(pS_tensormap), recast<uint128_t>(sS_tensormap));
       }
     }
@@ -1309,7 +1362,7 @@ public:
       return cute::make_tuple(tma_desc_a, tma_desc_b);
     }
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      return cute::make_tuple(tma_desc_a, tma_desc_b, tma_desc_scale);
+      return cute::make_tuple(tma_desc_a, tma_desc_b, tma_desc_scale, tma_desc_act_scale);
     }
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       return cute::make_tuple(tma_desc_a, tma_desc_b, tma_desc_scale, tma_desc_zero);
@@ -1331,6 +1384,8 @@ public:
     // Replacing global_address for the next batch
     cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_B,
                                                     mainloop_params.ptr_B[next_batch]);
+    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_act_scale,
+                                                    mainloop_params.ptr_ActS[next_batch]);
 
     if (TensormapUpdateShapesStridesForAandScale) {
       cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
@@ -1386,6 +1441,8 @@ public:
     cute::array<uint64_t, MaxTensorRank> prob_stride_B = {0,0,0,0,0};
     cute::array<uint32_t, MaxTensorRank> prob_shape_scale  = {1,1,1,1,1};
     cute::array<uint64_t, MaxTensorRank> prob_stride_scale = {0,0,0,0,0};
+    cute::array<uint32_t, MaxTensorRank> prob_shape_act_scale  = {1,1,1,1,1};
+    cute::array<uint64_t, MaxTensorRank> prob_stride_act_scale = {0,0,0,0,0};
     cute::array<uint32_t, MaxTensorRank> prob_shape_zero   = {1,1,1,1,1};
     cute::array<uint64_t, MaxTensorRank> prob_stride_zero  = {0,0,0,0,0};
 
@@ -1394,6 +1451,13 @@ public:
     cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b, 
                                             prob_shape_B, prob_stride_B);
 
+    NonVoidElementScale const* ptr_ActS = nullptr;
+    auto scale_k = K / ScalingGroupSize;
+
+    Tensor tensor_act_scale = make_tensor(detail::get_logical_ptr(ptr_ActS), make_shape(N,scale_k,Int<1>{}), mainloop_params.dActS[next_group]);
+    cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_act_scale, tensor_act_scale, 
+                                            prob_shape_act_scale, prob_stride_act_scale);
+
     for (uint64_t& stride : prob_stride_B) {
       stride = (stride * sizeof_bits_v<SwappedElementB>) / 8;
     }
@@ -1401,6 +1465,14 @@ public:
     cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_B,
                                                             prob_shape_B,
                                                             prob_stride_B);
+
+    for (uint64_t& stride : prob_stride_act_scale) {
+      stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
+    }
+
+    cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_act_scale,
+                                                            prob_shape_act_scale,
+                                                            prob_stride_act_scale);
 
     if (TensormapUpdateShapesStridesForAandScale) {
 
@@ -1411,7 +1483,6 @@ public:
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
         NonVoidElementScale const* ptr_S = nullptr;
         // auto scale_k = K / mainloop_params.chunk_size;
-        auto scale_k = K / ScalingGroupSize;
         Tensor tensor_scale = make_tensor(detail::get_logical_ptr(ptr_S), make_shape(M,scale_k,Int<1>{}), mainloop_params.dS[next_group]);
         cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_scale, tensor_scale, 
                                               prob_shape_scale, prob_stride_scale);
@@ -1419,7 +1490,6 @@ public:
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         ElementZero const* ptr_Z = nullptr;
         // auto scale_k = K / mainloop_params.chunk_size;
-        auto scale_k = K / ScalingGroupSize;
         Tensor tensor_zero = make_tensor(detail::get_logical_ptr(ptr_Z), make_shape(M,scale_k,Int<1>{}), mainloop_params.dS[next_group]);
         cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_zero, tensor_zero, 
                                                 prob_shape_zero, prob_stride_zero);
@@ -1495,6 +1565,7 @@ public:
 
     // Entire warp must do this (i.e. it's aligned)
     tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);
+    tma_descriptor_cp_fence_release(get<3>(input_tensormaps), shared_tensormaps.smem_tensormap_act_scale);
 
     if (TensormapUpdateShapesStridesForAandScale) {
       TensormapUpdateShapesStridesForAandScale = false;
@@ -1524,6 +1595,7 @@ public:
     cute::tma_descriptor_fence_acquire(get<1>(input_tensormaps));
     if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       cute::tma_descriptor_fence_acquire(get<2>(input_tensormaps));
+      cute::tma_descriptor_fence_acquire(get<3>(input_tensormaps));
     }
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       cute::tma_descriptor_fence_acquire(get<3>(input_tensormaps));

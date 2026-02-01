@@ -1,6 +1,8 @@
 
 #pragma once
 
+#include <curand_kernel.h>
+
 using namespace cute;
 
 // #define ENABLE_PRINT
@@ -96,15 +98,24 @@ __global__ void set_device(T *ptr, int count, int value = 0) {
 
 
 template<typename T>
-__global__ void set_device_sequential(T *ptr, int count, int value = 0) {
-  if (thread0())
+__global__ void set_device_sequential(T *ptr, int count, int seed, int value = 0) {
+  if (thread0()) {
+    // Initialize curand state
+    curandState state;
+    curand_init(seed, 0, 0, &state);
+    
     for (int i = 0; i < count; i++)
     {
-      if (value == 0)
-        ptr[i] = static_cast<T>(((i + 1) % 50) * 0.1f);
-      else
+      if (value == 0) {
+        // Random number in range [-2, 2]
+        float rand_val = curand_uniform(&state) * 4.0f - 2.0f;
+        ptr[i] = static_cast<T>(rand_val);
+      } 
+      else {
         ptr[i] = static_cast<T>(value);
+      }
     }
+  }
 }
 
 __global__ void set_device_ue8m0(void *ptr_, int count, int default_val = 0) {
@@ -223,7 +234,9 @@ __device__ void single_gemm_varify(
   int bid, int tid,
   int block_tile_k, int group_size,
   int M, int N, int K,
-  ElementA *A_ptr, ElementB *B_ptr, ElementScalePacked *scale_ptr, ElementD *D_ptr) {
+  ElementA *A_ptr, ElementB *B_ptr, 
+  ElementScalePacked *scale_ptr, ElementScalePacked *act_scale_ptr,
+  ElementD *D_ptr) {
 
   float lut[16];
 
@@ -251,6 +264,7 @@ __device__ void single_gemm_varify(
             ElementA *local_A_ptr = A_ptr + m * K + k;
             uint8_t *local_B_ptr = reinterpret_cast<uint8_t *>(B_ptr) + n * K / 2 + k / 2;
             ElementScalePacked *local_scale_ptr = scale_ptr + (k / block_tile_k) * N + n;
+            ElementScalePacked *local_act_scale_ptr = act_scale_ptr + (k / block_tile_k) * M + m;
 
             float elem_A_0 = local_A_ptr[0];
             float elem_A_1 = local_A_ptr[1];
@@ -263,8 +277,9 @@ __device__ void single_gemm_varify(
 
             int scale_idx = (k % block_tile_k) / group_size;
             float scale = static_cast<float>((*local_scale_ptr)[scale_idx]);
+            float act_scale = static_cast<float>((*local_act_scale_ptr)[scale_idx]);
 
-            accum += elem_A_0 * elem_B_low * scale + elem_A_1 * elem_B_high * scale;
+            accum += elem_A_0 * elem_B_low * scale * act_scale + elem_A_1 * elem_B_high * scale * act_scale;
 
             // if (group_id == 0 && bid == 0 && tid == 0)
             //     printf("A %f %f B %f %f scale %f accum %f\n",
@@ -297,7 +312,7 @@ template <
 __global__ void groupwise_verify_kernel(
     ProblemSizes problem_sizes,
     int group_num,
-    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementD *D,
+    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementScalePacked *act_scale, ElementD *D,
     int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
@@ -331,6 +346,7 @@ __global__ void groupwise_verify_kernel(
     ElementA *A_ptr = A;
     ElementB *B_ptr = B;
     ElementScalePacked *scale_ptr = scale;
+    ElementScalePacked *act_scale_ptr = act_scale;
     ElementD *D_ptr = D;
 
     int bid = blockIdx.x;
@@ -345,50 +361,15 @@ __global__ void groupwise_verify_kernel(
           bid, tid,
           block_tile_k, group_size,
           M, N, K,
-          A_ptr, B_ptr, scale_ptr, D_ptr
+          A_ptr, B_ptr, scale_ptr, act_scale_ptr, D_ptr
         );
 
         A_ptr += M * K;
         B_ptr += N * K / 2;
         scale_ptr += N * K / block_tile_k;
+        act_scale_ptr += M * K / block_tile_k;
         D_ptr += M * N;
     }
-}
-
-template <
-    typename ElementA,
-    typename ElementB,
-    typename ElementScalePacked,
-    typename ElementD,
-    typename StrideA,
-    typename StrideB
->
-__global__ void groupwise_verify_kernel(
-    int M, int N, int K,
-    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementD *D,
-    int block_tile_k, int group_size,
-    StrideA stride_A, StrideB stride_B
-) {
-    ElementA *A_ptr = A;
-    ElementB *B_ptr = B;
-    ElementScalePacked *scale_ptr = scale;
-    ElementD *D_ptr = D;
-
-    int bid = blockIdx.x;
-    int tid = threadIdx.x;
-
-    single_gemm_varify(
-      bid, tid,
-      block_tile_k, group_size,
-      M, N, K,
-      A_ptr, B_ptr, scale_ptr, D_ptr
-    );
-
-    // A_ptr += M * K;
-    // B_ptr += N * K / 2;
-    // scale_ptr += N * K / block_tile_k;
-    // D_ptr += M * N;
-    
 }
 
 
@@ -404,37 +385,18 @@ template <
 void groupwise_verify(
     ProblemSizes problem_sizes,
     int group_num,
-    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementD *D,
+    ElementA *A, ElementB *B, 
+    ElementScalePacked *scale, ElementScalePacked *act_scale, 
+    ElementD *D,
     int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
     groupwise_verify_kernel<<<1024, 1024>>>(
         problem_sizes, 
         group_num, 
-        A, B, scale, D,
+        A, B, scale, act_scale, D,
         block_tile_k, group_size,
         stride_A, stride_B);
     cudaDeviceSynchronize();
 }
 
-template <
-    typename ElementA,
-    typename ElementB,
-    typename ElementScalePacked,
-    typename ElementD,
-    typename StrideA,
-    typename StrideB
->
-void groupwise_verify(
-    int M, int N, int K,
-    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementD *D,
-    int block_tile_k, int group_size,
-    StrideA stride_A, StrideB stride_B
-) {
-    groupwise_verify_kernel<<<1024, 1024>>>(
-        M, N, K,
-        A, B, scale, D,
-        block_tile_k, group_size,
-        stride_A, stride_B);
-    cudaDeviceSynchronize();
-}

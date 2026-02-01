@@ -665,6 +665,7 @@ private:
   using ConversionMode = typename Collective::ConversionMode;
   using SmemLayoutA = typename Collective::SmemLayoutA;
   using SmemLayoutB = typename Collective::SmemLayoutB;
+  using SmemLayoutActScale = typename Collective::SmemLayoutActScale;
   using SmemLayoutScale = typename Collective::SmemLayoutScale;
   using SwappedElementA = typename Collective::SwappedElementA;
   using SwappedElementB = typename Collective::SwappedElementB;
@@ -672,6 +673,7 @@ private:
   using RealSwappedElementB = typename Collective::RealSwappedElementB;
   using ElementScale = typename Collective::ElementScale;
   using ElementZero = typename Collective::ElementZero;
+  using SmemCopyAtomActScale = typename Collective::SmemCopyAtomActScale;
   using SmemCopyAtomScale = typename Collective::SmemCopyAtomScale;
   static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
   static constexpr auto ModeHasScales = Collective::ModeHasScales;
@@ -724,10 +726,12 @@ public:
       return 0;
     }
     else if constexpr (ModeHasScales) {
+      constexpr uint32_t act_scale_tx_bytes = cutlass::bits_to_bytes(size<0>(SmemLayoutActScale{}) * size<1>(SmemLayoutActScale{}) * static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
       constexpr uint32_t scale_tx_bytes = cutlass::bits_to_bytes(size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) * static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
+      static_assert(act_scale_tx_bytes % 128 == 0, "Each scale stage must be 128B aligned."); // required by TMA
       static_assert(scale_tx_bytes % 128 == 0, "Each scale stage must be 128B aligned."); // required by TMA
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return scale_tx_bytes;
+        return act_scale_tx_bytes + scale_tx_bytes;
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         // Scale and zero share smem layout
@@ -784,6 +788,12 @@ public:
       auto tCsS              = cute::get<0>(partitioned_mma_extra_info);
 
       copy(smem_tiled_copy_S, tCsS(_,_,k_block,read_stage), tCrS_copy_view(_,_,k_block));
+  
+      auto tCrActS_copy_view    = cute::get<2>(tiled_copy_and_views);
+      Tensor tCsActS = cute::get<2>(partitioned_mma_extra_info);
+      
+      copy(SmemCopyAtomActScale{}, tCsActS(_,_,0,_,k_block,read_stage), tCrActS_copy_view(_,_,_,k_block));
+
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
         // Nothing extra to do
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
@@ -1189,7 +1199,8 @@ public:
     cute::tuple<Ts...> const& load_inputs,
     TensorStorage& shared_tensors,
     uint2 const& cluster_local_block_id,
-    int const m_coord, 
+    int const m_coord,
+    int const n_coord,
     int const l_coord) {
 
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
@@ -1203,8 +1214,17 @@ public:
 
       Tensor tSgS = block_tma_s.partition_S(gS);                                              // (TMA,TMA_M,TMA_K,k)
       Tensor tSsS = block_tma_s.partition_D(sS);                                              // (TMA,TMA_M,TMA_K,PIPE)
+
+      Tensor sActS  = make_tensor(make_smem_ptr(shared_tensors.smem_act_scale.begin()), SmemLayoutActScale{}); // (BLK_N,BLK_K,PIPE)
+      Tensor gActS_mkl = get<3>(load_inputs);
+      auto block_tma_act_s = mainloop_params.tma_load_act_scale.get_slice(cluster_local_block_id.x);
+      Tensor gActS = gActS_mkl(_,_,n_coord,_,l_coord);                                                  // (BLK_N,BLK_K,k)
+
+      Tensor tActSgActS = block_tma_act_s.partition_S(gActS);                                              // (TMA,TMA_N,TMA_K,k)
+      Tensor tActSsActS = block_tma_act_s.partition_D(sActS);                                              // (TMA,TMA_N,TMA_K,PIPE)
+
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(tSgS, tSsS);
+        return cute::make_tuple(tSgS, tSsS, tActSgActS, tActSsActS);
       } 
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor sZ  = make_tensor(make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{}); // (BLK_M,BLK_K,PIPE)
@@ -1244,7 +1264,29 @@ public:
       Tensor tCsS = mma_thread_slice.partition_A(sS);
       Tensor tCrS = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_,_,Int<0>{})).layout()); 
 
-      return cute::make_tuple(tCsS, tCrS);
+      Tensor sActS = make_tensor(make_smem_ptr(shared_tensors.smem_act_scale.begin()), SmemLayoutActScale{});// (BLK_N,BLK_SCALE_K,PIPE)
+      Tensor tCsActS_wg = mma_thread_slice.partition_B(sActS);
+      
+      auto shape_wg = tCsActS_wg.shape();
+      auto stride_wg = tCsActS_wg.stride();
+      int constexpr mma_n = get<0, 0>(shape_wg) / Int<4>{} / Int<2>{};
+      
+      auto layout_MMA_N = make_layout(
+          make_shape(Int<4>{}, Int<2>{}, Int<mma_n>{}, get<0, 1>(shape_wg)),
+          make_stride(Int<2>{}, Int<1>{}, Int<8>{}, get<0, 1>(stride_wg))
+      );
+      
+      Tensor tCsActS_view = make_tensor(tCsActS_wg.data(), make_layout(
+          make_shape(layout_MMA_N.shape(), get<1>(shape_wg), get<2>(shape_wg), get<3>(shape_wg)),
+          make_stride(layout_MMA_N.stride(), get<1>(stride_wg), get<2>(stride_wg), get<3>(stride_wg))
+      ));
+      
+      int thr_id = threadIdx.x % 4;
+      auto tCsActS_thr = tCsActS_view(make_tuple(thr_id,_,_,_),_,_,_);
+      auto shape_thr = cute::select<0,1,3,4>(tCsActS_thr.shape());
+      Tensor tCrActS_thr = make_tensor<ElementScale>(shape_thr);
+
+      return cute::make_tuple(tCsS, tCrS, tCsActS_thr, tCrActS_thr);
     }
     else if constexpr (ModeHasScales) {
       Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});// (BLK_M,BLK_SCALE_K,PIPE)
@@ -1286,8 +1328,11 @@ public:
       auto smem_thr_copy_S   = smem_tiled_copy_S.get_thread_slice(warp_group_thread_idx);
       Tensor tCrS_copy_view  = smem_thr_copy_S.retile_D(cute::get<1>(partitioned_extra_info));        // (CPY,CPY_M,CPY_K)
       
+      auto& tCrActS = cute::get<3>(partitioned_extra_info);
+      Tensor tCrActS_copy_view = make_tensor(tCrActS.data(), tCrActS.layout());
+
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view);
+        return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view, tCrActS_copy_view);
       } 
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor tCrZ_copy_view  = smem_thr_copy_S.retile_D(cute::get<3>(partitioned_extra_info));      // (CPY,CPY_M,CPY_K)
