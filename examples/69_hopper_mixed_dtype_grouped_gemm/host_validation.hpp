@@ -5,28 +5,28 @@
 
 using namespace cute;
 
-// #define ENABLE_PRINT
-// #define DEBUG_INPUT_ACT
-// #define DEBUG_INPUT_WEIGHT
-
 
 template <typename T>
-__global__ void print_device(T *ptr, int count, const char str = ' ') {
-#ifdef ENABLE_PRINT
+__global__ void print_device(bool enable_print, T *ptr, int count, int Groups, const char str = ' ') {
+if (enable_print) {
   if (thread0()) {
     printf("print_device %c ", str);
-    for (int i = 0; i < count; i++)
-    {
-      printf("(%d):%f ", i, float(ptr[i]));
+    
+    for (int g = 0; g < Groups; g++) {
+      for (int i = 0; i < count / Groups; i++)
+      {
+        int idx = g * count / Groups + i;
+        printf("(g-%d  %d):%f ", g, i, float(ptr[idx]));
+      }
+      printf("\n");
     }
-    printf("\n");
   }
-#endif
+}
 }
 
 template <typename T>
-__global__ void print_device_packed(T *ptr, int count, const char str = ' ') {
-#ifdef ENABLE_PRINT
+__global__ void print_device_packed(bool enable_print, T *ptr, int count, const char str = ' ') {
+if (enable_print) {
   if (thread0()) {
     printf("print_device %c ", str);
     for (int i = 0; i < count; i++)
@@ -35,13 +35,13 @@ __global__ void print_device_packed(T *ptr, int count, const char str = ' ') {
     }
     printf("\n");
   }
-#endif
+}
 }
 
 
 template <typename T>
-__global__ void print_device_4b(T *ptr_, int rows, int cols, const char str = ' ') {
-#ifdef ENABLE_PRINT
+__global__ void print_device_4b(bool enable_print, T *ptr_, int rows, int cols, const char str = ' ') {
+if (enable_print) {
 
   float lut[16];
 
@@ -78,13 +78,13 @@ __global__ void print_device_4b(T *ptr_, int rows, int cols, const char str = ' 
       printf("\n");
     }
   }
-#endif
+}
 }
 
 
 template<typename T>
-__global__ void set_device(T *ptr, int count, int value = 0) {
-#ifdef DEBUG_INPUT_ACT
+__global__ void set_device(bool debug_input_act, T *ptr, int count, int value = 0) {
+if (debug_input_act) {
   if (thread0())
     for (int i = 0; i < count; i++)
     {
@@ -93,7 +93,7 @@ __global__ void set_device(T *ptr, int count, int value = 0) {
       else
         ptr[i] = static_cast<T>(value);
     }
-#endif
+}
 }
 
 
@@ -143,8 +143,8 @@ __global__ void set_device_ue8m0(void *ptr_, int count, int default_val = 0) {
 
 
 template<typename T>
-__global__ void set_device_int4(T *ptr_, int count, uint8_t value = 0) {
-#ifdef DEBUG_INPUT_WEIGHT
+__global__ void set_device_int4(bool debug_input_weight, T *ptr_, int count, uint8_t value = 0) {
+if (debug_input_weight) {
   // N x K
   // 16 x 256
   if (thread0())
@@ -203,22 +203,44 @@ __global__ void set_device_int4(T *ptr_, int count, uint8_t value = 0) {
    
   }
 
-#endif
+}
 }
 
 
 template <typename T>
-__global__ void compare_device(T *out, T *ref, int count) {
+__global__ void compare_device(T *out, T *ref, int count, int Groups, int M, int N) {
     
     if (thread0())
     {
-        for (int i = 0; i < count; i++)
-        {
-            float abs_error = abs(float(out[i]) - float(ref[i]));
-            if (abs_error > 1e-1)
-                printf("(%d): out %f ref %f abs_error %f\n",
-                    i, float(out[i]), float(ref[i]), abs_error);
+        int P99_error_count = 0;
+        int P98_error_count = 0;
+        int P95_error_count = 0;
+
+
+        for (int g = 0; g < Groups; g++) {
+          for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+              int idx = g * M * N + m * N + n;
+              float abs_error = abs(float(out[idx]) - float(ref[idx]));
+              float rel_error = abs_error / abs(float(ref[idx]));
+
+              if (rel_error > 0.01)
+              {
+                P99_error_count++;
+                printf("(g=%d, m=%d, n=%d): out %f ref %f abs_error %f rel_error %f\n",
+                    g, m, n, float(out[idx]), float(ref[idx]), abs_error, rel_error);
+                
+                if (rel_error > 0.02)
+                  P98_error_count++;
+                if (rel_error > 0.05)
+                  P95_error_count++;
+              }
+            }
+          }
         }
+        printf("P99_error_count %d %.2f%%\n", P99_error_count, float(P99_error_count) / count * 100.0f);
+        printf("P98_error_count %d %.2f%%\n", P98_error_count, float(P98_error_count) / count * 100.0f);
+        printf("P95_error_count %d %.2f%%\n", P95_error_count, float(P95_error_count) / count * 100.0f);
         printf("\n");
     }
 }

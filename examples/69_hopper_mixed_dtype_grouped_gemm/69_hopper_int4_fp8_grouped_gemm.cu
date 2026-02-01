@@ -342,6 +342,10 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
     cmd.get_cmd_line_argument("shuffle", shuffle);
     cmd.get_cmd_line_argument("explore", explore);
     cmd.get_cmd_line_argument("compare", compare);
+    cmd.get_cmd_line_argument("enable_print", enable_print);
+    cmd.get_cmd_line_argument("enable_print_weight", enable_print_weight);
+    cmd.get_cmd_line_argument("debug_input_act", debug_input_act);
+    cmd.get_cmd_line_argument("debug_input_weight", debug_input_weight);
 
     this->Base::parse(argc, args);
 
@@ -565,8 +569,8 @@ void initialize(Options& options) {
   initialize_tensor(block_A, seed + 2023);
   
   // print("jiangs block_A (size=%d)\n", int(block_A.size())); // block_A (size=512)  
-  set_device<<<1, 1>>>(block_A.get(), block_A.size(), 1);
-  print_device<<<1, 1>>>(block_A.get(), block_A.size(), 'A');
+  set_device<<<1, 1>>>(options.debug_input_act, block_A.get(), block_A.size(), 1);
+  print_device<<<1, 1>>>(options.enable_print, block_A.get(), block_A.size(), options.groups, 'A');
   cudaDeviceSynchronize();
 
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -577,8 +581,8 @@ void initialize(Options& options) {
   float scope_max = float(cutlass::platform::numeric_limits<QuantType>::max());
   // print("jiangs block_B (size=%d) min=%f max=%f\n",
     // int(block_B.size()), scope_min, scope_max); // jiangs block_B (size=4096) min=-8.000000 max=7.000000
-  set_device_int4<<<1, 1>>>(block_B.get(), block_B.size(), 1);
-  print_device_4b<<<1, 1>>>(block_B.get(), options.groups * options.n, options.k, 'B');
+  set_device_int4<<<1, 1>>>(options.debug_input_weight, block_B.get(), block_B.size(), 1);
+  print_device_4b<<<1, 1>>>(options.enable_print_weight, block_B.get(), options.groups * options.n, options.k, 'B');
 
   if constexpr (cute::is_same_v<QuantType, cutlass::float_e2m1_t> && 
       cute::is_same_v<MmaType, cutlass::bfloat16_t>)
@@ -607,7 +611,7 @@ void initialize(Options& options) {
   {
     block_B_interleaved.copy_from_device(block_B.get());
   }
-  print_device_4b<<<1, 1>>>(block_B_interleaved.get(), options.groups * options.n, options.k, 'B');
+  print_device_4b<<<1, 1>>>(options.enable_print_weight, block_B_interleaved.get(), options.groups * options.n, options.k, 'B');
 
   cutlass::unified_encode_int4b(
     reinterpret_cast<cutlass::int4b_t const *>(block_B.get()),
@@ -618,7 +622,7 @@ void initialize(Options& options) {
   
   // print("jiangs block_C (size=%d)\n", int(block_C.size())); // block_C (size=16)
   initialize_tensor(block_C, seed + 2021);
-  print_device<<<1, 1>>>(block_C.get(), block_C.size(), 'C');  
+  print_device<<<1, 1>>>(options.enable_print, block_C.get(), block_C.size(), options.groups, 'C');  
   cudaDeviceSynchronize();
   
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -632,15 +636,15 @@ void initialize(Options& options) {
     set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size(), 5678);
   }
   // initialize_scale(block_scale, options);
-  print_device<<<1, 1>>>(block_act_scale.get(), block_act_scale.size(), 'S');
-  print_device<<<1, 1>>>(block_scale.get(), block_scale.size(), 'S');
+  print_device<<<1, 1>>>(options.enable_print, block_act_scale.get(), block_act_scale.size(), options.groups, 'S');
+  print_device<<<1, 1>>>(options.enable_print, block_scale.get(), block_scale.size(), options.groups, 'S');
   cudaDeviceSynchronize();
   
   // cutlass::pack_scale_fp8(block_scale.get(), block_scale_packed.get(), block_scale.size());
   cutlass::pack_scale_fp32(block_act_scale.get(), block_act_scale_packed.get(), block_act_scale.size(), ElementScalePacked::kElements);
   cutlass::pack_scale_fp32(block_scale.get(), block_scale_packed.get(), block_scale.size(), ElementScalePacked::kElements);  
-  print_device_packed<<<1, 1>>>(block_act_scale_packed.get(), block_act_scale.size(), 'P');
-  print_device_packed<<<1, 1>>>(block_scale_packed.get(), block_scale.size(), 'P');
+  print_device_packed<<<1, 1>>>(options.enable_print, block_act_scale_packed.get(), block_act_scale.size(), 'P');
+  print_device_packed<<<1, 1>>>(options.enable_print, block_scale_packed.get(), block_scale.size(), 'P');
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
   groupwise_verify(
@@ -654,7 +658,7 @@ void initialize(Options& options) {
     stride_A.get(), stride_B.get()
   );
 
-  print_device<<<1,1>>>(block_ref_D.get(), block_ref_D.size(), 'R');
+  print_device<<<1,1>>>(options.enable_print, block_ref_D.get(), block_ref_D.size(), options.groups, 'R');
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -851,11 +855,11 @@ bool verify(Options const& options) {
   }
 
   if (options.compare) {
-    compare_device<<<1,1>>>(block_D.get(), block_ref_D.get(), block_D.size());
+    compare_device<<<1,1>>>(block_D.get(), block_ref_D.get(), block_D.size(), options.groups, options.m, options.n);
   }
   // printf("block_D: ");
-  print_device<<<1,1>>>(block_ref_D.get(), block_ref_D.size(), 'R');
-  print_device<<<1,1>>>(block_D.get(), block_D.size(), 'D');
+  print_device<<<1,1>>>(options.enable_print, block_ref_D.get(), block_ref_D.size(), options.groups, 'R');
+  print_device<<<1,1>>>(options.enable_print, block_D.get(), block_D.size(), options.groups, 'D');
 
 
   return passed;
@@ -951,7 +955,10 @@ int main(int argc, char const **args) {
       << "This example requires a GPU of NVIDIA's Hopper Architecture (compute capability 90).\n";
     return 0;
   }
-  
+
+  // Print SM count
+  int sm_count = props.multiProcessorCount;
+  std::cout << "Device: " << props.name << ", SM count: " << sm_count << std::endl;
 
   //
   // Parse options
