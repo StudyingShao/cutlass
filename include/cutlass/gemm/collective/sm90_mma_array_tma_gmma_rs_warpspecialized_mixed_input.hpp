@@ -145,6 +145,20 @@ public:
   using StrideScale = cute::Stride<cute::Int<1>, int64_t, int64_t>;
   using NonVoidStrideScale = cute::conditional_t<cute::is_void_v<StrideScale>, cute::Stride<_1, int64_t, int64_t>, StrideScale>;
 
+  // ========== 新增：Raw ActScale（不 pack，K-major）==========
+  // 获取 ElementScale 的基础类型（如果是 Array，提取其元素类型）
+  using ElementActScaleRaw = cute::conditional_t<
+      cute::is_void_v<ElementScale>, 
+      float,
+      cute::conditional_t<
+          (sizeof(NonVoidElementScale) > 2),  // 如果是 Array（大于 2 字节）
+          cutlass::bfloat16_t,                 // 使用 bf16 作为基础类型
+          NonVoidElementScale                  // 否则直接使用
+      >
+  >;
+  // K-major stride: (stride_n, stride_k=1, stride_l)
+  using StrideActScaleRaw = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+
   static_assert(( IsATransformed && (cutlass::gemm::detail::is_k_major<StrideA>() || is_layout<StrideA>::value || is_layout<InternalStrideA>::value)) || 
                 (!IsATransformed && (cutlass::gemm::detail::is_k_major<StrideB>() || is_layout<StrideB>::value || is_layout<InternalStrideB>::value)),
                 "The transformed type must be K-major.");
@@ -245,6 +259,20 @@ public:
     SmemLayoutAtomActScale{}, 
     make_shape(shape<0>(ActScaleTileShape{}), shape<1>(ActScaleTileShape{}), Int<Stages>{}),
     cute::conditional_t< ::cutlass::gemm::detail::is_major<0,NonVoidStrideScale>(), Step<_2,_1,_3>, Step<_1,_2,_3>>{}));
+  
+  // ========== 新增：Raw ActScale Smem Layout（不 pack，K-major）==========
+  // 每个 K tile 中的 scale 数量：TileK / ScalingGroupSize
+  static constexpr int ActScaleKPerTile = size<2>(TileShape{}) / ScalingGroupSize;
+  // Raw ActScale tile 形状：(TileN, ActScaleKPerTile)
+  using ActScaleRawTileShape = decltype(make_shape(shape<1>(TileShape{}), Int<ActScaleKPerTile>{}));
+  // Smem atom：(TileN, ActScaleKPerTile)
+  using SmemLayoutAtomActScaleRaw = Layout<Shape<decltype(shape<1>(TileShape{})), Int<ActScaleKPerTile>>>;
+  // Smem layout：(TileN, ActScaleKPerTile, Stages) - K 方向连续
+  using SmemLayoutActScaleRaw = decltype(tile_to_shape(
+    SmemLayoutAtomActScaleRaw{}, 
+    make_shape(shape<0>(ActScaleRawTileShape{}), shape<1>(ActScaleRawTileShape{}), Int<Stages>{}),
+    Step<_1,_2,_3>{}));  // K-major: 第二维（K）先增长
+  
   // It is assumed that the scales and zero-points share the same smem layout
   using SmemLayoutScale = decltype(tile_to_shape(
     SmemLayoutAtomScale{}, 
@@ -300,6 +328,7 @@ public:
 
   struct SharedStorage {
     static constexpr int act_scale_elements = cute::cosize_v<SmemLayoutActScale>;
+    static constexpr int act_scale_raw_elements = cute::cosize_v<SmemLayoutActScaleRaw>;  // 新增：Raw ActScale
     static constexpr int scale_elements = Utils::elements_per_smem_scale();
     static constexpr int zero_elements = Utils::elements_per_smem_zero();
     struct TensorStorage {
@@ -308,6 +337,8 @@ public:
       cute::ArrayEngine<NonVoidElementScale, act_scale_elements> smem_act_scale;
       cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
       cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
+      // 新增：Raw ActScale smem - 放在最后，避免影响已有成员的内存布局
+      cute::ArrayEngine<ElementActScaleRaw, act_scale_raw_elements> smem_act_scale_raw;
     } tensors;
 
     struct TensorMapStorage {
@@ -340,6 +371,9 @@ public:
     NonVoidStrideScale const* dS{};
     int chunk_size = 0;
     ElementZero const** ptr_Z = nullptr;
+    // 新增：Raw ActScale（不 pack，K-major）
+    ElementActScaleRaw const** ptr_ActS_Raw = nullptr;
+    StrideActScaleRaw const* dActS_Raw{};
   };
 
   // Device side kernel params
@@ -404,6 +438,9 @@ public:
     int reload_factor = (chunk_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{});
     InternalSwappedStrideA dA;
     InternalSwappedStrideB dB;
+    // 新增：Raw ActScale（不 pack，K-major）
+    ElementActScaleRaw const** ptr_ActS_Raw;
+    StrideActScaleRaw const* dActS_Raw;
   };
 
   //
@@ -530,7 +567,10 @@ public:
           chunk_size,
           reload_factor,
           dA,
-          dB
+          dB,
+          // 新增：Raw ActScale
+          args.ptr_ActS_Raw,
+          args.dActS_Raw
       };
     };
 
@@ -914,8 +954,82 @@ public:
             
             cute::copy(tiled_copy_act_scale, tActSgActS, tActSsActS);
           }
-          cute::cp_async_fence();
+          // 注意：fence 移到后面，与 Raw ActScale 共享同一个 fence 组
         }
+        
+        // ========== 新增：Raw ActScale LDGSTS（不 pack，K-major）==========
+        if (mainloop_params.ptr_ActS_Raw != nullptr) {
+          ElementActScaleRaw const* ptr_act_scale_raw = mainloop_params.ptr_ActS_Raw[curr_batch];
+          auto dActS_Raw = mainloop_params.dActS_Raw[curr_batch];
+          
+          constexpr int TileN_Raw = size<0>(ActScaleRawTileShape{});    // 例如 16
+          constexpr int ScaleK_Raw = size<1>(ActScaleRawTileShape{});   // 例如 4 (TileK/GROUP_SIZE)
+          constexpr int TotalElems_Raw = TileN_Raw * ScaleK_Raw;        // 例如 64
+          
+          // K-major offset 计算
+          // gmem 布局假设为 (scale_k_total, N)，K 方向连续
+          int64_t act_scale_raw_offset = n_coord * TileN_Raw * get<0>(dActS_Raw) +
+                                         scale_load_k * ScaleK_Raw * get<1>(dActS_Raw);
+          
+          // cp.async 向量类型：bf16 是 2 字节，选择 4/8/16 字节对齐
+          constexpr int ActScaleRawElemBytes = sizeof(ElementActScaleRaw);
+          constexpr int ActScaleRawCpAsyncBytes = 
+              (ActScaleRawElemBytes >= 16) ? 16 :
+              (ActScaleRawElemBytes >= 8)  ? 8  :
+              (ActScaleRawElemBytes >= 4)  ? 4  : 4;
+          using CpAsyncVecRaw = cute::uint_bit_t<ActScaleRawCpAsyncBytes * 8>;
+          
+          // 将指针 recast 为向量类型
+          static_assert(sizeof(ElementActScaleRaw) <= sizeof(CpAsyncVecRaw),
+              "ElementActScaleRaw size must be <= CpAsyncVecRaw");
+          constexpr int ElemsPerVec = sizeof(CpAsyncVecRaw) / sizeof(ElementActScaleRaw);
+          constexpr int TotalVecs = TotalElems_Raw / ElemsPerVec;
+          
+          CpAsyncVecRaw const* ptr_act_scale_raw_vec = reinterpret_cast<CpAsyncVecRaw const*>(
+              ptr_act_scale_raw + act_scale_raw_offset);
+          
+          // 创建 1D gmem tensor (TotalVecs 个向量，stride=1)
+          Tensor gActS_Raw = make_tensor(
+              make_gmem_ptr(ptr_act_scale_raw_vec),
+              make_layout(make_shape(Int<TotalVecs>{}), make_stride(Int<1>{}))
+          );
+          
+          // 创建 1D smem tensor
+          Tensor sActS_Raw_full = make_tensor(
+              make_smem_ptr(shared_tensors.smem_act_scale_raw.begin()), 
+              SmemLayoutActScaleRaw{}
+          );
+          CpAsyncVecRaw* smem_act_scale_raw_vec = reinterpret_cast<CpAsyncVecRaw*>(
+              sActS_Raw_full(_,_,write_stage).data().get());
+          Tensor sActS_Raw = make_tensor(
+              make_smem_ptr(smem_act_scale_raw_vec),
+              make_layout(make_shape(Int<TotalVecs>{}), make_stride(Int<1>{}))
+          );
+          
+          // TiledCopy 配置
+          constexpr int NumThreadsRaw = (TotalVecs < 128) ? TotalVecs : 128;
+          constexpr int VecsPerThread = (TotalVecs + NumThreadsRaw - 1) / NumThreadsRaw;
+          
+          using GmemCopyAtomActScaleRaw = cute::Copy_Atom<
+              cute::SM80_CP_ASYNC_CACHEALWAYS<CpAsyncVecRaw>, CpAsyncVecRaw>;
+          
+          auto tiled_copy_act_scale_raw = cute::make_tiled_copy(
+              GmemCopyAtomActScaleRaw{},
+              cute::Layout<cute::Shape<cute::Int<NumThreadsRaw>>>{},
+              cute::Layout<cute::Shape<cute::Int<VecsPerThread>>>{}
+          );
+          
+          if (thread_idx < NumThreadsRaw) {
+            auto thr_copy_raw = tiled_copy_act_scale_raw.get_slice(thread_idx);
+            auto tActS_gActS_Raw = thr_copy_raw.partition_S(gActS_Raw);
+            auto tActS_sActS_Raw = thr_copy_raw.partition_D(sActS_Raw);
+            
+            cute::copy(tiled_copy_act_scale_raw, tActS_gActS_Raw, tActS_sActS_Raw);
+          }
+        }
+        
+        // 统一的 fence - 包含原有 ActScale 和新增的 Raw ActScale
+        cute::cp_async_fence();
         
         if (cute::elect_one_sync()) {
           copy(mainloop_params.tma_load_scale.with(get<2>(input_tensormaps), *tma_barrier, mcast_mask_s), tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
@@ -1174,6 +1288,25 @@ public:
         // accum ((2, _2, _2), MMA_M, _1)
         auto tCrS = cute::get<1>(partitioned_extra_info);
         auto tCrActS = cute::get<3>(partitioned_extra_info);
+
+        // if (block0() && threadIdx.x == 128) {
+        //   // tCrActS_thr: ptr[64b] o (_2,_2,_1,_1):(_1,_2,_0,_0)
+        //   auto scale_coord0 = make_coord(0, 0, 0, 0);
+        //   auto scale_coord1 = make_coord(1, 0, 0, 0);
+        //   auto scale_coord2 = make_coord(0, 1, 0, 0);
+        //   auto scale_coord3 = make_coord(1, 1, 0, 0);
+
+        //   printf("fisrt k tile  chunk_id_ %d  block %d %d %d thread %d  tCrActS: %f %f %f %f\n",
+        //   chunk_id_,
+        //   blockIdx.x, blockIdx.y, blockIdx.z,
+        //   threadIdx.x,
+        //   float(tCrActS(scale_coord0)[chunk_id_]),
+        //   float(tCrActS(scale_coord1)[chunk_id_]),
+        //   float(tCrActS(scale_coord2)[chunk_id_]),
+        //   float(tCrActS(scale_coord3)[chunk_id_])
+        //   );
+        // }
+
         for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
           for (int m = 0; m < size<0, 1>(accum); m++) {
             auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
@@ -1270,6 +1403,26 @@ public:
             for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
               warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
+
+              // {
+              //   auto tCrActS = cute::get<3>(partitioned_extra_info);
+              //   if (block0() && threadIdx.x == 128) {
+              //     auto scale_coord0 = make_coord(0, 0, 0, 0);
+              //     auto scale_coord1 = make_coord(1, 0, 0, 0);
+              //     auto scale_coord2 = make_coord(0, 1, 0, 0);
+              //     auto scale_coord3 = make_coord(1, 1, 0, 0);
+        
+              //     printf("mainloop  chunk_id_ %d  thread %d  tCrActS: %f %f %f %f\n",
+              //     chunk_id_,
+              //     threadIdx.x,
+              //     scale_convertor(tCrActS(scale_coord0)[chunk_id_]),
+              //     scale_convertor(tCrActS(scale_coord1)[chunk_id_]),
+              //     scale_convertor(tCrActS(scale_coord2)[chunk_id_]),
+              //     scale_convertor(tCrActS(scale_coord3)[chunk_id_])
+              //     );
+              //   }
+              // }
+
               // Apply the group-wise scaling
               auto tCrActS = cute::get<3>(partitioned_extra_info);
               auto tCrS = cute::get<1>(partitioned_extra_info);
@@ -1342,6 +1495,26 @@ public:
 
           warpgroup_wait<0>();
           warpgroup_fence_operand(intermediate);
+
+          // {
+          //   int scale_idx = k_block / NumMMAsPerChunk;
+          //   auto tCrActS = cute::get<3>(partitioned_extra_info);
+          //   if (block0() && threadIdx.x == 128) {
+          //     auto scale_coord0 = make_coord(0, 0, 0, 0);
+          //     auto scale_coord1 = make_coord(1, 0, 0, 0);
+          //     auto scale_coord2 = make_coord(0, 1, 0, 0);
+          //     auto scale_coord3 = make_coord(1, 1, 0, 0);
+    
+          //     printf("last tile  chunk_id_ %d  thread %d  tCrActS: %f %f %f %f\n",
+          //     scale_idx,
+          //     threadIdx.x,
+          //     scale_convertor(tCrActS(scale_coord0)[scale_idx]),
+          //     scale_convertor(tCrActS(scale_coord1)[scale_idx]),
+          //     scale_convertor(tCrActS(scale_coord2)[scale_idx]),
+          //     scale_convertor(tCrActS(scale_coord3)[scale_idx])
+          //     );
+          //   }
+          // }
 
           // Apply the group-wise scaling
           auto tCrS = cute::get<1>(partitioned_extra_info);
