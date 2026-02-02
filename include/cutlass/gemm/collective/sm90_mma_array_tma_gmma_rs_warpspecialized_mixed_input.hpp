@@ -350,11 +350,11 @@ public:
         _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
 
     using TMA_Zero = decltype(make_tma_copy(
-          GmemTiledCopyScale{},
-          make_tensor(detail::get_logical_ptr(static_cast<NonVoidElementZero const*>(nullptr)), repeat_like(NonVoidStrideScale{}, int32_t(0)), NonVoidStrideScale{}),
-          SmemLayoutScale{}(_,_,cute::Int<0>{}),
-          ScaleTileShape{},
-          _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
+        GmemTiledCopyScale{},
+        make_tensor(detail::get_logical_ptr(static_cast<NonVoidElementZero const*>(nullptr)), repeat_like(NonVoidStrideScale{}, int32_t(0)), NonVoidStrideScale{}),
+        SmemLayoutScale{}(_,_,cute::Int<0>{}),
+        ScaleTileShape{},
+        _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
     
     TMA_A tma_load_a;
     TMA_B tma_load_b;
@@ -1070,10 +1070,10 @@ public:
         auto tCrS = cute::get<1>(partitioned_extra_info);
         for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
           for (int m = 0; m < size<0, 1>(accum); m++) {
+            auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
             for (int n = 0; n < size<0, 2>(accum); n++) {
               for (int e = 0; e < size<0, 0>(accum); e++) {
                 auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
 
                 if (chunk_id_ == 0) {
                   accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * scale_convertor(tCrS(scale_coord)[0]);
@@ -1156,10 +1156,10 @@ public:
               auto tCrS = cute::get<1>(partitioned_extra_info);
               for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
                 for (int m = 0; m < size<0, 1>(accum); m++) {
+                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
                   for (int n = 0; n < size<0, 2>(accum); n++) {
                     for (int e = 0; e < size<0, 0>(accum); e++) {
                       auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                      auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
 
                       accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
                     }
@@ -1227,10 +1227,10 @@ public:
           auto tCrS = cute::get<1>(partitioned_extra_info);
           for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
             for (int m = 0; m < size<0, 1>(accum); m++) {
+              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
               for (int n = 0; n < size<0, 2>(accum); n++) {
                 for (int e = 0; e < size<0, 0>(accum); e++) {
                   auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
                   int scale_idx = k_block / NumMMAsPerChunk;
 
                   accum(accum_coord) = fma(intermediate(accum_coord), scale_convertor(tCrS(scale_coord)[scale_idx]), accum(accum_coord));

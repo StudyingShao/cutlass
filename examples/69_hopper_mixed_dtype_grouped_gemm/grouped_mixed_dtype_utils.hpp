@@ -45,6 +45,10 @@ public:
 
     bool explore = false;
     bool compare = true;
+    bool enable_print = false;
+    bool enable_print_weight = false;
+    bool debug_input_act = false;
+    bool debug_input_weight = false;
     int groups = 6;
     int c = 512;
     std::string benchmark_path;
@@ -189,12 +193,13 @@ void grouped_mixed_dtype_profiling(
     result.gflops = options.gflops(result.avg_runtime_ms / 1000.0);
 
     if (!options.explore) {
-        std::cout << "  Problem Sizes, Alpha, Beta\n";
-        for (int32_t i = 0; i < options.groups; ++i) {
-            std::cout << "    " << options.problem_sizes_host[i] << ", " << alpha_host[i] << ", " << beta_host[i] << '\n';
-        }
-        std::cout << "  Groups      : " << options.groups << '\n'
-                  << "  Avg runtime : " << result.avg_runtime_ms * 1000.0 << " us\n"
+        std::cout << "  Problem Sizes G x (M, N, K), Alpha, Beta\n";
+        // for (int32_t i = 0; i < options.groups; ++i) {
+        //     std::cout << "    " << options.problem_sizes_host[i] << ", " << alpha_host[i] << ", " << beta_host[i] << '\n';
+        // }
+
+        std::cout << "    " << options.groups << " x " << options.problem_sizes_host[0] << ", " << alpha_host[0] << ", " << beta_host[0] << '\n';
+        std::cout << "  Avg runtime : " << result.avg_runtime_ms * 1000.0 << " us\n"
                   << "  GFLOPS      : " << result.gflops << '\n';
     }
 }
