@@ -1043,8 +1043,6 @@ public:
           cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate_array[chunk_id]);
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
-          warpgroup_commit_batch();
-
           if (k_block == 0) {
             Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
           }
@@ -1056,32 +1054,57 @@ public:
             Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
           }
         }
+
+        warpgroup_commit_batch();
+
+        if (chunk_id > 0) {
+          warpgroup_wait<1>();
+
+          int chunk_id_ = chunk_id - 1;
+          warpgroup_fence_operand(intermediate_array[chunk_id_]);
+
+          // Apply the group-wise scaling
+          // tCrS  ((4, _2, _2), MMA_M, _1)
+          // accum ((2, _2, _2), MMA_M, _1)
+          auto tCrS = cute::get<1>(partitioned_extra_info);
+          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+            for (int m = 0; m < size<0, 1>(accum); m++) {
+              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+              for (int n = 0; n < size<0, 2>(accum); n++) {
+                for (int e = 0; e < size<0, 0>(accum); e++) {
+                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+
+                  if (chunk_id_ == 0) {
+                    accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * scale_convertor(tCrS(scale_coord)[0]);
+                  }
+                  else {
+                    accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
+                  }
+                }
+              }
+            }
+          }
+        }
+
       }
 
       warpgroup_wait<0>();
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
-        warpgroup_fence_operand(intermediate_array[chunk_id_]);
+      int chunk_id_ = NumChunksPerTileK - 1;
+      warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-        // Apply the group-wise scaling
-        // tCrS  ((4, _2, _2), MMA_M, _1)
-        // accum ((2, _2, _2), MMA_M, _1)
-        auto tCrS = cute::get<1>(partitioned_extra_info);
-        for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-          for (int m = 0; m < size<0, 1>(accum); m++) {
-            auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-            for (int n = 0; n < size<0, 2>(accum); n++) {
-              for (int e = 0; e < size<0, 0>(accum); e++) {
-                auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+      // Apply the group-wise scaling
+      // tCrS  ((4, _2, _2), MMA_M, _1)
+      // accum ((2, _2, _2), MMA_M, _1)
+      auto tCrS = cute::get<1>(partitioned_extra_info);
+      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+        for (int m = 0; m < size<0, 1>(accum); m++) {
+          auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+          for (int n = 0; n < size<0, 2>(accum); n++) {
+            for (int e = 0; e < size<0, 0>(accum); e++) {
+              auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
 
-                if (chunk_id_ == 0) {
-                  accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * scale_convertor(tCrS(scale_coord)[0]);
-                }
-                else {
-                  accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
-                }
-              }
+              accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
             }
           }
         }
@@ -1127,7 +1150,6 @@ public:
           // (V,M) x (V,N) => (V,M,N)
           cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate_array[chunk_id]);
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
-          warpgroup_commit_batch();
 
           if (k_block == K_BLOCK_MAX - 1) {
             pipeline.consumer_release(smem_pipe_release);             // UNLOCK smem_pipe_release, done _computing_ on it
@@ -1146,23 +1168,21 @@ public:
             Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, smem_pipe_read.index());
             Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, smem_pipe_read.index());
 
+            warpgroup_commit_batch();
             warpgroup_wait<0>();
 
-            CUTLASS_PRAGMA_UNROLL
-            for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
-              warpgroup_fence_operand(intermediate_array[chunk_id_]);
+            warpgroup_fence_operand(intermediate_array[chunk_id]);
 
-              // Apply the group-wise scaling
-              auto tCrS = cute::get<1>(partitioned_extra_info);
-              for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-                for (int m = 0; m < size<0, 1>(accum); m++) {
-                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-                  for (int n = 0; n < size<0, 2>(accum); n++) {
-                    for (int e = 0; e < size<0, 0>(accum); e++) {
-                      auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+            // Apply the group-wise scaling
+            auto tCrS = cute::get<1>(partitioned_extra_info);
+            for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+              for (int m = 0; m < size<0, 1>(accum); m++) {
+                auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                for (int n = 0; n < size<0, 2>(accum); n++) {
+                  for (int e = 0; e < size<0, 0>(accum); e++) {
+                    auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
 
-                      accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
-                    }
+                    accum(accum_coord) = fma(intermediate_array[chunk_id](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id]), accum(accum_coord));
                   }
                 }
               }
@@ -1177,6 +1197,31 @@ public:
             Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
           }
         }
+
+        warpgroup_commit_batch();
+
+        if (chunk_id > 0) {
+          warpgroup_wait<1>();
+
+          int chunk_id_ = chunk_id - 1;          
+          warpgroup_fence_operand(intermediate_array[chunk_id_]);
+
+          // Apply the group-wise scaling
+          auto tCrS = cute::get<1>(partitioned_extra_info);
+          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+            for (int m = 0; m < size<0, 1>(accum); m++) {
+              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+              for (int n = 0; n < size<0, 2>(accum); n++) {
+                for (int e = 0; e < size<0, 0>(accum); e++) {
+                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+
+                  accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
+                }
+              }
+            }
+          }
+        }
+
       }
     }
 
@@ -1198,7 +1243,6 @@ public:
         // (V,M) x (V,N) => (V,M,N)
         cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate);
         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
-        warpgroup_commit_batch();
 
         if (k_block == 0) {
           Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
@@ -1220,6 +1264,7 @@ public:
         if ((k_block + 1) % NumMMAsPerChunk == 0) {
           tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
+          warpgroup_commit_batch();
           warpgroup_wait<0>();
           warpgroup_fence_operand(intermediate);
 
