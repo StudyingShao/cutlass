@@ -68,6 +68,7 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler_params.h"
 
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
@@ -197,6 +198,7 @@ using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativ
 using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative; // Epilogue to launch
 // using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
 // using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong; // Epilogue to launch
+using RasterOrderOptions = typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupParams<Shape<int,int,int>>::RasterOrderOptions;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
@@ -330,6 +332,9 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
 
   bool shuffle = true;
 
+  // Scheduler configuration options
+  int swizzle = 2;  // max_swizzle_size: 1, 2, 4, or 8
+
   // Parses the command line
   void parse(int argc, char const **args) {
     cutlass::CommandLine cmd(argc, args);
@@ -340,6 +345,7 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
     cmd.get_cmd_line_argument("enable_print_weight", enable_print_weight);
     cmd.get_cmd_line_argument("debug_input_act", debug_input_act);
     cmd.get_cmd_line_argument("debug_input_weight", debug_input_weight);
+    cmd.get_cmd_line_argument("swizzle", swizzle);
 
     this->Base::parse(argc, args);
 
@@ -364,6 +370,7 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
       << "  --iterations=<int>          Number of profiling iterations to perform\n\n"
       << "  --warmup=<int>              Number of warmup iterations to perform\n\n"
       << "  --shuffle=<boolean>         Enable the offline layout swizzling.\n\n"
+      << "  --swizzle=<int>             Tile scheduler swizzle size (1, 2, 4, or 8). Default: 1\n"
       << "  --benchmark=<str>           Executes a benchmark problem size.\n";
 
     out
@@ -731,6 +738,11 @@ typename Gemm::Arguments args_from_options(Options const& options, bool host_pro
     {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
     hw_info
   };
+  
+  // Configure tile scheduler for swizzle and raster order
+  arguments.scheduler.max_swizzle_size = options.swizzle;
+  arguments.scheduler.raster_order = RasterOrderOptions::Heuristic;  // AlongM, AlongN, or Heuristic;
+  
   return arguments;
 }
 
