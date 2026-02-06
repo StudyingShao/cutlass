@@ -113,28 +113,25 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M
 //--------------------------------------------------------------------------------------------
 
 // MXFP4 x BF16
-// using MmaType = cutlass::bfloat16_t;     // activations
-// using QuantType = cutlass::float_e2m1_t; // weights
-// #define GROUP_SIZE 32
-// using ElementScale = cutlass::float_ue8m0_t;
-// constexpr int TileShapeM = 128;
-// constexpr int TileShapeN = 16;
-// constexpr int TileShapeK = 128;
+using MmaType = cutlass::bfloat16_t;     // activations
+using QuantType = cutlass::float_e2m1_t; // weights
+#define GROUP_SIZE 32
+using ElementScale = cutlass::float_ue8m0_t;
+constexpr int TileShapeM = 128;
+constexpr int TileShapeN = 16;
+constexpr int TileShapeK = 128; // 128 only
 
 //--------------------------------------------------------------------------------------------
 
-// INT4 x FP8
-using MmaType = cutlass::float_e4m3_t;      // activations
-using QuantType = cutlass::int4b_t;         // weights
-#define GROUP_SIZE 128
-using ElementScale = cutlass::bfloat16_t;
-// constexpr int TileShapeK = 512;
-// constexpr int TileShapeK = 256;
-// constexpr int TileShapeK = 128;
+// // INT4 x FP8
+// using MmaType = cutlass::float_e4m3_t;      // activations
+// using QuantType = cutlass::int4b_t;         // weights
+// #define GROUP_SIZE 128
+// using ElementScale = cutlass::bfloat16_t;
 
-constexpr int  TileShapeM = 128;
-constexpr int  TileShapeN = 16;
-constexpr int  TileShapeK = 8192 / TileShapeN;
+// constexpr int  TileShapeM = 128;
+// constexpr int  TileShapeN = 16;
+// constexpr int  TileShapeK = 8192 / TileShapeN;
 
 //--------------------------------------------------------------------------------------------
 

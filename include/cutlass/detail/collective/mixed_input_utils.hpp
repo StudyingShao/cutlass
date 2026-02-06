@@ -548,6 +548,11 @@ prmt(unsigned hi, unsigned lo, unsigned select_code)
   return res;
 }
 
+
+__constant__ static __nv_fp8x4_storage_t HIGH_E4M3s_LUT_[2] = {0x03020100U, 0x03020100U};
+__constant__ static __nv_fp8x4_storage_t LOW_E4M3s_LUT_[2] = {0xFFFEFC00U, 0xFFFEFC00U};
+
+
 __device__ __inline__
 __nv_fp8x4_storage_t
 cvt_lut_fp4_to_bf16
@@ -555,8 +560,10 @@ cvt_lut_fp4_to_bf16
   const unsigned index
 )
 {
-  const __nv_fp8x4_storage_t h4b_lut = 0x03020100U; //7654
-  const __nv_fp8x4_storage_t l4b_lut = 0xFFFEFC00U; //3210
+
+  auto lane_id = threadIdx.x & 0x1;
+  __nv_fp8x4_storage_t h4b_lut = HIGH_E4M3s_LUT_[lane_id];
+  __nv_fp8x4_storage_t l4b_lut = LOW_E4M3s_LUT_[lane_id];
 
   __nv_fp8x4_storage_t lut_res = prmt(h4b_lut, l4b_lut, index);
 
