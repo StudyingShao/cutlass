@@ -167,7 +167,6 @@ public:
   using ElementAccumulator = typename TiledMma::ValTypeC;
   using GmemTiledCopyA = GmemTiledCopyA_;
   using GmemTiledCopyB = GmemTiledCopyB_;
-  using GmemTiledCopyScale = cute::SM90_TMA_LOAD;
   using SmemLayoutAtomA = SmemLayoutAtomA_;
   using SmemLayoutAtomB = SmemLayoutAtomB_;
   using SmemCopyAtomA = SmemCopyAtomA_;
@@ -203,7 +202,8 @@ public:
 
   static constexpr int IsSubbyteA = cute::sizeof_bits_v<SwappedElementA> < 8;
   using TmaElementA = cute::conditional_t<IsSubbyteA, uint8_t, SwappedElementA>;
-  using TmaElementScale = uint_bit_t<sizeof_bits_v<NonVoidElementScale> >; // in case we have array. translating to uint to satisfy tma descriptor's specialization
+  // TmaElementScale removed: scale no longer uses TMA
+  // Scale loaded via SM90_BULK_COPY_G2S (lightweight, no TMA descriptor needed)
 
   using MainloopPipeline = cutlass::PipelineTmaAsync<DispatchPolicy::Stages>;
   using PipelineState = cutlass::PipelineState<DispatchPolicy::Stages>;
@@ -296,8 +296,6 @@ public:
     struct TensorMapStorage {
       cute::TmaDescriptor smem_tensormap_A;
       cute::TmaDescriptor smem_tensormap_B;
-      cute::TmaDescriptor smem_tensormap_scale;
-      cute::TmaDescriptor smem_tensormap_zero;
     };
 
     using PipelineStorage = typename MainloopPipeline::SharedStorage;
@@ -342,25 +340,9 @@ public:
         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
         size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
 
-    using TMA_Scale = decltype(make_tma_copy<TmaElementScale>(
-        GmemTiledCopyScale{},
-        make_tensor(detail::get_logical_ptr(static_cast<NonVoidElementScale const*>(nullptr)), repeat_like(NonVoidStrideScale{}, int32_t(0)), NonVoidStrideScale{}),
-        SmemLayoutScale{}(_,_,cute::Int<0>{}),
-        ScaleTileShape{},
-        _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
-
-    using TMA_Zero = decltype(make_tma_copy(
-        GmemTiledCopyScale{},
-        make_tensor(detail::get_logical_ptr(static_cast<NonVoidElementZero const*>(nullptr)), repeat_like(NonVoidStrideScale{}, int32_t(0)), NonVoidStrideScale{}),
-        SmemLayoutScale{}(_,_,cute::Int<0>{}),
-        ScaleTileShape{},
-        _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
-    
     TMA_A tma_load_a;
     TMA_B tma_load_b;
     uint32_t tma_transaction_bytes = TmaTransactionBytes;
-    TMA_Scale tma_load_scale;
-    TMA_Zero tma_load_zero;
     void* tensormaps;
     SwappedElementA const** ptr_A;
     SwappedStrideA ptr_dA;
@@ -473,8 +455,6 @@ public:
         SmemLayoutB{}(_,_,cute::Int<0>{}),
         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
         size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
-    typename Params::TMA_Scale tma_load_scale{};
-    typename Params::TMA_Zero tma_load_zero{};
 
     void* tensormaps = workspace;
     auto args_setup = [&](auto ptr_A, auto ptr_B, int64_t scale_k = 0, int chunk_size = 0, int reload_factor = 1) -> Params {
@@ -482,8 +462,6 @@ public:
           tma_load_a,
           tma_load_b,
           TmaTransactionBytes,
-          tma_load_scale,
-          tma_load_zero,
           tensormaps,
           reinterpret_cast<SwappedElementA const**>(ptr_A),
           ptr_dA,
@@ -506,36 +484,8 @@ public:
     }
     else if constexpr (ModeHasScales) {
       auto fake_scale_k = 1;
-      ElementScale const* ptr_S = reinterpret_cast<ElementScale const*>(args.ptr_S);
-      StrideScale dS{};
-      Tensor tensor_scale = make_tensor(detail::get_logical_ptr(ptr_S), make_layout(make_shape(init_M, fake_scale_k, mock_L), dS));
-      tma_load_scale = make_tma_copy<TmaElementScale>(
-          GmemTiledCopyScale{},
-          tensor_scale,
-          SmemLayoutScale{}(_,_,cute::Int<0>{}),
-          ScaleTileShape{},
-          _1{}); // mcast along N mode for this M load, if any
-
-      if constexpr(KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return SwapAB ? args_setup(args.ptr_B, args.ptr_A, fake_scale_k, args.chunk_size, (args.chunk_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{}))
-                      : args_setup(args.ptr_A, args.ptr_B, fake_scale_k, args.chunk_size, (args.chunk_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{}));
-      }
-      else if constexpr(KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        ElementZero const* ptr_Z = reinterpret_cast<ElementZero const*>(args.ptr_Z);
-        Tensor tensor_zero = make_tensor(detail::get_logical_ptr(ptr_Z), make_layout(make_shape(init_M,fake_scale_k,mock_L), dS));
-        tma_load_zero = make_tma_copy(
-            GmemTiledCopyScale{},
-            tensor_zero,
-            SmemLayoutScale{}(_,_,cute::Int<0>{}),
-            ScaleTileShape{},
-            _1{}); // mcast along N mode for this M load, if any
-        return SwapAB ? args_setup(args.ptr_B, args.ptr_A, fake_scale_k, args.chunk_size, (args.chunk_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{}))
-                      : args_setup(args.ptr_A, args.ptr_B, fake_scale_k, args.chunk_size, (args.chunk_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{}));
-        
-      } 
-      else {
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in to_underlying_arguments.");
-      }
+      return SwapAB ? args_setup(args.ptr_B, args.ptr_A, fake_scale_k, args.chunk_size, (args.chunk_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{}))
+                    : args_setup(args.ptr_A, args.ptr_B, fake_scale_k, args.chunk_size, (args.chunk_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{}));
     } 
     else {
       static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in to_underlying_arguments.");
@@ -552,21 +502,8 @@ public:
         return num_input_tensors * SizeOfCuTensorMap * sm_count;
     };
 
-    if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-      // Allocate gmem space for input tensormaps per each SM, A tensormap copies followed by B tensormap copies
-      return calculate_workspace_size(2);
-    } 
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      // Allocate gmem space for input tensormaps per each SM, A tensormap copies followed by B tensormap copies, followed by scale tensormap copies
-      return calculate_workspace_size(3);
-    } 
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      // Allocate gmem space for input tensormaps per each SM, A tensormap copies followed by B tensormap copies, followed by scale and zeros tensormap copies
-      return calculate_workspace_size(4);
-    } 
-    else {
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in get_workspace_size.");
-    }
+    // Only A and B need TMA tensormaps; scale/zero use bulk copy (no descriptors)
+    return calculate_workspace_size(2);
   }
 
   template <class ProblemShape>
@@ -672,25 +609,16 @@ public:
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return cute::make_tuple(gA_mkl, gB_nkl);
     } 
-    else if constexpr (ModeHasScales) {
-      // The real scale_k that actually works
-      // auto scale_k = K / mainloop_params.chunk_size;
-      auto scale_k = K / ScalingGroupSize;
-
-      Tensor mS_mkl = mainloop_params.tma_load_scale.get_tma_tensor(make_shape(M,scale_k,L));      // (m,scale_k,l)
-      Tensor gS_mkl = local_tile(mS_mkl, ScaleTileShape{}, make_coord(_,_));       // (BLK_M,BLK_Scale_K,m,scale_k,l)
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(gA_mkl, gB_nkl, gS_mkl);
-      }
-      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        Tensor mZ_mkl = mainloop_params.tma_load_zero.get_tma_tensor(make_shape(M,scale_k,L));      // (m,scale_k,l)
-        Tensor gZ_mkl = local_tile(mZ_mkl, ScaleTileShape{}, make_coord(_,_));      // (BLK_M,BLK_Scale_K,m,scale_k,l)
-        return cute::make_tuple(gA_mkl, gB_nkl, gS_mkl, gZ_mkl);
-      }
-      else {
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load_init.");
-      }
-    } 
+    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+      // Scale ptr/stride placeholders — set correctly by tensors_perform_update before first load()
+      return cute::make_tuple(gA_mkl, gB_nkl,
+          static_cast<NonVoidElementScale const*>(nullptr), int64_t(0));
+    }
+    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+      return cute::make_tuple(gA_mkl, gB_nkl,
+          static_cast<NonVoidElementScale const*>(nullptr), int64_t(0),
+          static_cast<NonVoidElementZero const*>(nullptr));
+    }
     else {
       static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load_init.");
     }
@@ -719,19 +647,18 @@ public:
 
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       static_assert(sizeof... (Ts) == 2, "Direct convert needs two inputs");
-      static_assert(sizeof... (TMs) == 2, "Direct convert needs two tensormaps");
     } 
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      static_assert(sizeof... (Ts) == 3, "Scaled convert needs three inputs");
-      static_assert(sizeof... (TMs) == 3, "Scaled convert needs three tensormaps");
+      static_assert(sizeof... (Ts) == 4, "Scaled convert needs four inputs (gA, gB, scale_ptr, stride_k)");
     } 
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      static_assert(sizeof... (Ts) == 4, "Scaled and zero convert needs four inputs");
-      static_assert(sizeof... (TMs) == 4, "Scaled and zero convert needs four tensormaps");
+      static_assert(sizeof... (Ts) == 5, "Scaled+zero convert needs five inputs (gA, gB, scale_ptr, stride_k, zero_ptr)");
     } 
     else {
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in TMA load.");
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load.");
     }
+    // Only A and B use TMA descriptors
+    static_assert(sizeof... (TMs) == 2, "Only A and B tensormaps needed");
 
     Tensor sA_ = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});          // (BLK_M,BLK_K,PIPE)
     Tensor sB_ = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});          // (BLK_N,BLK_K,PIPE)
@@ -765,7 +692,6 @@ public:
 
     uint16_t mcast_mask_a = 0;
     uint16_t mcast_mask_b = 0;
-    uint16_t mcast_mask_s = 0;
 
     // Issue TmaLoads
     // Maps the tile -> block, value
@@ -783,7 +709,15 @@ public:
       }
     }
 
-    auto extra_input_partitions = Utils::partition_extra_tma_inputs(mainloop_params, load_inputs, shared_tensors, cluster_local_block_id, m_coord, l_coord);
+    // Prepare SMEM tensors for scale/zero bulk copy (if needed)
+    [[maybe_unused]] Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});
+    [[maybe_unused]] Tensor sZ = [&]() {
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+        return make_tensor(make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});
+      } else {
+        return make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{}); // dummy
+      }
+    }();
 
     // Mainloop
     CUTLASS_PRAGMA_NO_UNROLL
@@ -801,43 +735,35 @@ public:
 
       int write_stage = smem_pipe_write.index();
       if (cute::elect_one_sync()) {
+        // TMA for A and B
         copy(mainloop_params.tma_load_a.with(get<0>(input_tensormaps), *tma_barrier, mcast_mask_a), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
         copy(mainloop_params.tma_load_b.with(get<1>(input_tensormaps), *tma_barrier, mcast_mask_b), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
-      }
-      if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-        // Nothing extra to do.
-      }
-      else if constexpr (ModeHasScales) {
-        // scale copy
-        auto tSgS = get<0>(extra_input_partitions);
-        auto tSsS = get<1>(extra_input_partitions);
 
-        // Temporary factor which will determine which k tile to reload from gmem. Needed so we don't modify tma transaction bytes
-        // on the fly.
-        // We must do a ceiling divide here to correctly handle with chunk_size == K. In that case, we don't require that K
-        // is a multiple of the threadblock tile K
-        const int scale_load_k = *k_tile_iter / 1;
-        // const int scale_load_k = *k_tile_iter / mainloop_params.reload_factor; // This will always be 0 when chunk_size == K.
-        if (cute::elect_one_sync()) {
-          copy(mainloop_params.tma_load_scale.with(get<2>(input_tensormaps), *tma_barrier, mcast_mask_s), tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
-        }
+        // Bulk copy for scale/zero (lightweight, no TMA descriptor)
+        if constexpr (ModeHasScales) {
+          auto scale_ptr = get<2>(load_inputs);
+          auto scale_stride_k = get<3>(load_inputs);
+          const int scale_load_k = *k_tile_iter / 1;
+          constexpr int BLK_M = size<0>(TileShape{});
+          constexpr int scale_load_bytes = BLK_M * sizeof(NonVoidElementScale);
 
-        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-          // Nothing extra to do
-        } 
-        else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-          auto tZgZ = get<2>(extra_input_partitions);
-          auto tZsZ = get<3>(extra_input_partitions);
-          if (cute::elect_one_sync()) {
-            copy(mainloop_params.tma_load_zero.with(get<3>(input_tensormaps), *tma_barrier, mcast_mask_s), tZgZ(_,_,_,scale_load_k), tZsZ(_,_,_,write_stage));
+          auto* scale_gmem_addr = reinterpret_cast<void const*>(
+              scale_ptr + m_coord * BLK_M + scale_load_k * scale_stride_k);
+          auto* scale_smem_addr = static_cast<void*>(&sS(0, 0, write_stage));
+          cute::SM90_BULK_COPY_G2S::copy(scale_gmem_addr,
+              reinterpret_cast<uint64_t*>(tma_barrier), scale_smem_addr, scale_load_bytes);
+
+          if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+            auto zero_ptr = get<4>(load_inputs);
+            constexpr int zero_load_bytes = BLK_M * sizeof(NonVoidElementZero);
+
+            auto* zero_gmem_addr = reinterpret_cast<void const*>(
+                zero_ptr + m_coord * BLK_M + scale_load_k * scale_stride_k);
+            auto* zero_smem_addr = static_cast<void*>(&sZ(0, 0, write_stage));
+            cute::SM90_BULK_COPY_G2S::copy(zero_gmem_addr,
+                reinterpret_cast<uint64_t*>(tma_barrier), zero_smem_addr, zero_load_bytes);
           }
         }
-        else {
-          static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled for TMA copy op.");
-        } 
-      } 
-      else {
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled for TMA copy op.");
       }
       ++k_tile_iter;
 
@@ -1316,10 +1242,8 @@ public:
 
     cute::TmaDescriptor* tma_desc_a = &gmem_tensormap[sm_idx];
     cute::TmaDescriptor* tma_desc_b = &gmem_tensormap[sm_idx + sm_count];
-    cute::TmaDescriptor* tma_desc_scale = &gmem_tensormap[sm_idx + 2*sm_count];
-    cute::TmaDescriptor* tma_desc_zero = &gmem_tensormap[sm_idx + 3*sm_count];
 
-    // Bringing tensormaps from params to smem for modification later
+    // Only A and B use TMA descriptors; scale/zero use bulk copy
     Tensor pA_tensormap = make_tensor(mainloop_params.tma_load_a.get_tma_descriptor(), Int<1>{}, Int<1>{});
     Tensor sA_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_A), Int<1>{}, Int<1>{});
     Tensor pB_tensormap = make_tensor(mainloop_params.tma_load_b.get_tma_descriptor(), Int<1>{}, Int<1>{});
@@ -1329,39 +1253,10 @@ public:
       copy(recast<uint128_t>(pA_tensormap), recast<uint128_t>(sA_tensormap));
       copy(recast<uint128_t>(pB_tensormap), recast<uint128_t>(sB_tensormap));
     }
-    
-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      Tensor pS_tensormap = make_tensor(mainloop_params.tma_load_scale.get_tma_descriptor(), Int<1>{}, Int<1>{});
-      Tensor sS_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_scale), Int<1>{}, Int<1>{});
-      if (cute::elect_one_sync()) {
-        copy(recast<uint128_t>(pS_tensormap), recast<uint128_t>(sS_tensormap));
-      }
-    }
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      Tensor pZ_tensormap = make_tensor(mainloop_params.tma_load_zero.get_tma_descriptor(), Int<1>{}, Int<1>{});
-      Tensor sZ_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_zero), Int<1>{}, Int<1>{});
-      if (cute::elect_one_sync()) {
-        copy(recast<uint128_t>(pZ_tensormap), recast<uint128_t>(sZ_tensormap));
-      }
-    }
-    else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_init.");
-    }
 
     __syncwarp();
 
-    if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-      return cute::make_tuple(tma_desc_a, tma_desc_b);
-    }
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      return cute::make_tuple(tma_desc_a, tma_desc_b, tma_desc_scale);
-    }
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      return cute::make_tuple(tma_desc_a, tma_desc_b, tma_desc_scale, tma_desc_zero);
-    }
-    else {
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_init.");
-    }
+    return cute::make_tuple(tma_desc_a, tma_desc_b);
   }
 
   // Replace address for the global tensor (to be done by single thread)
@@ -1373,39 +1268,17 @@ public:
       Params const& mainloop_params,
       cute::tuple<TMs...> const& input_tensormaps,
       int32_t next_batch) {
-    // Replacing global_address for the next batch
+    // Only A and B use TMA descriptors; scale/zero addresses are passed via load_inputs
     cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_B,
                                                     mainloop_params.ptr_B[next_batch]);
 
     if (TensormapUpdateShapesStridesForAandScale) {
       cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
                                                       mainloop_params.ptr_A[next_batch]);
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_scale,
-                                                      mainloop_params.ptr_S[next_batch]);
-      }
-      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_zero,
-                                                      mainloop_params.ptr_Z[next_batch]);
-      }
-      else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_address.");
-      }
     }
     else {
       cute::tma_descriptor_replace_addr_in_global_mem(get<0>(input_tensormaps),
                                                       mainloop_params.ptr_A[next_batch]);
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        cute::tma_descriptor_replace_addr_in_global_mem(get<2>(input_tensormaps),
-                                                      mainloop_params.ptr_S[next_batch]);
-      }
-      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        cute::tma_descriptor_replace_addr_in_global_mem(get<3>(input_tensormaps),
-                                                      mainloop_params.ptr_Z[next_batch]);
-      }
-      else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_address.");
-      }
     }
 
   }
@@ -1429,11 +1302,6 @@ public:
     cute::array<uint64_t, MaxTensorRank> prob_stride_A = {0,0,0,0,0};
     cute::array<uint32_t, MaxTensorRank> prob_shape_B  = {1,1,1,1,1};
     cute::array<uint64_t, MaxTensorRank> prob_stride_B = {0,0,0,0,0};
-    cute::array<uint32_t, MaxTensorRank> prob_shape_scale  = {1,1,1,1,1};
-    cute::array<uint64_t, MaxTensorRank> prob_stride_scale = {0,0,0,0,0};
-    cute::array<uint32_t, MaxTensorRank> prob_shape_zero   = {1,1,1,1,1};
-    cute::array<uint64_t, MaxTensorRank> prob_stride_zero  = {0,0,0,0,0};
-
     SwappedElementB const* ptr_B = nullptr;
     Tensor tensor_b = make_tensor(ptr_B, detail::get_gmem_layout(make_shape(N,K,Int<1>{}), mainloop_params.ptr_dB[next_group]));
     cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b, 
@@ -1453,25 +1321,6 @@ public:
       Tensor tensor_a = make_tensor(ptr_A, detail::get_gmem_layout(make_shape(M,K,Int<1>{}), mainloop_params.ptr_dA[next_group]));
       cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a, 
                                               prob_shape_A, prob_stride_A);
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        NonVoidElementScale const* ptr_S = nullptr;
-        // auto scale_k = K / mainloop_params.chunk_size;
-        auto scale_k = K / ScalingGroupSize;
-        Tensor tensor_scale = make_tensor(detail::get_logical_ptr(ptr_S), make_shape(M,scale_k,Int<1>{}), mainloop_params.dS[next_group]);
-        cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_scale, tensor_scale, 
-                                              prob_shape_scale, prob_stride_scale);
-      }
-      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        ElementZero const* ptr_Z = nullptr;
-        // auto scale_k = K / mainloop_params.chunk_size;
-        auto scale_k = K / ScalingGroupSize;
-        Tensor tensor_zero = make_tensor(detail::get_logical_ptr(ptr_Z), make_shape(M,scale_k,Int<1>{}), mainloop_params.dS[next_group]);
-        cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_zero, tensor_zero, 
-                                                prob_shape_zero, prob_stride_zero);
-      }
-      else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_tensor_properties.");
-      }
 
       // Convert strides to byte strides
       for (uint64_t& stride : prob_stride_A) {
@@ -1480,25 +1329,6 @@ public:
       cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_A,
                                                               prob_shape_A,
                                                               prob_stride_A);
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        for (uint64_t& stride : prob_stride_scale) {
-          stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
-        }
-        cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_scale,
-                                                              prob_shape_scale,
-                                                              prob_stride_scale);
-      }
-      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        for (uint64_t& stride : prob_stride_zero) {
-          stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
-        }
-        cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_zero,
-                                                              prob_shape_zero,
-                                                              prob_stride_zero);
-      }
-      else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_replace_global_tensor_properties.");
-      } 
     }
   }
 
@@ -1545,15 +1375,6 @@ public:
       TensormapUpdateShapesStridesForAandScale = false;
 
       tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        tma_descriptor_cp_fence_release(get<2>(input_tensormaps), shared_tensormaps.smem_tensormap_scale);
-      }
-      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        tma_descriptor_cp_fence_release(get<3>(input_tensormaps), shared_tensormaps.smem_tensormap_zero);
-      }
-      else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_cp_fence_release.");
-      }
     }
     else {
       tma_descriptor_fence_release();
@@ -1567,15 +1388,6 @@ public:
   tensormaps_fence_acquire(cute::tuple<TMs...> const& input_tensormaps) {
     cute::tma_descriptor_fence_acquire(get<0>(input_tensormaps));
     cute::tma_descriptor_fence_acquire(get<1>(input_tensormaps));
-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      cute::tma_descriptor_fence_acquire(get<2>(input_tensormaps));
-    }
-    else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      cute::tma_descriptor_fence_acquire(get<3>(input_tensormaps));
-    }
-    else if constexpr (KernelConversionMode != ConversionMode::DirectConvert){
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_fence_acquire.");
-    }
   }
 
   template <class InputTensors, class ProblemShape_MNKL>
@@ -1586,7 +1398,30 @@ public:
       [[maybe_unused]] Params const& mainloop_params,
       [[maybe_unused]] ProblemShape_MNKL problem_shape_mnkl,
       [[maybe_unused]] int32_t next_batch) {
-    return input_tensors;
+    if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
+      return input_tensors;
+    }
+    else if constexpr (ModeHasScales) {
+      auto new_scale_ptr = mainloop_params.ptr_S[next_batch];
+      int64_t new_stride_k;
+      if constexpr (IsGroupedGemmKernel) {
+        new_stride_k = get<1>(mainloop_params.dS[next_batch]);
+      } else {
+        new_stride_k = get<1>(mainloop_params.dS[0]);
+      }
+      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+        return cute::make_tuple(get<0>(input_tensors), get<1>(input_tensors),
+                                new_scale_ptr, new_stride_k);
+      }
+      else {
+        auto new_zero_ptr = mainloop_params.ptr_Z[next_batch];
+        return cute::make_tuple(get<0>(input_tensors), get<1>(input_tensors),
+                                new_scale_ptr, new_stride_k, new_zero_ptr);
+      }
+    }
+    else {
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensors_perform_update.");
+    }
   }
 
 };
