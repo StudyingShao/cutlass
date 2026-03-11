@@ -688,6 +688,103 @@ __global__ void interleave_fp4xbf16_Hopper_kernel_combine_opt(
 
 
 template<typename T>
+__global__ void interleave_fp4xbf16_Hopper_kernel_combine_triton(
+    T *ptr_4b, 
+    T *ptr_4b_interleaved, 
+    const int rows, 
+    const int cols
+) {
+    uint8_t *uint8_ptr = reinterpret_cast<uint8_t *>(ptr_4b);
+    uint8_t *uint8_interleaved_ptr = reinterpret_cast<uint8_t *>(ptr_4b_interleaved);
+
+    for (int block_id = blockIdx.x; block_id < rows / 2; block_id += gridDim.x)
+    {
+        for (int partition_id = threadIdx.y; partition_id < cols / 64; partition_id += blockDim.y)
+        {
+            int lane_id = threadIdx.x;
+            int row_id = block_id / 8 * 16 + block_id % 8;
+            
+            int mma_id = lane_id / 4;
+            int dst_row_id = row_id + (mma_id % 2) * 8;
+
+            int interleaved_lane_id = lane_id / 8 * 16 + (lane_id % 4) * 4;
+            
+            int col_id = partition_id * 32 + mma_id * 8 + lane_id % 4;
+            int dst_col_id = partition_id * 32 + interleaved_lane_id;
+
+            int first_fp4_id = row_id * cols / 2 + col_id;
+            int second_fp4_id = (row_id + 8) * cols / 2 + col_id;
+            int third_fp4_id = first_fp4_id + 4;
+            int fourth_fp4_id = second_fp4_id + 4;
+
+            uint8_t fp4x2[4];
+            fp4x2[0] = uint8_ptr[first_fp4_id];
+            fp4x2[1] = uint8_ptr[second_fp4_id];
+            fp4x2[2] = uint8_ptr[third_fp4_id];
+            fp4x2[3] = uint8_ptr[fourth_fp4_id];
+
+            uint32_t fp4x8_raw = *reinterpret_cast<uint32_t *>(fp4x2);
+            uint32_t fp4x8_interleaved = 0;
+            uint32_t mask;
+
+            // first fp4 in 16 bits
+            mask = 0b0000'0000'0000'0000'0000'0000'1000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) << 24;
+            mask = 0b0000'0000'0000'0000'0000'0000'0111'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) << 18;
+            mask = 0b0000'0000'0000'0000'0000'0000'0000'1000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) << 12;
+            mask = 0b0000'0000'0000'0000'0000'0000'0000'0111;
+            fp4x8_interleaved |= (fp4x8_raw & mask) << 6;
+
+            // second fp4 in 16 bits
+            mask = 0b0000'0000'0000'0000'1000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) << 13;
+            mask = 0b0000'0000'0000'0000'0111'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) << 7;
+            mask = 0b0000'0000'0000'0000'0000'1000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) << 1;
+            mask = 0b0000'0000'0000'0000'0000'0111'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) >> 5;
+
+            // third fp4 in 16 bits
+            mask = 0b0000'0000'1000'0000'0000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) << 2;
+            mask = 0b0000'0000'0111'0000'0000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) >> 4;
+            mask = 0b0000'0000'0000'1000'0000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) >> 10;
+            mask = 0b0000'0000'0000'0111'0000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) >> 16;
+            
+            // fourth fp4 in 16 bits
+            mask = 0b1000'0000'0000'0000'0000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) >> 1;
+            mask = 0b0001'0000'0000'0000'0000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) << 1;
+            mask = 0b0110'0000'0000'0000'0000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) >> 3;
+            mask = 0b0000'1000'0000'0000'0000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) >> 13;
+            mask = 0b0000'0001'0000'0000'0000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) >> 11;
+            mask = 0b0000'0110'0000'0000'0000'0000'0000'0000;
+            fp4x8_interleaved |= (fp4x8_raw & mask) >> 15;
+
+            uint8_t *fp4x2_interleaved = reinterpret_cast<uint8_t *>(&fp4x8_interleaved);
+
+            int dst_id = dst_row_id * cols / 2 + dst_col_id;
+
+            uint8_interleaved_ptr[dst_id] = fp4x2_interleaved[0];
+            uint8_interleaved_ptr[dst_id + 1] = fp4x2_interleaved[1];
+            uint8_interleaved_ptr[dst_id + 2] = fp4x2_interleaved[2];
+            uint8_interleaved_ptr[dst_id + 3] = fp4x2_interleaved[3];
+        }
+    }
+}
+
+
+template<typename T>
 __global__ void interleave_int4xfp8_Hopper_kernel(
     T *ptr_4b, 
     T *ptr_4b_interleaved, 
@@ -750,10 +847,14 @@ void interleave_fp4xbf16_Hopper(
     const int rows, 
     const int cols
 ) {
+    // // row-major input
+    // dim3 block(32, 32);
+    // // interleave_w4a16_Hopper_kernel_combine<<<1024, block>>>(fp4_ptr, fp4_interleaved_ptr, rows, cols);
+    // interleave_fp4xbf16_Hopper_kernel_combine_opt<<<1024, block>>>(fp4_ptr, fp4_interleaved_ptr, rows, cols);
+
     // row-major input
-    dim3 block(32, 32);
-    // interleave_w4a16_Hopper_kernel_combine<<<1024, block>>>(fp4_ptr, fp4_interleaved_ptr, rows, cols);
-    interleave_fp4xbf16_Hopper_kernel_combine_opt<<<1024, block>>>(fp4_ptr, fp4_interleaved_ptr, rows, cols);
+    dim3 block(16, 32);
+    interleave_fp4xbf16_Hopper_kernel_combine_triton<<<1024, block>>>(fp4_ptr, fp4_interleaved_ptr, rows, cols);
 }
 
 

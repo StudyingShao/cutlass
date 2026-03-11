@@ -534,6 +534,66 @@ typedef uint32_t            __nv_int4x8_storage_t;
 typedef uint64_t            __nv_fp8x8_storage_t;
 typedef cutlass::uint128_t  __nv_bf16x8_storage_t;
 
+
+// -----------------------------------------------------------------------
+// Interleaved version of the bits of four consecutive fp4 values (i.e. 16-bits):
+//     s000000eem000000         (1st fp4)
+//        s000000eem000000      (2nd fp4)
+//           s000000eem000000   (3rd fp4)
+//     0sm0ee0000000000         (4th fp4)
+// -----------------------------------------------------------------------
+
+__device__ __inline__
+__nv_bf16x8_storage_t
+psx_cvt_triton_fp4x8_to_bf16x8_interleaved
+(
+    const __nv_fp4x8_storage_t fp4x8
+)
+{
+  __nv_bf16x8_storage_t bf16x8_raw;
+  __nv_bfloat162 *bf16x2_raw = reinterpret_cast<__nv_bfloat162 *>(&bf16x8_raw);
+
+  // 0x7e807e80 -> BF16 [126, 126]
+  uint32_t bias_raw = 0x7e807e80U;
+  __nv_bfloat162 bias = reinterpret_cast<__nv_bfloat162&>(bias_raw);
+
+  __nv_fp4x8_storage_t first_fp4 = fp4x8 & 0x81C081C0U;
+  bf16x2_raw[0] = __hmul2(reinterpret_cast<__nv_bfloat162&>(first_fp4), bias);
+
+  __nv_fp4x8_storage_t second_fp4 = (fp4x8 << 3) & 0x81C081C0U;
+  bf16x2_raw[1] = __hmul2(reinterpret_cast<__nv_bfloat162&>(second_fp4), bias);
+
+  __nv_fp4x8_storage_t third_fp4 = (fp4x8 << 6) & 0x81C081C0U;
+  bf16x2_raw[2] = __hmul2(reinterpret_cast<__nv_bfloat162&>(third_fp4), bias);
+
+  __nv_fp4x8_storage_t fourth_fp4;
+  __nv_fp4x8_storage_t fourth_fp4_s = (fp4x8 << 1) & 0x80008000U;
+  __nv_fp4x8_storage_t fourth_fp4_e = fp4x8 >> 3;
+
+  static constexpr uint32_t immLut = (0xf0 & 0xcc) | 0xaa;
+  asm volatile(
+    "{\n"
+    "  lop3.b32 %0, %0, %1, %2, %3;\n"
+    "}\n"
+    : "+r"(fourth_fp4_e)
+    : "n"(0x01800180U), "r"(fourth_fp4_s), "n"(immLut));
+
+  __nv_fp4x8_storage_t fourth_fp4_m = fp4x8 >> 7;
+
+  asm volatile(
+    "{\n"
+    "  lop3.b32 %0, %1, %2, %3, %4;\n"
+    "}\n"
+    : "=r"(fourth_fp4)
+    : "r"(fourth_fp4_m), "n"(0x00400040U), "r"(fourth_fp4_e), "n"(immLut));
+
+  bf16x2_raw[3] = __hmul2(reinterpret_cast<__nv_bfloat162&>(fourth_fp4), bias);
+
+  return bf16x8_raw;
+}
+
+
+
 inline __device__ unsigned
 prmt(unsigned hi, unsigned lo, unsigned select_code)
 {
@@ -953,7 +1013,8 @@ public:
     auto&& src_ = cute::recast<__nv_fp4x8_storage_t>(src)(0);
     auto&& dst_ = cute::recast<__nv_bf16x8_storage_t>(dst)(0);
     
-    dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved(src_);
+    // dst_ = psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved(src_);
+    dst_ = psx_cvt_triton_fp4x8_to_bf16x8_interleaved(src_);
   }
 
 
