@@ -45,10 +45,6 @@ public:
 
     bool explore = false;
     bool compare = true;
-    bool enable_print = false;
-    bool enable_print_weight = false;
-    bool debug_input_act = false;
-    bool debug_input_weight = false;
     int groups = 6;
     int c = 512;
     std::string benchmark_path;

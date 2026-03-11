@@ -332,6 +332,15 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
   // Scheduler configuration options
   int swizzle = 2;  // max_swizzle_size: 1, 2, 4, or 8
 
+  // Print options
+  bool enable_print = false;
+  bool enable_print_weight = false;
+  
+  // Debug options
+  bool debug_input_act = false;
+  bool debug_input_weight = false;
+  bool debug_input_scale = false;
+
   // Parses the command line
   void parse(int argc, char const **args) {
     cutlass::CommandLine cmd(argc, args);
@@ -342,6 +351,7 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
     cmd.get_cmd_line_argument("enable_print_weight", enable_print_weight);
     cmd.get_cmd_line_argument("debug_input_act", debug_input_act);
     cmd.get_cmd_line_argument("debug_input_weight", debug_input_weight);
+    cmd.get_cmd_line_argument("debug_input_scale", debug_input_scale);
     cmd.get_cmd_line_argument("swizzle", swizzle);
 
     this->Base::parse(argc, args);
@@ -612,7 +622,7 @@ void initialize(Options& options) {
   
   // print("jiangs block_scale (size=%d)\n", int(block_scale.size())); // block_scale (size=16)
   if constexpr (cute::is_same_v<ElementScale, cutlass::float_ue8m0_t>) {
-    set_device_ue8m0<<<1, 1>>>(block_scale.get(), block_scale.size());
+    set_device_ue8m0<<<1, 1>>>(options.debug_input_scale, block_scale.get(), block_scale.size());
   }
   else {
     set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size(), 5678);
@@ -622,7 +632,7 @@ void initialize(Options& options) {
   cudaDeviceSynchronize();
   
   // cutlass::pack_scale_fp8(block_scale.get(), block_scale_packed.get(), block_scale.size());
-  cutlass::pack_scale_fp32(block_scale.get(), block_scale_packed.get(), block_scale.size(), ElementScalePacked::kElements);  
+  cutlass::pack_scale_fp32(options.debug_input_scale, block_scale.get(), block_scale_packed.get(), block_scale.size(), ElementScalePacked::kElements);  
   print_device_packed<<<1, 1>>>(options.enable_print, block_scale_packed.get(), block_scale.size(), 'P');
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 

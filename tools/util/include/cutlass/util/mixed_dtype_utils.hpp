@@ -340,7 +340,7 @@ static bool pack_scale_fp8(ElementScale const *block_in, cutlass::Array<ElementS
 }
 
 template <class ElementScale, class ElementScalePacked>
-static bool pack_scale_fp32(ElementScale const *block_in, ElementScalePacked *block_out, const size_t block_size, const size_t sub_k_tile_scale_num) {
+static bool pack_scale_fp32(bool debug_input_scale, ElementScale const *block_in, ElementScalePacked *block_out, const size_t block_size, const size_t sub_k_tile_scale_num) {
   std::vector<ElementScale> data_in(block_size);
   std::vector<ElementScalePacked> data_out(block_size);
 
@@ -355,8 +355,12 @@ static bool pack_scale_fp32(ElementScale const *block_in, ElementScalePacked *bl
   ////////////////////////////////////////////////////////////////////////////////////////
   for (size_t i = 0; i < block_size; i++) {
     for (size_t j = 0; j < sub_k_tile_scale_num; j++) {
-      data_out[i][j] = ElementScale(float(data_in[i]) * (j + 1));
-      // data_out[i][j] = ElementScale(float(data_in[i]));
+      if (!debug_input_scale) {
+        data_out[i][j] = ElementScale(float(data_in[i]) * (j + 1));
+      }
+      else {
+        data_out[i][j] = ElementScale(float(data_in[i]));
+      }
     }
   }
   ////////////////////////////////////////////////////////////////////////////////////////

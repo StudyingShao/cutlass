@@ -117,14 +117,14 @@ __global__ void set_device_sequential(T *ptr, int count, int seed, int value = 0
   }
 }
 
-__global__ void set_device_ue8m0(void *ptr_, int count, int default_val = 0) {
+__global__ void set_device_ue8m0(bool debug_input_scale, void *ptr_, int count, int default_val = 1) {
 
   cutlass::float_ue8m0_t *ptr = reinterpret_cast<cutlass::float_ue8m0_t *>(ptr_);
 
   if (thread0())
     for (int i = 0; i < count; i++)
     {
-      if (default_val == 0)
+      if (!debug_input_scale)
       {
         // 114 -> 0.000122
         // 130 -> 8.000000
@@ -166,20 +166,17 @@ if (debug_input_weight) {
     // // fp4:    1 2 3 4
     // // bits:   0010 0100 0101 0110
     // // 16-bit: 0x2456U
-    // for (int i = 0; i < count / 4; i++)
+    // curandState state;
+    // curand_init(0, 0, 0, &state);
+    
+    // for (int i = 0; i < 16 / 4; i++)
     // {
-    //   uint16_t value = 0x2456U;
+    //   uint16_t value = static_cast<uint16_t>(curand(&state));
     //   uint16_t *ptr = reinterpret_cast<uint16_t *>(ptr_);
     //   ptr[i] = value;
     // }
 
     // uint32_t *ptr = reinterpret_cast<uint32_t *>(ptr_);
-
-    // for (int i = 0; i < count / 8; i++)
-    // {
-    //   ptr[i] = 0xFFFFFFFFF;
-    // }
-  
     // // mma0
     // ptr[0] = 0x76543210U;   // 0-7
     // ptr[1] = 0xFEDCBA98U;   // 8-15
@@ -192,16 +189,12 @@ if (debug_input_weight) {
     // ptr[130] = 0xFEDCBA98U; // 1040-1047
     // ptr[131] = 0x76543210U; // 1048-1055
     
-    
     // // mma4
     // ptr[8] = 0x76543210U;   // 64-71
     // ptr[9] = 0xFEDCBA98U;
     // ptr[136] = 0xFEDCBA98U;
     // ptr[137] = 0x76543210U;
-      
-   
   }
-
 }
 }
 
