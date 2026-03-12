@@ -461,9 +461,15 @@ public:
       : detail::compute_stage_count_or_override<detail::sm90_smem_capacity_bytes,
           ElementAMma, ElementBMma, TileShape_MNK, StageCountType::bytes, SmemAlignment>(StageCountType{});
       
+  static constexpr bool IsMXFP4 = cute::is_same_v<RealElementA, cutlass::float_e2m1_t>;
+
+  using ArrayMixedInputPolicy = cute::conditional_t<IsMXFP4,
+      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<PipelineStages, ClusterShape_MNK, KernelScheduleType>,
+      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<PipelineStages, ClusterShape_MNK, KernelScheduleType>>;
+
   using DispatchPolicy = cute::conditional_t<IsMixedInput,
       cute::conditional_t<IsArrayOfPointersGemm,
-        MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<PipelineStages, ClusterShape_MNK, KernelScheduleType>, 
+        ArrayMixedInputPolicy, 
         MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput<PipelineStages, ClusterShape_MNK, KernelScheduleType>>, 
         MainloopSm90TmaGmmaRmemAWarpSpecialized<PipelineStages, ClusterShape_MNK, KernelScheduleType>>;
 

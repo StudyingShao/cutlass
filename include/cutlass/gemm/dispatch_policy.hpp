@@ -425,6 +425,24 @@ struct MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput {
     "KernelSchedule must be one of the Ptr-Array or Grouped Gemm TMA Warp Specialized Cooperative policies");
 };
 
+// Pre-scale variant: microscale is fused into the A operand conversion (FP4->BF16),
+// eliminating chunk-wise post-scaling and MMA pipeline drains.
+template<
+  int Stages_,
+  class ClusterShape_ = Shape<_1,_1,_1>,
+  class KernelSchedule = KernelPtrArrayTmaWarpSpecializedCooperative
+>
+struct MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale {
+  constexpr static int Stages = Stages_;
+  using ClusterShape = ClusterShape_;
+  using ArchTag = arch::Sm90;
+  using Schedule = KernelSchedule;
+  static_assert(
+    cute::is_same_v<Schedule, KernelPtrArrayTmaWarpSpecializedCooperative> ||
+    cute::is_same_v<Schedule, KernelPtrArrayTmaWarpSpecializedPingpong>,
+    "KernelSchedule must be one of the Ptr-Array or Grouped Gemm TMA Warp Specialized Cooperative policies");
+};
+
 // n-buffer in smem (Hopper TMA), pipelined with Hopper GMMA and TMA, Warp specialized dynamic schedule
 // For FP8 kernels with Block Scaling
 template<
