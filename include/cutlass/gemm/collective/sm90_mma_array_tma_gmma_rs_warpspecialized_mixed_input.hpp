@@ -804,6 +804,42 @@ public:
     }
   }
 
+  template <class AccumTensor, class IntermTensor, class ScaleTensor>
+  CUTLASS_DEVICE void
+  apply_groupwise_scale(
+      AccumTensor& accum,
+      IntermTensor const& intermediate,
+      ScaleTensor const& tCrS,
+      int scale_idx,
+      bool is_first_accum)
+  {
+    multiply_add<ElementAccumulator> fma_op;
+    
+    CUTLASS_PRAGMA_UNROLL
+    for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < size<0, 1>(accum); m++) {
+        
+        float scale_val = scale_convertor(tCrS(make_coord(make_tuple(0, m, 0), mma_m, 0))[scale_idx]);
+        
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < size<0, 2>(accum); n++) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int e = 0; e < size<0, 0>(accum); e++) {
+
+            auto coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+            
+            if (is_first_accum) {
+              accum(coord) = intermediate(coord) * scale_val;
+            } else {
+              accum(coord) = fma_op(intermediate(coord), scale_val, accum(coord));
+            }
+          }
+        }
+      }
+    }
+  }
+
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Consumer Perspective
   template <
@@ -925,8 +961,6 @@ public:
     // We release buffers to producer warps(dma load) with some mmas in flight
     PipelineState smem_pipe_release = smem_pipe_read;
 
-    multiply_add<ElementAccumulator> fma;
-
     constexpr int NumMMAsPerChunk = ScalingGroupSize / cute::get<0, 1>(tCsB.shape())();
     constexpr int NumChunksPerTileK = cute::size<1>(sA.shape())() / ScalingGroupSize;
     cute::array<decltype(make_fragment_like(accum)) , NumChunksPerTileK> intermediate_array;
@@ -989,27 +1023,8 @@ public:
           int chunk_id_ = chunk_id - 1;
           warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-          // Apply the group-wise scaling
-          // tCrS  ((4, _2, _2), MMA_M, _1)
-          // accum ((2, _2, _2), MMA_M, _1)
-          auto tCrS = cute::get<1>(partitioned_extra_info);
-          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-            for (int m = 0; m < size<0, 1>(accum); m++) {
-              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-              for (int n = 0; n < size<0, 2>(accum); n++) {
-                for (int e = 0; e < size<0, 0>(accum); e++) {
-                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-
-                  if (chunk_id_ == 0) {
-                    accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * scale_convertor(tCrS(scale_coord)[0]);
-                  }
-                  else {
-                    accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
-                  }
-                }
-              }
-            }
-          }
+          apply_groupwise_scale(accum, intermediate_array[chunk_id_],
+              cute::get<1>(partitioned_extra_info), chunk_id_, chunk_id_ == 0);
         }
 
       }
@@ -1019,22 +1034,8 @@ public:
       int chunk_id_ = NumChunksPerTileK - 1;
       warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-      // Apply the group-wise scaling
-      // tCrS  ((4, _2, _2), MMA_M, _1)
-      // accum ((2, _2, _2), MMA_M, _1)
-      auto tCrS = cute::get<1>(partitioned_extra_info);
-      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-        for (int m = 0; m < size<0, 1>(accum); m++) {
-          auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-          for (int n = 0; n < size<0, 2>(accum); n++) {
-            for (int e = 0; e < size<0, 0>(accum); e++) {
-              auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-
-              accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
-            }
-          }
-        }
-      }
+      apply_groupwise_scale(accum, intermediate_array[chunk_id_],
+          cute::get<1>(partitioned_extra_info), chunk_id_, false);
 
       --k_tile_count;
       if (k_tile_count > 0) {
@@ -1099,20 +1100,8 @@ public:
 
             warpgroup_fence_operand(intermediate_array[chunk_id]);
 
-            // Apply the group-wise scaling
-            auto tCrS = cute::get<1>(partitioned_extra_info);
-            for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-              for (int m = 0; m < size<0, 1>(accum); m++) {
-                auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-                for (int n = 0; n < size<0, 2>(accum); n++) {
-                  for (int e = 0; e < size<0, 0>(accum); e++) {
-                    auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-
-                    accum(accum_coord) = fma(intermediate_array[chunk_id](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id]), accum(accum_coord));
-                  }
-                }
-              }
-            }
+            apply_groupwise_scale(accum, intermediate_array[chunk_id],
+                cute::get<1>(partitioned_extra_info), chunk_id, false);
 
             Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
           }
@@ -1132,20 +1121,8 @@ public:
           int chunk_id_ = chunk_id - 1;          
           warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-          // Apply the group-wise scaling
-          auto tCrS = cute::get<1>(partitioned_extra_info);
-          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-            for (int m = 0; m < size<0, 1>(accum); m++) {
-              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-              for (int n = 0; n < size<0, 2>(accum); n++) {
-                for (int e = 0; e < size<0, 0>(accum); e++) {
-                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-
-                  accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), scale_convertor(tCrS(scale_coord)[chunk_id_]), accum(accum_coord));
-                }
-              }
-            }
-          }
+          apply_groupwise_scale(accum, intermediate_array[chunk_id_],
+              cute::get<1>(partitioned_extra_info), chunk_id_, false);
         }
 
       }
@@ -1194,21 +1171,8 @@ public:
           warpgroup_wait<0>();
           warpgroup_fence_operand(intermediate);
 
-          // Apply the group-wise scaling
-          auto tCrS = cute::get<1>(partitioned_extra_info);
-          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-            for (int m = 0; m < size<0, 1>(accum); m++) {
-              auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-              for (int n = 0; n < size<0, 2>(accum); n++) {
-                for (int e = 0; e < size<0, 0>(accum); e++) {
-                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                  int scale_idx = k_block / NumMMAsPerChunk;
-
-                  accum(accum_coord) = fma(intermediate(accum_coord), scale_convertor(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
-                }
-              }
-            }
-          }
+          apply_groupwise_scale(accum, intermediate,
+              cute::get<1>(partitioned_extra_info), k_block / NumMMAsPerChunk, false);
         }
       }
     }
