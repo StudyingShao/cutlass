@@ -58,6 +58,8 @@ private:
     int group_idx = 0;
     uint64_t start_linear_idx = 0;
     uint64_t total_tiles = 0;
+    // OPTIMIZATION: Pre-computed problem_blocks_m (fixed across all groups when N is constant)
+    uint64_t problem_blocks_m_fixed = 0;
   } current_group_info_;
 
 public:
@@ -241,6 +243,10 @@ public:
     }
     auto problem_blocks_m = round_up(ctas_along_m, (1 << params_.log_swizzle_size_) * params_.cluster_shape_.m());
     auto problem_blocks_n = round_up(ctas_along_n, (1 << params_.log_swizzle_size_) * params_.cluster_shape_.n());
+
+    // OPTIMIZATION: Store fixed problem_blocks_m for reuse (assumes N is constant across all groups)
+    current_group_info_.problem_blocks_m_fixed = problem_blocks_m;
+
     current_group_info_.total_tiles = problem_blocks_m * problem_blocks_n;
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");
@@ -298,27 +304,13 @@ public:
       RasterOrder raster_order) {
 
     bool valid_tile = true;
-    uint64_t ctas_along_m, ctas_along_n;
-    if (is_tuple<decltype(cute::shape<0>(problem_shapes[group_info.group_idx]))>::value ||
-        is_tuple<decltype(cute::shape<1>(problem_shapes[group_info.group_idx]))>::value) {
-      ctas_along_m = cute::size(cute::ceil_div(cute::shape<0>(problem_shapes[group_info.group_idx]), cta_shape.m()));
-      ctas_along_n = cute::size(cute::ceil_div(cute::shape<1>(problem_shapes[group_info.group_idx]), cta_shape.n()));
-    }
-    else {
-      ctas_along_m = divmod_cta_shape_m.divide(cute::shape<0>(problem_shapes[group_info.group_idx]) +  divmod_cta_shape_m.divisor - 1);
-      ctas_along_n = divmod_cta_shape_n.divide(cute::shape<1>(problem_shapes[group_info.group_idx]) +  divmod_cta_shape_n.divisor - 1);
-    }
-    auto problem_blocks_m = round_up(ctas_along_m, (1 << log_swizzle_size) * cluster_shape.m());
-    auto problem_blocks_n = round_up(ctas_along_n, (1 << log_swizzle_size) * cluster_shape.n());
-    group_info.total_tiles = problem_blocks_m * problem_blocks_n;
 
-    while (group_info.start_linear_idx + group_info.total_tiles <= linear_idx) {
-      group_info.group_idx++;
+    // OPTIMIZATION: Use cached problem_blocks_m if available (only compute variable ctas_along_n)
+    uint64_t ctas_along_n, problem_blocks_m, problem_blocks_n;
 
-      if (group_info.group_idx >= total_problem_groups)
-        return WorkTileInfo::invalid_work_tile();
-
-      group_info.start_linear_idx += group_info.total_tiles;
+    if (group_info.problem_blocks_m_fixed == 0) {
+      // First call: compute and cache problem_blocks_m
+      uint64_t ctas_along_m;
       if (is_tuple<decltype(cute::shape<0>(problem_shapes[group_info.group_idx]))>::value ||
           is_tuple<decltype(cute::shape<1>(problem_shapes[group_info.group_idx]))>::value) {
         ctas_along_m = cute::size(cute::ceil_div(cute::shape<0>(problem_shapes[group_info.group_idx]), cta_shape.m()));
@@ -329,6 +321,39 @@ public:
         ctas_along_n = divmod_cta_shape_n.divide(cute::shape<1>(problem_shapes[group_info.group_idx]) +  divmod_cta_shape_n.divisor - 1);
       }
       problem_blocks_m = round_up(ctas_along_m, (1 << log_swizzle_size) * cluster_shape.m());
+      group_info.problem_blocks_m_fixed = problem_blocks_m;  // Cache for reuse
+    }
+    else {
+      // Subsequent calls: reuse cached problem_blocks_m, only compute ctas_along_n
+      problem_blocks_m = group_info.problem_blocks_m_fixed;
+      if (is_tuple<decltype(cute::shape<1>(problem_shapes[group_info.group_idx]))>::value) {
+        ctas_along_n = cute::size(cute::ceil_div(cute::shape<1>(problem_shapes[group_info.group_idx]), cta_shape.n()));
+      }
+      else {
+        ctas_along_n = divmod_cta_shape_n.divide(cute::shape<1>(problem_shapes[group_info.group_idx]) +  divmod_cta_shape_n.divisor - 1);
+      }
+    }
+
+    problem_blocks_n = round_up(ctas_along_n, (1 << log_swizzle_size) * cluster_shape.n());
+    group_info.total_tiles = problem_blocks_m * problem_blocks_n;
+
+    while (group_info.start_linear_idx + group_info.total_tiles <= linear_idx) {
+      group_info.group_idx++;
+
+      if (group_info.group_idx >= total_problem_groups)
+        return WorkTileInfo::invalid_work_tile();
+
+      group_info.start_linear_idx += group_info.total_tiles;
+
+      // OPTIMIZATION: Reuse cached problem_blocks_m, only compute variable ctas_along_n
+      // Assumes N (shape<0>) is constant across all groups
+      problem_blocks_m = group_info.problem_blocks_m_fixed;
+      if (is_tuple<decltype(cute::shape<1>(problem_shapes[group_info.group_idx]))>::value) {
+        ctas_along_n = cute::size(cute::ceil_div(cute::shape<1>(problem_shapes[group_info.group_idx]), cta_shape.n()));
+      }
+      else {
+        ctas_along_n = divmod_cta_shape_n.divide(cute::shape<1>(problem_shapes[group_info.group_idx]) +  divmod_cta_shape_n.divisor - 1);
+      }
       problem_blocks_n = round_up(ctas_along_n, (1 << log_swizzle_size) * cluster_shape.n());
       group_info.total_tiles = problem_blocks_m * problem_blocks_n;
     }
