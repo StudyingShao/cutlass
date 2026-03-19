@@ -264,6 +264,7 @@ private:
   }  
 
   bool TensormapUpdateShapesStridesForAandScale = true;
+  int current_group_idx_ = 0;
 
 public:
   static constexpr ConversionMode KernelConversionMode = get_conversion_mode();
@@ -322,9 +323,27 @@ public:
 
   // Device side kernel params
   struct Params {
-    // Assumption: StrideA is congruent with Problem_MK
-    using LayoutA = decltype(detail::get_gmem_layout(repeat_like(InternalSwappedStrideA{}, int32_t(0)), InternalSwappedStrideA{}));
-    using LayoutB = decltype(detail::get_gmem_layout(repeat_like(InternalSwappedStrideB{}, int32_t(0)), InternalSwappedStrideB{}));
+    // For grouped GEMM with non-layout stride: replace static-zero L stride (_0) with
+    // a static non-zero value so the TMA descriptor includes the L dimension at creation.
+    // Int<32> is the minimum static value that after subbyte upcast<2> (FP4→uint8_t)
+    // produces Int<16> = 16 bytes, satisfying cuTensorMapEncodeTiled's 16-byte alignment.
+    // Being fully static, all CuTe coordinate computations remain compile-time optimizable.
+    using TmaStrideA = cute::conditional_t<
+        IsGroupedGemmKernel && !cute::is_layout<InternalSwappedStrideA>::value,
+        decltype(cute::make_stride(
+            cute::get<0>(InternalSwappedStrideA{}),
+            cute::get<1>(InternalSwappedStrideA{}),
+            cute::Int<32>{})),
+        InternalSwappedStrideA>;
+    using LayoutA = decltype(detail::get_gmem_layout(repeat_like(TmaStrideA{}, int32_t(0)), TmaStrideA{}));
+    using TmaStrideB = cute::conditional_t<
+        IsGroupedGemmKernel && !cute::is_layout<InternalSwappedStrideB>::value,
+        decltype(cute::make_stride(
+            cute::get<0>(InternalSwappedStrideB{}),
+            cute::get<1>(InternalSwappedStrideB{}),
+            cute::Int<16>{})),
+        InternalSwappedStrideB>;
+    using LayoutB = decltype(detail::get_gmem_layout(repeat_like(TmaStrideB{}, int32_t(0)), TmaStrideB{}));
 
     using TMA_A = decltype(make_tma_copy<TmaElementA>(
         GmemTiledCopyA{},
@@ -356,6 +375,7 @@ public:
     int reload_factor = (chunk_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{});
     InternalSwappedStrideA dA;
     InternalSwappedStrideB dB;
+    int num_groups;
   };
 
   //
@@ -440,8 +460,18 @@ public:
       ptr_dA = SwappedStrideA{};
       ptr_dB = SwappedStrideB{};
     }
-    Tensor tensor_a = make_tensor(ptr_A_first_batch, detail::get_gmem_layout(make_shape(init_M,init_K,mock_L), dA));
-    Tensor tensor_b = make_tensor(ptr_B_first_batch, detail::get_gmem_layout(make_shape(init_N,init_K,mock_L), dB));
+    // For grouped GEMM: use TmaStrideA (with static _1 L stride) so the TMA descriptor
+    // is created as 3D, enabling coordinate-based group selection.
+    typename Params::TmaStrideA tma_dA;
+    if constexpr (!IsGroupedGemmKernel || cute::is_layout<InternalSwappedStrideA>::value) {
+      tma_dA = dA;
+    }
+    Tensor tensor_a = make_tensor(ptr_A_first_batch, detail::get_gmem_layout(make_shape(init_M,init_K,mock_L), tma_dA));
+    typename Params::TmaStrideB tma_dB;
+    if constexpr (!IsGroupedGemmKernel || cute::is_layout<InternalSwappedStrideB>::value) {
+      tma_dB = dB;
+    }
+    Tensor tensor_b = make_tensor(ptr_B_first_batch, detail::get_gmem_layout(make_shape(init_N,init_K,mock_L), tma_dB));
 
     typename Params::TMA_A tma_load_a = make_tma_copy<TmaElementA>(
         GmemTiledCopyA{},
@@ -457,6 +487,10 @@ public:
         size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
 
     void* tensormaps = workspace;
+    int num_groups_val = 1;
+    if constexpr (IsGroupedGemmKernel) {
+      num_groups_val = problem_shapes.groups();
+    }
     auto args_setup = [&](auto ptr_A, auto ptr_B, int64_t scale_k = 0, int chunk_size = 0, int reload_factor = 1) -> Params {
       return {
           tma_load_a,
@@ -474,7 +508,8 @@ public:
           chunk_size,
           reload_factor,
           dA,
-          dB
+          dB,
+          num_groups_val
       };
     };
 
@@ -599,8 +634,11 @@ public:
 
     // TMA requires special handling of strides to deal with coord codomain mapping
     // Represent the full tensors -- get these from TMA
-    Tensor mA_mkl = mainloop_params.tma_load_a.get_tma_tensor(shape(detail::get_gmem_layout(make_shape(M,K,mock_L), mainloop_params.dA))); // (m,k,l)
-    Tensor mB_nkl = mainloop_params.tma_load_b.get_tma_tensor(shape(detail::get_gmem_layout(make_shape(N,K,mock_L), mainloop_params.dB))); // (n,k,l)
+    // For grouped GEMM: A uses L=num_groups so all groups are accessible via TMA L coordinate
+    auto A_L = IsGroupedGemmKernel ? mainloop_params.num_groups : mock_L;
+    auto B_L = IsGroupedGemmKernel ? mainloop_params.num_groups : mock_L;
+    Tensor mA_mkl = mainloop_params.tma_load_a.get_tma_tensor(shape(detail::get_gmem_layout(make_shape(M,K,A_L), mainloop_params.dA))); // (m,k,l)
+    Tensor mB_nkl = mainloop_params.tma_load_b.get_tma_tensor(shape(detail::get_gmem_layout(make_shape(N,K,B_L), mainloop_params.dB))); // (n,k,l)
 
     // Make tiled views, defer the slice
     Tensor gA_mkl = local_tile(mA_mkl, TileShape{}, make_coord(_,_,_), Step<_1, X,_1>{});  // (BLK_M,BLK_K,m,k,l)
@@ -680,8 +718,11 @@ public:
 
     // Partition the inputs based on the current block coordinates.
     auto [m_coord, n_coord, k_coord, l_coord] = blk_coord;
-    Tensor gA = gA_mkl(_,_,m_coord,_,l_coord);                                                     // (BLK_M,BLK_K,k)
-    Tensor gB = gB_nkl(_,_,n_coord,_,l_coord);                                                     // (BLK_N,BLK_K,k)
+    // For grouped GEMM: A selects group via L coordinate instead of descriptor update
+    auto a_l_coord = IsGroupedGemmKernel ? current_group_idx_ : l_coord;
+    auto b_l_coord = IsGroupedGemmKernel ? current_group_idx_ : l_coord;
+    Tensor gA = gA_mkl(_,_,m_coord,_,a_l_coord);                                                   // (BLK_M,BLK_K,k)
+    Tensor gB = gB_nkl(_,_,n_coord,_,b_l_coord);                                                   // (BLK_N,BLK_K,k)
 
     // Applies the mapping from block_tma_a
     Tensor tAgA = block_tma_a.partition_S(gA);                                                 // (TMA,TMA_M,TMA_K,k)
@@ -1233,16 +1274,27 @@ public:
       cute::tuple<TMs...> const& input_tensormaps,
       int32_t next_batch) {
     // Only A and B use TMA descriptors; scale/zero addresses are passed via load_inputs
-    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_B,
-                                                    mainloop_params.ptr_B[next_batch]);
-
-    if (TensormapUpdateShapesStridesForAandScale) {
-      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
-                                                      mainloop_params.ptr_A[next_batch]);
-    }
-    else {
-      cute::tma_descriptor_replace_addr_in_global_mem(get<0>(input_tensormaps),
-                                                      mainloop_params.ptr_A[next_batch]);
+    if constexpr (IsGroupedGemmKernel) {
+      // Grouped GEMM: set base addresses once; groups are accessed via TMA L coordinate
+      if (TensormapUpdateShapesStridesForAandScale) {
+        cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
+                                                        mainloop_params.ptr_A[0]);
+        cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_B,
+                                                        mainloop_params.ptr_B[0]);
+      }
+    } else {
+      // Ptr-Array: update B address per batch
+      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_B,
+                                                      mainloop_params.ptr_B[next_batch]);
+      // Ptr-Array: update A address per batch
+      if (TensormapUpdateShapesStridesForAandScale) {
+        cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
+                                                        mainloop_params.ptr_A[next_batch]);
+      }
+      else {
+        cute::tma_descriptor_replace_addr_in_global_mem(get<0>(input_tensormaps),
+                                                        mainloop_params.ptr_A[next_batch]);
+      }
     }
 
   }
@@ -1256,20 +1308,38 @@ public:
       Params const& mainloop_params,
       int32_t next_group,
       ProblemShape_MNKL problem_shape_mnkl) {
+    if (!TensormapUpdateShapesStridesForAandScale) return;
+
     const uint32_t M = get<0>(problem_shape_mnkl);
     const uint32_t N = get<1>(problem_shape_mnkl);
     const uint32_t K = get<2>(problem_shape_mnkl);
     
-    // Replace all dims for consistency
     constexpr int MaxTensorRank = 5;
     cute::array<uint32_t, MaxTensorRank> prob_shape_A  = {1,1,1,1,1};
     cute::array<uint64_t, MaxTensorRank> prob_stride_A = {0,0,0,0,0};
     cute::array<uint32_t, MaxTensorRank> prob_shape_B  = {1,1,1,1,1};
     cute::array<uint64_t, MaxTensorRank> prob_stride_B = {0,0,0,0,0};
+
+    // B: build 3D layout (N, K, num_groups) for coordinate-based group selection
     SwappedElementB const* ptr_B = nullptr;
-    Tensor tensor_b = make_tensor(ptr_B, detail::get_gmem_layout(make_shape(N,K,Int<1>{}), mainloop_params.ptr_dB[next_group]));
-    cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b, 
-                                            prob_shape_B, prob_stride_B);
+    if constexpr (!cute::is_layout<InternalSwappedStrideB>::value) {
+      auto dB_group = mainloop_params.ptr_dB[next_group];
+      auto stride_n = cute::get<0>(dB_group);
+      auto stride_k = cute::get<1>(dB_group);
+      int64_t term_n = static_cast<int64_t>(N) * static_cast<int64_t>(stride_n);
+      int64_t term_k = static_cast<int64_t>(K) * static_cast<int64_t>(stride_k);
+      int64_t stride_l = term_n > term_k ? term_n : term_k;
+      auto full_layout = make_layout(
+          make_shape(N, K, static_cast<uint32_t>(mainloop_params.num_groups)),
+          cute::make_stride(stride_n, stride_k, stride_l));
+      Tensor tensor_b = make_tensor(ptr_B, full_layout);
+      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b,
+                                              prob_shape_B, prob_stride_B);
+    } else {
+      Tensor tensor_b = make_tensor(ptr_B, detail::get_gmem_layout(make_shape(N,K,Int<1>{}), mainloop_params.ptr_dB[next_group]));
+      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b, 
+                                              prob_shape_B, prob_stride_B);
+    }
 
     for (uint64_t& stride : prob_stride_B) {
       stride = (stride * sizeof_bits_v<SwappedElementB>) / 8;
@@ -1279,21 +1349,33 @@ public:
                                                             prob_shape_B,
                                                             prob_stride_B);
 
-    if (TensormapUpdateShapesStridesForAandScale) {
-
-      SwappedElementA const* ptr_A = nullptr;
-      Tensor tensor_a = make_tensor(ptr_A, detail::get_gmem_layout(make_shape(M,K,Int<1>{}), mainloop_params.ptr_dA[next_group]));
-      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a, 
+    // A: build 3D layout (M, K, num_groups) for coordinate-based group selection
+    SwappedElementA const* ptr_A = nullptr;
+    if constexpr (!cute::is_layout<InternalSwappedStrideA>::value) {
+      auto dA_group = mainloop_params.ptr_dA[next_group];
+      auto stride_m = cute::get<0>(dA_group);
+      auto stride_k = cute::get<1>(dA_group);
+      int64_t term_m = static_cast<int64_t>(M) * static_cast<int64_t>(stride_m);
+      int64_t term_k = static_cast<int64_t>(K) * static_cast<int64_t>(stride_k);
+      int64_t stride_l = term_m > term_k ? term_m : term_k;
+      auto full_layout = make_layout(
+          make_shape(M, K, static_cast<uint32_t>(mainloop_params.num_groups)),
+          cute::make_stride(stride_m, stride_k, stride_l));
+      Tensor tensor_a = make_tensor(ptr_A, full_layout);
+      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a,
                                               prob_shape_A, prob_stride_A);
-
-      // Convert strides to byte strides
-      for (uint64_t& stride : prob_stride_A) {
-        stride = (stride * sizeof_bits_v<SwappedElementA>) / 8;
-      }
-      cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_A,
-                                                              prob_shape_A,
-                                                              prob_stride_A);
+    } else {
+      Tensor tensor_a = make_tensor(ptr_A, detail::get_gmem_layout(make_shape(M,K,Int<1>{}), mainloop_params.ptr_dA[next_group]));
+      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a,
+                                              prob_shape_A, prob_stride_A);
     }
+
+    for (uint64_t& stride : prob_stride_A) {
+      stride = (stride * sizeof_bits_v<SwappedElementA>) / 8;
+    }
+    cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_A,
+                                                            prob_shape_A,
+                                                            prob_stride_A);
   }
 
   template <class... TMs, class ProblemShape_MNKL>
@@ -1333,14 +1415,15 @@ public:
     }
 
     // Entire warp must do this (i.e. it's aligned)
-    tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);
-
     if (TensormapUpdateShapesStridesForAandScale) {
       TensormapUpdateShapesStridesForAandScale = false;
 
       tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
+      tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);
     }
-    else {
+    else if constexpr (!IsGroupedGemmKernel) {
+      // Ptr-Array: B address updated in shared mem, A address updated in gmem
+      tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);
       tma_descriptor_fence_release();
     }
   }
@@ -1362,6 +1445,9 @@ public:
       [[maybe_unused]] Params const& mainloop_params,
       [[maybe_unused]] ProblemShape_MNKL problem_shape_mnkl,
       [[maybe_unused]] int32_t next_batch) {
+    if constexpr (IsGroupedGemmKernel) {
+      current_group_idx_ = next_batch;
+    }
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return input_tensors;
     }
