@@ -1,0 +1,15 @@
+# Debugging Knowledge
+
+Methodologies, patterns, and common issues.
+
+## Topics to Document
+
+- SASS analysis methodology: how to read and interpret SASS
+- NCU profiling insights: key metrics and their meanings
+- Common errors and solutions: error patterns we've encountered
+- Correctness validation: strategies for validating kernel results
+- Memory debugging: compute-sanitizer usage patterns
+
+## Document Template
+
+See ../.claude/skills/knowledge-mgmt/SKILL.md for full template.

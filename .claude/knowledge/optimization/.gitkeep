@@ -1,0 +1,15 @@
+# Optimization Knowledge
+
+Techniques and patterns backed by empirical data.
+
+## Topics to Document
+
+- Tile shape tuning: benchmark data across configurations
+- Groupwise scaling optimization: overlap strategies
+- Memory layout patterns: swizzle modes, bank conflicts
+- Scheduler selection: Cooperative vs Pingpong trade-offs
+- Register pressure management
+
+## Document Template
+
+See ../.claude/skills/knowledge-mgmt/SKILL.md for full template.

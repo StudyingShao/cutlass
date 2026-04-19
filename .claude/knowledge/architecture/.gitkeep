@@ -1,0 +1,20 @@
+# Architecture Knowledge
+
+Deep understanding of hardware and software architecture.
+
+## Documented Topics
+
+- ✅ **TMA (Tensor Memory Accelerator)**: `tma-fundamentals.md` - Comprehensive guide to TMA hardware, descriptor structure, PTX instructions, CuTe abstraction, and usage patterns
+- ✅ **SwapAB Pattern**: `swapab-pattern.md` - Design pattern for mapping variable dimensions to WGMMA constraints in grouped GEMM
+
+## Topics to Document
+
+- WGMMA (Warpgroup Matrix Multiply-Accumulate): detailed tile shapes, data flow, instruction variants, accumulator management
+- CuTe Layout System: layout algebra fundamentals, tensor operations, partitioning strategies, basis vectors
+- Hopper Architecture Overview: SM90 features beyond TMA/WGMMA, compute capabilities, memory hierarchy
+- Cluster Programming Model: CTA clusters, distributed shared memory, synchronization primitives
+- Mixed-Precision Type Conversions: FP4→BF16, INT4→FP8, bit-manipulation techniques
+
+## Document Template
+
+See ../.claude/skills/knowledge-mgmt/SKILL.md for full template.

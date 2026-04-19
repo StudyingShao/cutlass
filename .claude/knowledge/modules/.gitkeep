@@ -1,0 +1,15 @@
+# Module Knowledge
+
+Deep understanding of code modules and their implementations.
+
+## Topics to Document
+
+- Mainloop collective: flow, key functions, customization points
+- Epilogue collective: scaling, accumulation, output strategies
+- TMA descriptor creation: setup, pitfalls, best practices
+- Copy atoms: TMA vs non-TMA copy operations
+- MMA atoms: WGMMA instruction wrappers
+
+## Document Template
+
+See ../.claude/skills/knowledge-mgmt/SKILL.md for full template.
