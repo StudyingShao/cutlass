@@ -235,7 +235,6 @@ __global__ void compare_device(bool compare_print, T *out, T *ref, int count, in
         printf("P99_error_count %d %.2f%%\n", P99_error_count, float(P99_error_count) / count * 100.0f);
         printf("P98_error_count %d %.2f%%\n", P98_error_count, float(P98_error_count) / count * 100.0f);
         printf("P95_error_count %d %.2f%%\n", P95_error_count, float(P95_error_count) / count * 100.0f);
-        printf("\n");
     }
 }
 

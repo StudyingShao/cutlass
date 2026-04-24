@@ -171,7 +171,15 @@ void grouped_mixed_dtype_profiling(
 
     for (int iter = 0; iter < options.warmup + options.iterations; ++iter) {
         cudaEventRecord(start);
-        CUTLASS_CHECK(gemm.run());
+        // Soft-fail: write status to `result` and return early instead of exit(),
+        // so the profiler explore loop can skip this config and continue.
+        result.status = gemm.run();
+        if (result.status != cutlass::Status::kSuccess) {
+            result.passed = false;
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            return;
+        }
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
 
@@ -185,6 +193,7 @@ void grouped_mixed_dtype_profiling(
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
+    if (runtimes.empty()) return;
     result.avg_runtime_ms = std::accumulate(runtimes.begin(), runtimes.end(), 0.0f) / runtimes.size();
     result.gflops = options.gflops(result.avg_runtime_ms / 1000.0);
 

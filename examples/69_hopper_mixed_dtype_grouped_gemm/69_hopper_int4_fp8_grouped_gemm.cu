@@ -31,8 +31,8 @@
 
 
 /*! \file
-    \brief 
-    Hopper Mixed-input Grouped GEMM example using CUTLASS 3 APIs for NVIDIA Hopper architecture. 
+    \brief
+    Hopper Mixed-input Grouped GEMM example using CUTLASS 3 APIs for NVIDIA Hopper architecture.
     See 55_hopper_int4_fp8_gemm.cu for more details about W4A8 GEMMs with lookup table.
 
     Limitations:
@@ -42,235 +42,37 @@
 
       $ ./examples/69_hopper_mixed_dtype_grouped_gemm/69_hopper_int4_fp8_grouped_gemm --m=2048 --n=2048 --k=2048 --mode=1 --groups=10
 
-      The above example command makes all 10 groups to be sized at the given m, n, k sizes.
-      Skipping any of the problem dimensions randomizes it across the different groups.
-      Same applies for alpha and beta values that are randomized across the different groups.
+    To enable the kernel config profiler (parallel compilation, ~8x faster build):
+      1) Uncomment `#define PROFILE` at the top of kernel_profiler_shared.hpp
+      2) make -j 69_hopper_int4_fp8_grouped_gemm
+      3) ./69_hopper_int4_fp8_grouped_gemm --explore=true ...
 */
 
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <vector>
-#include <string>
-#include <numeric>
-#include <typeinfo>
-#include <float.h>
-
-#include "cutlass/cutlass.h"
-
-#include "cute/tensor.hpp"
-#include "cutlass/tensor_ref.h"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/epilogue/thread/linear_combination.h"
-#include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/gemm/group_array_problem_shape.hpp"
-#include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/collective_builder.hpp"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
-#include "cutlass/gemm/kernel/gemm_universal.hpp"
-#include "cutlass/gemm/kernel/tile_scheduler_params.h"
-
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/distribution.h"
-#include "cutlass/util/host_tensor.h"
-#include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/tensor_view_io.h"
-#include "cutlass/util/reference/device/gemm.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
-#include "cutlass/util/reference/device/tensor_fill.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass/util/reference/host/tensor_copy.h"
-#include "cutlass/util/reference/host/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_norm.h"
-#include "cutlass/util/reference/host/gett.hpp"
-#include "cutlass/util/mixed_dtype_utils.hpp"
-
-#include "helper.h"
-#include "grouped_mixed_dtype_utils.hpp"
+#include "kernel_profiler_shared.hpp"
 #include "host_validation.hpp"
-
 #include "BF16_MXFP4_Test.h"
-
-// #define PROFILE
-
-using namespace cute;
-
-using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M,N,K> per group
-
-// constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
-//--------------------------------------------------------------------------------------------
-// constexpr int TileShapeK = 128;
-// using ElementScale = float;
-// using ElementScalePacked = cutlass::Array<ElementScale, 1>;
-//--------------------------------------------------------------------------------------------
-// constexpr int TileShapeK = 256;
-// using ElementScale = float;
-// using ElementScalePacked = cutlass::Array<ElementScale, 2>;
-//--------------------------------------------------------------------------------------------
-// constexpr int TileShapeK = 512;
-// using ElementScale = cutlass::bfloat16_t;
-// using ElementScalePacked = cutlass::Array<ElementScale, 4>;
-//--------------------------------------------------------------------------------------------
-
-// MXFP4 x BF16
-using MmaType = cutlass::bfloat16_t;     // activations
-using QuantType = cutlass::float_e2m1_t; // weights
-#define GROUP_SIZE 32
-using ElementScale = cutlass::float_ue8m0_t;
-constexpr int TileShapeM = 128;
-constexpr int TileShapeN = 16;
-constexpr int TileShapeK = 128; // 128 only
-
-//--------------------------------------------------------------------------------------------
-
-// // INT4 x FP8
-// using MmaType = cutlass::float_e4m3_t;      // activations
-// using QuantType = cutlass::int4b_t;         // weights
-// #define GROUP_SIZE 128
-// using ElementScale = cutlass::bfloat16_t;
-
-// constexpr int  TileShapeM = 128;
-// constexpr int  TileShapeN = 16;
-// constexpr int  TileShapeK = 8192 / TileShapeN;
-
-//--------------------------------------------------------------------------------------------
-
-
-// ElementScalePacked maximum 8xfp8 -> 64 bits
-using ElementScalePacked = cutlass::Array<ElementScale, TileShapeK / GROUP_SIZE>;
 
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-/// GEMM kernel configurations
+/// Global variable definitions (extern-declared in kernel_profiler_shared.hpp)
 /////////////////////////////////////////////////////////////////////////////////////////////////
-
-// A matrix configuration
-using         ElementA    = MmaType;
-using         LayoutA     = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
-constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;    // Alignment of A matrix in units of elements (up to 16 bytes)
-
-// B matrix configuration
-using         ElementB    = QuantType;                                      // Element type for B matrix operand
-using         LayoutB     = cutlass::layout::ColumnMajor;                   // Layout type for B matrix operand
-constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
-
-// This example manually swaps and transposes, so keep transpose of input layouts
-using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
-using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
-
-// Need to pass a pointer type to make the 3rd dimension of Stride be _0
-using StrideA = cute::remove_pointer_t<cutlass::detail::TagToStrideA_t<LayoutA*>>;
-using StrideB = cute::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutB*>>;
-
-// Define the CuTe layout for reoredered quantized tensor B
-// LayoutAtomQuant places values that will be read by the same thread in contiguous locations in global memory.
-// It specifies the reordering within a single warp's fragment
-using LayoutAtomQuant = decltype(cutlass::compute_memory_reordering_atom<MmaType>());
-using LayoutB_Reordered = decltype(cute::tile_to_shape(LayoutAtomQuant{}, Layout<Shape<int,int,Int<1>>, StrideB>{}));
-
-using ElementZero = cutlass::float_e4m3_t;
-using LayoutScale = cutlass::layout::RowMajor;
-
-// C/D matrix configuration
-// using         ElementC    = float;                                // Element type for C and D matrix operands
-using         ElementC    = cutlass::bfloat16_t;                                // Element type for C and D matrix operands
-using         LayoutC     = cutlass::layout::RowMajor;                      // Layout type for C and D matrix operands
-constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
-
-// D matrix configuration
-using         ElementD    = ElementC;
-using         LayoutD     = LayoutC;
-constexpr int AlignmentD  = 128 / cutlass::sizeof_bits<ElementD>::value;
-
-// Core kernel configurations
-using ElementAccumulator  = float;                                          // Element type for internal accumulation
-using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
-using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<cute::Int<TileShapeM>,cute::Int<TileShapeN>,cute::Int<TileShapeK>>;          // Threadblock-level tile size
-// using TileShape           = Shape<_64,_64,cute::Int<TileShapeK>>;          // Threadblock-level tile size
-using ClusterShape        = Shape<_2,_1,_1>;                                // Shape of the threadblocks in a cluster
-using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
-using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
-using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative; // Epilogue to launch
-// using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
-// using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong; // Epilogue to launch
-using RasterOrderOptions = typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupParams<Shape<int,int,int>>::RasterOrderOptions;
-
-using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    TileShape, ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type *, AlignmentC,
-    ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type *, AlignmentD,
-    EpilogueSchedule
-  >::CollectiveOp;
-
-// =========================================================== MIXED INPUT WITH SCALES ===========================================================================
-// The Scale information must get paired with the operand that will be scaled. In this example, B is scaled so we make a tuple of B's information and the scale information.
-using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    cute::tuple<ElementB, ElementScalePacked>, LayoutB_Transpose *, AlignmentB,
-    ElementA, LayoutA_Transpose *, AlignmentA,
-    ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    KernelSchedule
-  >::CollectiveOp;
-
-// TileScheduler=void -> Ptr-Array Cooperative and Grouped Gemm Cooperative kernel only supports the default scheduler.
-using GemmKernelScaleOnly = cutlass::gemm::kernel::GemmUniversal<
-    ProblemShape, 
-    CollectiveMainloopScaleOnly,
-    CollectiveEpilogue
->;
-
-// using CollectiveMainloopShuffled = typename cutlass::gemm::collective::CollectiveBuilder<
-//     ArchTag, OperatorClass,
-//     cute::tuple<ElementB, ElementScalePacked>, LayoutB_Reordered *, AlignmentB,
-//     ElementA, LayoutA_Transpose *, AlignmentA,
-//     ElementAccumulator,
-//     TileShape, ClusterShape,
-//     cutlass::gemm::collective::StageCountAutoCarveout<
-//       static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-//     KernelSchedule
-//   >::CollectiveOp;
-
-// using GemmKernelShuffled = cutlass::gemm::kernel::GemmUniversal<
-//     ProblemShape, 
-//     CollectiveMainloopShuffled,
-//     CollectiveEpilogue
-// >;
-
-using GemmScaleOnly = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleOnly>;
-// using GemmShuffled  = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelShuffled>;
-
-using StrideC = typename GemmKernelScaleOnly::InternalStrideC;
-using StrideD = typename GemmKernelScaleOnly::InternalStrideD;
-
-using StrideC_ref = cutlass::detail::TagToStrideC_t<LayoutC>;
-using StrideD_ref = cutlass::detail::TagToStrideC_t<LayoutD>;
-using StrideS = typename CollectiveMainloopScaleOnly::StrideScale;
-using StrideS_ref = cutlass::detail::TagToStrideB_t<LayoutScale>;
 
 // Host-side allocations
 std::vector<int64_t> offset_A;
 std::vector<int64_t> offset_B;
-std::vector<int64_t> offset_B_dq;
 std::vector<int64_t> offset_C;
 std::vector<int64_t> offset_D;
 std::vector<int64_t> offset_scale;
 std::vector<int64_t> offset_zero;
 
-std::vector<StrideA> stride_A_host;
-std::vector<StrideB> stride_B_host;
-std::vector<StrideC> stride_C_host;
-std::vector<StrideD> stride_D_host;
+std::vector<StrideA>     stride_A_host;
+std::vector<StrideB>     stride_B_host;
+std::vector<StrideC>     stride_C_host;
+std::vector<StrideD>     stride_D_host;
 std::vector<StrideC_ref> stride_C_host_ref;
 std::vector<StrideD_ref> stride_D_host_ref;
-std::vector<StrideS> stride_S_host;
+std::vector<StrideS>     stride_S_host;
 std::vector<StrideS_ref> stride_S_host_ref;
 
 std::vector<ElementAccumulator> alpha_host;
@@ -281,128 +83,44 @@ uint64_t seed = 2020;
 // Device-side allocations
 cutlass::DeviceAllocation<typename ProblemShape::UnderlyingProblemShape> problem_sizes;
 
-cutlass::DeviceAllocation<MmaType> block_A;
-cutlass::DeviceAllocation<QuantType> block_B;
-cutlass::DeviceAllocation<QuantType> block_B_interleaved;
-cutlass::DeviceAllocation<ElementB> block_B_modified;
-cutlass::DeviceAllocation<MmaType> block_B_dq;
-cutlass::DeviceAllocation<ElementScale> block_scale;
+cutlass::DeviceAllocation<MmaType>            block_A;
+cutlass::DeviceAllocation<QuantType>          block_B;
+cutlass::DeviceAllocation<QuantType>          block_B_interleaved;
+cutlass::DeviceAllocation<ElementScale>       block_scale;
 cutlass::DeviceAllocation<ElementScalePacked> block_scale_packed;
-cutlass::DeviceAllocation<ElementZero> block_zero;
-cutlass::DeviceAllocation<ElementC> block_C;
-cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutput> block_D;
-cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutput> block_ref_D;
+cutlass::DeviceAllocation<ElementZero>        block_zero;
+cutlass::DeviceAllocation<ElementC>           block_C;
+cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput> block_D;
+cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput> block_ref_D;
 
-cutlass::DeviceAllocation<const MmaType *> ptr_A;
-cutlass::DeviceAllocation<const QuantType *> ptr_B;
-cutlass::DeviceAllocation<const MmaType *> ptr_B_dq;
+cutlass::DeviceAllocation<const MmaType *>            ptr_A;
+cutlass::DeviceAllocation<const QuantType *>          ptr_B;
 cutlass::DeviceAllocation<const ElementScalePacked *> ptr_scale_packed;
-cutlass::DeviceAllocation<const ElementZero *> ptr_zero;
-cutlass::DeviceAllocation<const ElementC *> ptr_C;
-cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutput *> ptr_D;
+cutlass::DeviceAllocation<const ElementZero *>        ptr_zero;
+cutlass::DeviceAllocation<const ElementC *>           ptr_C;
+cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput *> ptr_D;
 
-cutlass::DeviceAllocation<StrideA> stride_A;
-cutlass::DeviceAllocation<StrideB> stride_B;
-cutlass::DeviceAllocation<LayoutB_Reordered> layout_B_reordered;
-cutlass::DeviceAllocation<StrideC> stride_C;
-cutlass::DeviceAllocation<StrideD> stride_D;
+cutlass::DeviceAllocation<StrideA>     stride_A;
+cutlass::DeviceAllocation<StrideB>     stride_B;
+cutlass::DeviceAllocation<StrideC>     stride_C;
+cutlass::DeviceAllocation<StrideD>     stride_D;
 cutlass::DeviceAllocation<StrideC_ref> stride_C_ref;
 cutlass::DeviceAllocation<StrideD_ref> stride_D_ref;
 cutlass::DeviceAllocation<StrideS_ref> stride_S_ref;
-cutlass::DeviceAllocation<StrideS> stride_S;
+cutlass::DeviceAllocation<StrideS>     stride_S;
 
-// Note, this is an array of pointers to alpha and beta scaling values per group
 cutlass::DeviceAllocation<ElementAccumulator*> alpha_device;
 cutlass::DeviceAllocation<ElementAccumulator*> beta_device;
-cutlass::DeviceAllocation<ElementAccumulator> block_alpha;
-cutlass::DeviceAllocation<ElementAccumulator> block_beta;
-
-#endif // defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+cutlass::DeviceAllocation<ElementAccumulator>  block_alpha;
+cutlass::DeviceAllocation<ElementAccumulator>  block_beta;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-/// Testbed utility types
+/// Testbed functions
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Command line options parsing
-struct Options : GroupedMixedDtypeOptions<QuantType> {
-  using Base = GroupedMixedDtypeOptions<QuantType>;
-
-  bool shuffle = true;
-
-  // Scheduler configuration options
-  int swizzle = 2;  // max_swizzle_size: 1, 2, 4, or 8
-
-  // Print options
-  bool enable_print = false;
-  bool enable_print_weight = false;
-  
-  // Debug options
-  bool debug_input_act = false;
-  bool debug_input_weight = false;
-  bool debug_input_scale = false;
-
-  // Parses the command line
-  void parse(int argc, char const **args) {
-    cutlass::CommandLine cmd(argc, args);
-    cmd.get_cmd_line_argument("shuffle", shuffle);
-    cmd.get_cmd_line_argument("explore", explore);
-    cmd.get_cmd_line_argument("compare", compare);
-    cmd.get_cmd_line_argument("enable_print", enable_print);
-    cmd.get_cmd_line_argument("enable_print_weight", enable_print_weight);
-    cmd.get_cmd_line_argument("debug_input_act", debug_input_act);
-    cmd.get_cmd_line_argument("debug_input_weight", debug_input_weight);
-    cmd.get_cmd_line_argument("debug_input_scale", debug_input_scale);
-    cmd.get_cmd_line_argument("swizzle", swizzle);
-
-    this->Base::parse(argc, args);
-
-    // Only have implementation of mode 1 (scale only)
-    mode = 1; // override the mode value to always be scale only mode
-  }
-
-  /// Prints the usage statement.
-  std::ostream & print_usage(std::ostream &out) const {
-
-    out << "69_hopper_int4_fp8_grouped_gemm\n\n"
-      << "  Hopper Mixed Dtype Grouped GEMM using a Warp Specialized kernel.\n\n"
-      << "Options:\n\n"
-      << "  --help                      If specified, displays this usage statement\n\n"
-      << "  --m=<int>                   Sets the M extent of the GEMM for all groups\n"
-      << "  --n=<int>                   Sets the N extent of the GEMM for all groups\n"
-      << "  --k=<int>                   Sets the K extent of the GEMM for all groups\n"
-      << "  --groups=<int>              Sets the number of individual GEMM problems for Grouped GEMM\n"
-      << "  --c=<int>                   The size of each chunk for the scales and zeros. To broadcast a vector of scales or zeros, set the group size to K.\n"
-      << "  --alpha=<f32>               Epilogue scalar alpha\n"
-      << "  --beta=<f32>                Epilogue scalar beta\n\n"
-      << "  --iterations=<int>          Number of profiling iterations to perform\n\n"
-      << "  --warmup=<int>              Number of warmup iterations to perform\n\n"
-      << "  --shuffle=<boolean>         Enable the offline layout swizzling.\n\n"
-      << "  --swizzle=<int>             Tile scheduler swizzle size (1, 2, 4, or 8). Default: 1\n"
-      << "  --benchmark=<str>           Executes a benchmark problem size.\n";
-
-    out
-      << "\n\nExamples:\n\n"
-      << "$ " << "69_hopper_int4_fp8_grouped_gemm" << " --m=1024 --n=512 --k=1024 --groups=10 --alpha=1 --beta=0 \n\n";
-
-    return out;
-  }
-};
-
-#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// GEMM setup and evaluation
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-// In the mainloop, PRMT selects 1 byte from only 8 bytes so the sign bit is handled in an extra PRMT.
-// Here the encodings of positive values and negative values are unified (except for the sign bit). 
-// For instance, 1 becomes 0b0111, which is the same encoding as -1 (0b1111).
-
-/// Allocates device-side data
 void allocate(Options const& options) {
   int64_t total_elements_A = 0;
   int64_t total_elements_B = 0;
-  int64_t total_elements_B_dq = 0;
   int64_t total_elements_C = 0;
   int64_t total_elements_D = 0;
   int64_t total_elements_scale = 0;
@@ -415,32 +133,28 @@ void allocate(Options const& options) {
     auto N = get<1>(problem);
     auto K = get<2>(problem);
 
-    // const int scale_k = K / options.c;
     const int scale_k = K / TileShapeK;
 
     offset_A.push_back(total_elements_A);
     offset_B.push_back(total_elements_B * cutlass::sizeof_bits<QuantType>::value / 8);
-    offset_B_dq.push_back(total_elements_B_dq);
     offset_C.push_back(total_elements_C);
     offset_D.push_back(total_elements_D);
     offset_scale.push_back(total_elements_scale);
     offset_zero.push_back(total_elements_zero);
 
-    int64_t elements_A = M * K;
-    int64_t elements_B = K * N ;
-    int64_t elements_B_dq = K * N;
-    int64_t elements_C = M * N;
-    int64_t elements_D = M * N;
+    int64_t elements_A     = M * K;
+    int64_t elements_B     = K * N;
+    int64_t elements_C     = M * N;
+    int64_t elements_D     = M * N;
     int64_t elements_scale = scale_k * N;
-    int64_t elements_zero = scale_k * N;
+    int64_t elements_zero  = scale_k * N;
 
-    total_elements_A += elements_A;
-    total_elements_B += elements_B;
-    total_elements_B_dq += elements_B_dq;
-    total_elements_C += elements_C;
-    total_elements_D += elements_D;
+    total_elements_A     += elements_A;
+    total_elements_B     += elements_B;
+    total_elements_C     += elements_C;
+    total_elements_D     += elements_D;
     total_elements_scale += elements_scale;
-    total_elements_zero += elements_zero;
+    total_elements_zero  += elements_zero;
 
     stride_A_host.push_back(cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1}));
     stride_B_host.push_back(cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1}));
@@ -455,8 +169,6 @@ void allocate(Options const& options) {
   block_A.reset(total_elements_A);
   block_B.reset(total_elements_B);
   block_B_interleaved.reset(total_elements_B);
-  block_B_modified.reset(total_elements_B);
-  block_B_dq.reset(total_elements_B_dq);
   block_C.reset(total_elements_C);
   block_D.reset(total_elements_D);
   block_ref_D.reset(total_elements_D);
@@ -468,7 +180,6 @@ void allocate(Options const& options) {
   block_beta.reset(options.groups);
 }
 
-/// Initialize operands to be used in the GEMM and reference GEMM
 void initialize(Options& options) {
 
   [[maybe_unused]]uint64_t seed = 2020;
@@ -476,50 +187,32 @@ void initialize(Options& options) {
   problem_sizes.reset(options.groups);
   problem_sizes.copy_from_host(options.problem_sizes_host.data());
 
-  //
-  // Assign pointers
-  //
-
-  std::vector<MmaType *> ptr_A_host(options.groups);
-  std::vector<QuantType *> ptr_B_host(options.groups);
-  std::vector<MmaType *> ptr_B_dq_host(options.groups);
-  std::vector<ElementC *> ptr_C_host(options.groups);
-  std::vector<ElementC *> ptr_D_host(options.groups);
+  std::vector<MmaType *>            ptr_A_host(options.groups);
+  std::vector<QuantType *>          ptr_B_host(options.groups);
+  std::vector<ElementC *>           ptr_C_host(options.groups);
+  std::vector<ElementC *>           ptr_D_host(options.groups);
   std::vector<ElementScalePacked *> ptr_scale_packed_host(options.groups);
-  std::vector<ElementZero *> ptr_zero_host(options.groups);
+  std::vector<ElementZero *>        ptr_zero_host(options.groups);
   std::vector<ElementAccumulator *> ptr_alpha_host(options.groups);
   std::vector<ElementAccumulator *> ptr_beta_host(options.groups);
 
   for (int32_t i = 0; i < options.groups; ++i) {
-    ptr_A_host.at(i) = block_A.get() + offset_A.at(i);
-    // ptr_B_host.at(i) = block_B_modified.get() + offset_B.at(i);
-    // ptr_B_host.at(i) = block_B.get() + offset_B.at(i);
-    ptr_B_host.at(i) = block_B_interleaved.get() + offset_B.at(i);
-    ptr_B_dq_host.at(i) = block_B_dq.get() + offset_B_dq.at(i);
-    ptr_C_host.at(i) = block_C.get() + offset_C.at(i);
-    ptr_D_host.at(i) = block_D.get() + offset_D.at(i);
+    ptr_A_host.at(i)            = block_A.get() + offset_A.at(i);
+    ptr_B_host.at(i)            = block_B_interleaved.get() + offset_B.at(i);
+    ptr_C_host.at(i)            = block_C.get() + offset_C.at(i);
+    ptr_D_host.at(i)            = block_D.get() + offset_D.at(i);
     ptr_scale_packed_host.at(i) = block_scale_packed.get() + offset_scale.at(i);
-    ptr_zero_host.at(i) = block_zero.get() + offset_zero.at(i);
+    ptr_zero_host.at(i)         = block_zero.get() + offset_zero.at(i);
     alpha_host.push_back((options.alpha == FLT_MAX) ? static_cast<ElementAccumulator>((rand() % 5) + 1) : options.alpha);
-    beta_host.push_back((options.beta == FLT_MAX) ? static_cast<ElementAccumulator>(rand() % 5) : options.beta);
+    beta_host.push_back( (options.beta  == FLT_MAX) ? static_cast<ElementAccumulator>(rand() % 5)       : options.beta);
     ptr_alpha_host.at(i) = block_alpha.get() + i;
-    ptr_beta_host.at(i) = block_beta.get() + i;
+    ptr_beta_host.at(i)  = block_beta.get() + i;
   }
 
-  ptr_A.reset(options.groups);
-  ptr_A.copy_from_host(ptr_A_host.data());
-
-  ptr_B.reset(options.groups);
-  ptr_B.copy_from_host(ptr_B_host.data());
-
-  ptr_B_dq.reset(options.groups);
-  ptr_B_dq.copy_from_host(ptr_B_dq_host.data());
-
-  ptr_C.reset(options.groups);
-  ptr_C.copy_from_host(ptr_C_host.data());
-
-  ptr_D.reset(options.groups);
-  ptr_D.copy_from_host(ptr_D_host.data());
+  ptr_A.reset(options.groups);  ptr_A.copy_from_host(ptr_A_host.data());
+  ptr_B.reset(options.groups);  ptr_B.copy_from_host(ptr_B_host.data());
+  ptr_C.reset(options.groups);  ptr_C.copy_from_host(ptr_C_host.data());
+  ptr_D.reset(options.groups);  ptr_D.copy_from_host(ptr_D_host.data());
 
   ptr_scale_packed.reset(options.groups);
   ptr_scale_packed.copy_from_host(ptr_scale_packed_host.data());
@@ -527,78 +220,45 @@ void initialize(Options& options) {
   ptr_zero.reset(options.groups);
   ptr_zero.copy_from_host(ptr_zero_host.data());
 
-  stride_A.reset(options.groups);
-  stride_A.copy_from_host(stride_A_host.data());
+  stride_A.reset(options.groups);   stride_A.copy_from_host(stride_A_host.data());
+  stride_B.reset(options.groups);   stride_B.copy_from_host(stride_B_host.data());
+  stride_C.reset(options.groups);   stride_C.copy_from_host(stride_C_host.data());
+  stride_D.reset(options.groups);   stride_D.copy_from_host(stride_D_host.data());
+  stride_C_ref.reset(options.groups); stride_C_ref.copy_from_host(stride_C_host_ref.data());
+  stride_D_ref.reset(options.groups); stride_D_ref.copy_from_host(stride_D_host_ref.data());
+  stride_S_ref.reset(options.groups); stride_S_ref.copy_from_host(stride_S_host_ref.data());
+  stride_S.reset(options.groups);   stride_S.copy_from_host(stride_S_host.data());
 
-  stride_B.reset(options.groups);
-  stride_B.copy_from_host(stride_B_host.data());
-
-  stride_C.reset(options.groups);
-  stride_C.copy_from_host(stride_C_host.data());
-
-  stride_D.reset(options.groups);
-  stride_D.copy_from_host(stride_D_host.data());
-
-  stride_C_ref.reset(options.groups);
-  stride_C_ref.copy_from_host(stride_C_host_ref.data());
-
-  stride_D_ref.reset(options.groups);
-  stride_D_ref.copy_from_host(stride_D_host_ref.data());
-
-  stride_S_ref.reset(options.groups);
-  stride_S_ref.copy_from_host(stride_S_host_ref.data());
-
-  stride_S.reset(options.groups);
-  stride_S.copy_from_host(stride_S_host.data());
-
-  alpha_device.reset(options.groups);
-  alpha_device.copy_from_host(ptr_alpha_host.data());
-  beta_device.reset(options.groups);
-  beta_device.copy_from_host(ptr_beta_host.data());
+  alpha_device.reset(options.groups); alpha_device.copy_from_host(ptr_alpha_host.data());
+  beta_device.reset(options.groups);  beta_device.copy_from_host(ptr_beta_host.data());
 
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
-  
-  // block_A -> cutlass::DeviceAllocation<MmaType>
+
   initialize_tensor(block_A, seed + 2023);
-  
-  // print("jiangs block_A (size=%d)\n", int(block_A.size())); // block_A (size=512)  
   set_device<<<1, 1>>>(options.debug_input_act, block_A.get(), block_A.size(), 1);
   print_device<<<1, 1>>>(options.enable_print, block_A.get(), block_A.size(), options.groups, 'A');
   cudaDeviceSynchronize();
 
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
-  
+
   initialize_quant_tensor(block_B, seed + 2022);
 
-  float scope_min = float(cutlass::platform::numeric_limits<QuantType>::lowest());
-  float scope_max = float(cutlass::platform::numeric_limits<QuantType>::max());
-  // print("jiangs block_B (size=%d) min=%f max=%f\n",
-    // int(block_B.size()), scope_min, scope_max); // jiangs block_B (size=4096) min=-8.000000 max=7.000000
   set_device_int4<<<1, 1>>>(options.debug_input_weight, block_B.get(), block_B.size(), 1);
   print_device_4b<<<1, 1>>>(options.enable_print_weight, block_B.get(), options.groups * options.n, options.k, 'B');
 
-  if constexpr (cute::is_same_v<QuantType, cutlass::float_e2m1_t> && 
+  if constexpr (cute::is_same_v<QuantType, cutlass::float_e2m1_t> &&
       cute::is_same_v<MmaType, cutlass::bfloat16_t>)
   {
     interleave_fp4xbf16_Hopper<QuantType>(
-      block_B.get(), 
-      block_B_interleaved.get(), 
-      options.groups * options.n, 
-      options.k);
-    // interleave_fp4_Hopper<QuantType>(
-    //   block_B.get(), 
-    //   block_B_interleaved.get(), 
-    //   options.groups * options.n, 
-    //   options.k);
+      block_B.get(), block_B_interleaved.get(),
+      options.groups * options.n, options.k);
   }
-  else if constexpr (cute::is_same_v<QuantType, cutlass::int4b_t> && 
+  else if constexpr (cute::is_same_v<QuantType, cutlass::int4b_t> &&
     cute::is_same_v<MmaType, cutlass::float_e4m3_t>)
   {
     interleave_int4xfp8_Hopper<QuantType>(
-      block_B.get(), 
-      block_B_interleaved.get(), 
-      options.groups * options.n, 
-      options.k);
+      block_B.get(), block_B_interleaved.get(),
+      options.groups * options.n, options.k);
   }
   else
   {
@@ -606,33 +266,24 @@ void initialize(Options& options) {
   }
   print_device_4b<<<1, 1>>>(options.enable_print_weight, block_B_interleaved.get(), options.groups * options.n, options.k, 'B');
 
-  cutlass::unified_encode_int4b(
-    reinterpret_cast<cutlass::int4b_t const *>(block_B.get()),
-    reinterpret_cast<cutlass::int4b_t *>(block_B_modified.get()),
-    block_B.size());
-  
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
-  
-  // print("jiangs block_C (size=%d)\n", int(block_C.size())); // block_C (size=16)
+
   initialize_tensor(block_C, seed + 2021);
-  print_device<<<1, 1>>>(options.enable_print, block_C.get(), block_C.size(), options.groups, 'C');  
+  print_device<<<1, 1>>>(options.enable_print, block_C.get(), block_C.size(), options.groups, 'C');
   cudaDeviceSynchronize();
-  
+
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
-  
-  // print("jiangs block_scale (size=%d)\n", int(block_scale.size())); // block_scale (size=16)
+
   if constexpr (cute::is_same_v<ElementScale, cutlass::float_ue8m0_t>) {
     set_device_ue8m0<<<1, 1>>>(options.debug_input_scale, block_scale.get(), block_scale.size());
   }
   else {
     set_device_sequential<<<1, 1>>>(block_scale.get(), block_scale.size(), 5678);
   }
-  // initialize_scale(block_scale, options);
   print_device<<<1, 1>>>(options.enable_print, block_scale.get(), block_scale.size(), options.groups, 'S');
   cudaDeviceSynchronize();
-  
-  // cutlass::pack_scale_fp8(block_scale.get(), block_scale_packed.get(), block_scale.size());
-  cutlass::pack_scale_fp32(options.debug_input_scale, block_scale.get(), block_scale_packed.get(), block_scale.size(), ElementScalePacked::kElements);  
+
+  cutlass::pack_scale_fp32(options.debug_input_scale, block_scale.get(), block_scale_packed.get(), block_scale.size(), ElementScalePacked::kElements);
   print_device_packed<<<1, 1>>>(options.enable_print, block_scale_packed.get(), block_scale.size(), 'P');
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -640,273 +291,57 @@ void initialize(Options& options) {
     problem_sizes.get(),
     options.groups,
     block_A.get(), block_B.get(), block_scale_packed.get(), block_ref_D.get(),
-    TileShapeK, 
-    GROUP_SIZE, // options.c,
+    TileShapeK,
+    GROUP_SIZE,
     stride_A.get(), stride_B.get()
   );
 
   print_device<<<1,1>>>(options.enable_print, block_ref_D.get(), block_ref_D.size(), options.groups, 'R');
-  /////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-
 
   initialize_zero(block_zero, options);
   block_alpha.copy_from_host(alpha_host.data());
   block_beta.copy_from_host(beta_host.data());
 
+  // Swap MN -> NM for SwapAB (device only; restore host copy below)
+  for (int32_t i = 0; i < options.groups; ++i) {
+    auto [M, N, K] = options.problem_sizes_host[i];
+    options.problem_sizes_host[i] = make_tuple(N, M, K);
+  }
   problem_sizes.reset(options.groups);
-
-  if (options.shuffle) {
-    std::vector<LayoutB_Reordered> layout_B_reordered_host(options.groups);
-    for (int32_t i = 0; i < options.groups; ++i) {
-      auto shape_B = cute::make_shape(cute::get<1>(options.problem_sizes_host[i]), cute::get<2>(options.problem_sizes_host[i]), Int<1>{});
-      auto layout_B = make_layout(shape_B, stride_B_host.at(i));
-      // Repeat the reorder layout atom to tile the whole tensor shape 
-      layout_B_reordered_host[i] = tile_to_shape(LayoutAtomQuant{}, shape_B);
-      cutlass::reorder_tensor(block_B_modified.get() + offset_B.at(i), layout_B, layout_B_reordered_host[i]);
-      if (i == 0) {
-        print("Quantized tensor layout: ");
-        print(layout_B_reordered_host[0]);
-        print("\n");
-      }
-    }
-    layout_B_reordered.reset(options.groups);
-    layout_B_reordered.copy_from_host(layout_B_reordered_host.data());
-  }
-
-  // Reverse MN -> NM for SwapAB
-  for (int32_t i = 0; i < options.groups; ++i) {
-    auto [M, N, K] = options.problem_sizes_host[i];
-    options.problem_sizes_host[i] = make_tuple(N, M, K);
-  }
   problem_sizes.copy_from_host(options.problem_sizes_host.data());
-  // Reverse back NM -> MN
+  // Restore host copy to original MN order
   for (int32_t i = 0; i < options.groups; ++i) {
     auto [M, N, K] = options.problem_sizes_host[i];
     options.problem_sizes_host[i] = make_tuple(N, M, K);
   }
 }
-
-/// Populates a Gemm::Arguments structure from the given commandline options
-template <typename Gemm>
-typename Gemm::Arguments args_from_options(Options const& options, bool host_problem_shapes_available = true)
-{
-  using Args = typename Gemm::Arguments;
-  auto&& dB = [&]() {
-    // if constexpr (cute::is_same_v<Gemm, GemmShuffled>) { // offline swizzling is enabled.
-    //   return layout_B_reordered.get();
-    // }
-    // else {
-    //   return stride_B.get();
-    // }
-    return stride_B.get();
-  }();
-  cutlass::KernelHardwareInfo hw_info;
-  // Change device_id to another value if you are running on a machine with multiple GPUs and wish
-  // to use a GPU other than that with device ID 0.
-  hw_info.device_id = 0;
-  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-
-  Args arguments;
-  decltype(arguments.epilogue.thread) fusion_args;
-
-  if (options.alpha != FLT_MAX && options.beta != FLT_MAX) {
-    // If both alpha/beta are provided (via cmd line args) and are scalar, i.e., same alpha/beta applies to all batches.
-    fusion_args.alpha = options.alpha;
-    fusion_args.beta = options.beta;
-    fusion_args.alpha_ptr = nullptr;
-    fusion_args.beta_ptr = nullptr;
-    fusion_args.alpha_ptr_array = nullptr;
-    fusion_args.beta_ptr_array = nullptr;
-    // Single alpha and beta for all groups
-    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
-    fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
-  }
-  else {
-    // If pointers to alpha/beta are provided, i.e., alpha/beta can differ between batches/groups.
-    fusion_args.alpha = 0;
-    fusion_args.beta = 0;
-    fusion_args.alpha_ptr = nullptr;
-    fusion_args.beta_ptr = nullptr;
-    fusion_args.alpha_ptr_array = alpha_device.get();
-    fusion_args.beta_ptr_array = beta_device.get();
-    // One alpha and beta per each group
-    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
-    fusion_args.dBeta = {cute::_0{}, cute::_0{}, 1};
-  }
-
-  // printf("chunk size = %d\n", options.c);
-
-  arguments = Args {
-    cutlass::gemm::GemmUniversalMode::kGrouped,
-    {options.groups, problem_sizes.get(), nullptr},
-    {ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_scale_packed.get(), stride_S.get(), GROUP_SIZE},
-    {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
-    hw_info
-  };
-  
-  // Configure tile scheduler for swizzle and raster order
-  arguments.scheduler.max_swizzle_size = options.swizzle;
-  arguments.scheduler.raster_order = RasterOrderOptions::Heuristic;  // AlongM, AlongN, or Heuristic;
-  
-  return arguments;
-}
-
 
 bool verify(Options const& options) {
   bool passed = true;
-
-  constexpr bool IsFP8Input = cute::is_same_v<MmaType, cutlass::float_e4m3_t> || cute::is_same_v<MmaType, cutlass::float_e5m2_t>;
-  using FP8Sched = cute::conditional_t<size<0>(TileShape{}) == 64, cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum, cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum>;
-  using ScheduleRef = cute::conditional_t<IsFP8Input, FP8Sched, cutlass::gemm::collective::KernelScheduleAuto>;
-
-  using CollectiveMainloopRef = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    MmaType, LayoutA, AlignmentA,
-    MmaType, LayoutB, AlignmentB,
-    ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAuto,
-    ScheduleRef
-  >::CollectiveOp;
-
-  using CollectiveEpilogueRef = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-    TileShape, ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, LayoutC, AlignmentC,
-    ElementD, LayoutD, AlignmentD,
-    cutlass::epilogue::NoSmemWarpSpecialized
-  >::CollectiveOp;
-
-  using GemmKernelRef = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int>, // Indicates ProblemShape
-    CollectiveMainloopRef,
-    CollectiveEpilogueRef
-  >;
-
-  using GemmRef = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelRef>;
-  using StrideA_verif = typename GemmRef::GemmKernel::StrideA;
-  using StrideB_verif = typename GemmRef::GemmKernel::StrideB;
-  using StrideC_verif = typename GemmRef::GemmKernel::StrideC;
-  using StrideD_verif = typename GemmRef::GemmKernel::StrideD;
 
   const ElementD epsilon(1e-2f);
   const ElementD non_zero_floor(1e-4f);
 
   for (int32_t i = 0; i < options.groups; ++i) {
     auto problem = options.problem_sizes_host.at(i);
-    auto N = get<0>(problem);
-    auto M = get<1>(problem);
-    auto K = get<2>(problem);
+    auto M = get<0>(problem);  // original M (after swap-back)
+    auto N = get<1>(problem);  // original N
     if (M == 0) {
       continue;
     }
-    else {
-      // StrideA_verif stride_A_verif;
-      // StrideB_verif stride_B_verif;
-
-      // stride_A_verif = cutlass::make_cute_packed_stride(StrideA_verif{}, cute::make_shape(M, K, 1));
-      // stride_B_verif = cutlass::make_cute_packed_stride(StrideB_verif{}, cute::make_shape(N, K, 1));
-
-      // // const int scale_k = 1;
-      // const int scale_k = K / options.c;
-
-      // auto layout_B = make_layout(cute::make_shape(N, K, Int<1>{}), stride_B_host.at(i));
-      // auto layout_scale_zero = make_layout(cute::make_shape(N, scale_k, Int<1>{}), stride_S_host_ref.at(i));
-      // cudaStream_t stream = cudaStreamDefault;
-      // cutlass::dequantize(block_B_dq.get() + offset_B_dq.at(i), block_B.get() + offset_B.at(i), layout_B, block_scale.get() + offset_scale.at(i), block_zero.get() + offset_zero.at(i), layout_scale_zero, options.k, stream);
-
-      //
-      // Compute reference output
-      //
-
-      // typename GemmRef::Arguments arguments{
-      //   cutlass::gemm::GemmUniversalMode::kGemm,
-      //   {M, N, K},
-      //   {block_A.get() + offset_A.at(i), stride_A_verif, block_B_dq.get() + offset_B_dq.at(i), stride_B_verif},
-      //   {{alpha_host.at(i), beta_host.at(i)}, block_C.get() + offset_C.at(i), stride_C_host_ref.at(i), block_ref_D.get() + offset_D.at(i), stride_D_host_ref.at(i)}
-      // };
-
-      // Run the gemm where the scaling is performed outside of the kernel.
-      // GemmRef gemm_ref;
-      // size_t workspace_size = GemmRef::get_workspace_size(arguments);
-      // cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-      // CUTLASS_CHECK(gemm_ref.can_implement(arguments));
-      // CUTLASS_CHECK(gemm_ref.initialize(arguments, workspace.get()));
-      // CUTLASS_CHECK(gemm_ref.run());
-
-      // Wait for kernel to finish
-      CUDA_CHECK(cudaDeviceSynchronize());
-
-      passed &= cutlass::reference::device::BlockCompareRelativelyEqual(block_ref_D.get() + offset_D.at(i), block_D.get() + offset_D.at(i), M * N, epsilon, non_zero_floor);
-      // std::cout << "Group: " << i << " Status: " << passed << std::endl;
-    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    passed &= cutlass::reference::device::BlockCompareRelativelyEqual(
+      block_ref_D.get() + offset_D.at(i), block_D.get() + offset_D.at(i), M * N, epsilon, non_zero_floor);
   }
 
   compare_device<<<1,1>>>(options.compare, block_D.get(), block_ref_D.get(), block_D.size(), options.groups, options.m, options.n);
-
-  // printf("block_D: ");
   print_device<<<1,1>>>(options.enable_print, block_ref_D.get(), block_ref_D.size(), options.groups, 'R');
   print_device<<<1,1>>>(options.enable_print, block_D.get(), block_D.size(), options.groups, 'D');
-
 
   return passed;
 }
 
 bool setup = false;
-
-/// Execute a given example GEMM computation
-template <typename Gemm>
-MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true)
-{
-  if (!setup) {
-    printf("Setup input tensors.\n");
-    allocate(options);
-    initialize(options);
-    setup = true;
-  }
-
-  // Instantiate CUTLASS kernel depending on templates
-  Gemm gemm;
-
-  // Create a structure of gemm kernel arguments suitable for invoking an instance of Gemm
-  auto arguments = args_from_options<Gemm>(options, host_problem_shapes_available);
-
-  // Using the arguments, query for extra workspace required for matrix multiplication computation
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-
-  // printf("workspace_size = %ld\n", workspace_size);
-
-  // Allocate workspace memory
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
-  // Check if the problem size is supported or not
-  CUTLASS_CHECK(gemm.can_implement(arguments));
-
-  // Initialize CUTLASS kernel with arguments and workspace pointer
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-
-  // Correctness / Warmup iteration
-  CUTLASS_CHECK(gemm.run());
-
-  // std::cout << "We passed all checks\n";
-  // Check if output from CUTLASS kernel and reference kernel are equal or not
-  MixedDtypeResult result;
-  result.passed = verify(options);
-  // if (!options.explore) {
-  //   std::cout << "  Disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
-  // }
-  // if (!result.passed) {
-  //   exit(-1);
-  // }
-
-  grouped_mixed_dtype_profiling(gemm, options, result, alpha_host, beta_host);
-
-  return result;
-}
 
 #ifdef PROFILE
 #include "kernel_profiler.h"
@@ -918,21 +353,9 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
 
 int main(int argc, char const **args) {
 
-  // FP4 -> BF16 Convertor
-  // interleave_w4a16_Hopper_test();
-  // interleave_fp4_Hopper_test();
-  // MXFP4_test();
-  // return 0;
-
-  // FP8 UE8M0 -> FP32 Convertor
-  // UE8M0_FP32_test();
-  // return 0;
-
-
   // CUTLASS must be compiled with CUDA 12.3 Toolkit to run this example
   if (__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 3)) {
     std::cerr << "This example requires CUDA 12.3 or newer.\n";
-    // Returning zero so this test passes on older Toolkits. Its actions are no-op.
     return 0;
   }
 
@@ -940,33 +363,22 @@ int main(int argc, char const **args) {
   int current_device_id;
   CUDA_CHECK(cudaGetDevice(&current_device_id));
   CUDA_CHECK(cudaGetDeviceProperties(&props, current_device_id));
-  cudaError_t error = cudaGetDeviceProperties(&props, 0);
   if (props.major != 9 || props.minor != 0) {
     std::cerr
       << "This example requires a GPU of NVIDIA's Hopper Architecture (compute capability 90).\n";
     return 0;
   }
 
-  // Print SM count
   int sm_count = props.multiProcessorCount;
   std::cout << "Device: " << props.name << ", SM count: " << sm_count << std::endl;
 
-  //
-  // Parse options
-  //
-
   Options options;
-
   options.parse(argc, args);
 
   if (options.help) {
     options.print_usage(std::cout) << std::endl;
     return 0;
   }
-
-  //
-  // Evaluate CUTLASS kernels
-  //
 
   if (options.explore) {
     #ifdef PROFILE
@@ -975,17 +387,13 @@ int main(int argc, char const **args) {
   }
   else {
     #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
-      std::cout << "Running in per-column scale mode." << std::endl;
-      if (options.shuffle) {
-        std::cerr << "Offline shuffle enabled unsupported." << std::endl;
-        // run<GemmShuffled>(options, false);
-      } else {
-        std::cout << "Offline shuffle disabled." << std::endl;
-        run<GemmScaleOnly>(options, false);
+      auto result = run<GemmScaleOnly>(options, false);
+      if (result.status != cutlass::Status::kSuccess) {
+        std::cerr << "Kernel failed: " << cutlassGetStatusString(result.status) << std::endl;
+        return -1;
       }
     #endif
   }
-
 
   return 0;
 }

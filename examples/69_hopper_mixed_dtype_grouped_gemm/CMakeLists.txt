@@ -91,6 +91,20 @@ cutlass_example_add_executable(
   TEST_SCALE_PERCOL
 )
 
+# Kernel config profiler part files. Each is guarded by #ifdef PROFILE internally,
+# so they compile to empty TUs unless kernel_profiler_shared.hpp has #define PROFILE.
+# To enable: uncomment #define PROFILE in kernel_profiler_shared.hpp, then make -j.
+target_sources(69_hopper_int4_fp8_grouped_gemm PRIVATE
+  profiler_pp_1x1x1.cu
+  profiler_pp_2x1x1.cu
+  profiler_pp_1x2x1.cu
+  profiler_pp_2x2x1.cu
+  profiler_coop_1x1x1.cu
+  profiler_coop_2x1x1.cu
+  profiler_coop_1x2x1.cu
+  profiler_coop_2x2x1.cu
+)
+
 cutlass_example_add_executable(
   69_hopper_int4_bf16_grouped_gemm
   69_hopper_int4_bf16_grouped_gemm.cu
