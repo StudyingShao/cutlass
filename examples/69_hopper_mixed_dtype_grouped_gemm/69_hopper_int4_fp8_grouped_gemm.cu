@@ -249,16 +249,26 @@ void initialize(Options& options) {
   if constexpr (cute::is_same_v<QuantType, cutlass::float_e2m1_t> &&
       cute::is_same_v<MmaType, cutlass::bfloat16_t>)
   {
-    interleave_fp4xbf16_Hopper<QuantType>(
-      block_B.get(), block_B_interleaved.get(),
-      options.groups * options.n, options.k);
+    for (int32_t i = 0; i < options.groups; ++i) {
+      auto problem = options.problem_sizes_host.at(i);
+      auto N = get<1>(problem);
+      auto K = get<2>(problem);
+      interleave_fp4xbf16_Hopper<QuantType>(
+        block_B.get() + offset_B.at(i), block_B_interleaved.get() + offset_B.at(i),
+        N, K);
+    }
   }
   else if constexpr (cute::is_same_v<QuantType, cutlass::int4b_t> &&
     cute::is_same_v<MmaType, cutlass::float_e4m3_t>)
   {
-    interleave_int4xfp8_Hopper<QuantType>(
-      block_B.get(), block_B_interleaved.get(),
-      options.groups * options.n, options.k);
+    for (int32_t i = 0; i < options.groups; ++i) {
+      auto problem = options.problem_sizes_host.at(i);
+      auto N = get<1>(problem);
+      auto K = get<2>(problem);
+      interleave_int4xfp8_Hopper<QuantType>(
+        block_B.get() + offset_B.at(i), block_B_interleaved.get() + offset_B.at(i),
+        N, K);
+    }
   }
   else
   {
@@ -334,7 +344,7 @@ bool verify(Options const& options) {
       block_ref_D.get() + offset_D.at(i), block_D.get() + offset_D.at(i), M * N, epsilon, non_zero_floor);
   }
 
-  compare_device<<<1,1>>>(options.compare, block_D.get(), block_ref_D.get(), block_D.size(), options.groups, options.m, options.n);
+  compare_device<<<1,1>>>(options.compare, block_D.get(), block_ref_D.get(), block_D.size(), problem_sizes.get(), options.groups);
   print_device<<<1,1>>>(options.enable_print, block_ref_D.get(), block_ref_D.size(), options.groups, 'R');
   print_device<<<1,1>>>(options.enable_print, block_D.get(), block_D.size(), options.groups, 'D');
 

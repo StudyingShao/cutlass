@@ -199,43 +199,58 @@ if (debug_input_weight) {
 }
 
 
-template <typename T>
-__global__ void compare_device(bool compare_print, T *out, T *ref, int count, int Groups, int M, int N) {
-    
-    if (thread0())
-    {
-        int P99_error_count = 0;
-        int P98_error_count = 0;
-        int P95_error_count = 0;
+// Walks the packed D buffer per-group using each group's actual (M, N) from
+// `problem_sizes`. This is mandatory for variable-M (e.g. MoE) tests — using a
+// single uniform M from `options.m` will overrun `block_D` and corrupt the CUDA
+// context (subsequent kernel launches then fail with "Error Internal").
+//
+// NOTE: at the point this kernel is launched (from verify()), the device-side
+// `problem_sizes` array has already been transposed for SwapAB by initialize(),
+// so each entry is laid out as (N, M, K) — original M lives at index 1.
+template <typename T, typename ProblemSizes>
+__global__ void compare_device(
+    bool compare_print, T *out, T *ref, int count,
+    ProblemSizes problem_sizes_swapped, int Groups)
+{
+    if (!thread0()) return;
 
+    if (count == 0) {
+      printf("P99_error_count 0 0.00%%\n");
+      printf("P98_error_count 0 0.00%%\n");
+      printf("P95_error_count 0 0.00%%\n");
+      return;
+    }
 
-        for (int g = 0; g < Groups; g++) {
-          for (int m = 0; m < M; m++) {
-            for (int n = 0; n < N; n++) {
-              int idx = g * M * N + m * N + n;
-              float abs_error = abs(float(out[idx]) - float(ref[idx]));
-              float rel_error = abs_error / abs(float(ref[idx]));
+    int P99_error_count = 0;
+    int P98_error_count = 0;
+    int P95_error_count = 0;
 
-              if (rel_error > 0.01)
-              {
-                P99_error_count++;
+    int64_t base = 0;
+    for (int g = 0; g < Groups; g++) {
+      // problem_sizes_swapped[g] = (N_orig, M_orig, K)
+      int N = get<0>(problem_sizes_swapped[g]);
+      int M = get<1>(problem_sizes_swapped[g]);
+      for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+          int64_t idx = base + int64_t(m) * N + n;
+          float abs_error = abs(float(out[idx]) - float(ref[idx]));
+          float rel_error = abs_error / abs(float(ref[idx]));
 
-                if (compare_print)
-                  printf("(g=%d, m=%d, n=%d): out %f ref %f abs_error %f rel_error %f\n",
-                      g, m, n, float(out[idx]), float(ref[idx]), abs_error, rel_error);
-                
-                if (rel_error > 0.02)
-                  P98_error_count++;
-                if (rel_error > 0.05)
-                  P95_error_count++;
-              }
-            }
+          if (rel_error > 0.01) {
+            P99_error_count++;
+            if (compare_print)
+              printf("(g=%d, m=%d, n=%d): out %f ref %f abs_error %f rel_error %f\n",
+                  g, m, n, float(out[idx]), float(ref[idx]), abs_error, rel_error);
+            if (rel_error > 0.02) P98_error_count++;
+            if (rel_error > 0.05) P95_error_count++;
           }
         }
-        printf("P99_error_count %d %.2f%%\n", P99_error_count, float(P99_error_count) / count * 100.0f);
-        printf("P98_error_count %d %.2f%%\n", P98_error_count, float(P98_error_count) / count * 100.0f);
-        printf("P95_error_count %d %.2f%%\n", P95_error_count, float(P95_error_count) / count * 100.0f);
+      }
+      base += int64_t(M) * N;
     }
+    printf("P99_error_count %d %.2f%%\n", P99_error_count, float(P99_error_count) / count * 100.0f);
+    printf("P98_error_count %d %.2f%%\n", P98_error_count, float(P98_error_count) / count * 100.0f);
+    printf("P95_error_count %d %.2f%%\n", P95_error_count, float(P95_error_count) / count * 100.0f);
 }
 
 
@@ -406,4 +421,3 @@ void groupwise_verify(
         stride_A, stride_B);
     cudaDeviceSynchronize();
 }
-

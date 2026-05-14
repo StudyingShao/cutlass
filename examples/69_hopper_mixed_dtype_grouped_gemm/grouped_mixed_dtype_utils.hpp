@@ -31,9 +31,13 @@
 
 #pragma once
 
-#include <vector>
+#include <algorithm>
 #include <fstream>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "../55_hopper_mixed_dtype_gemm/mixed_dtype_utils.hpp"
 
@@ -48,6 +52,7 @@ public:
     int groups = 6;
     int c = 512;
     std::string benchmark_path;
+    std::string expert_counts_path;
     std::vector<UnderlyingProblemShape> problem_sizes_host;
 
     GroupedMixedDtypeOptions() : MixedDtypeOptions()
@@ -63,8 +68,16 @@ public:
         MixedDtypeOptions::parse(argc, args);
         c = k;
         cmd.get_cmd_line_argument("c", c);
+        cmd.get_cmd_line_argument("benchmark", benchmark_path);
+        cmd.get_cmd_line_argument("expert_counts", expert_counts_path);
 
-        problem_sizes_host = benchmark_path.empty() ? randomize_problems(cmd) : load_benchmark_problems();
+        if (!expert_counts_path.empty()) {
+            problem_sizes_host = load_expert_counts_problems();
+        } else if (!benchmark_path.empty()) {
+            problem_sizes_host = load_benchmark_problems();
+        } else {
+            problem_sizes_host = randomize_problems(cmd);
+        }
     }
 
     std::ostream& print_usage(std::ostream& out) const {
@@ -81,7 +94,12 @@ public:
             << "  --beta=<f32>                Epilogue scalar beta\n"
             << "  --iterations=<int>          Number of profiling iterations\n"
             << "  --warmup=<int>              Number of warmup iterations\n"
-            << "  --benchmark=<str>           Executes a benchmark problem size\n";
+            << "  --benchmark=<str>           Executes a benchmark problem size\n"
+            << "  --expert_counts=<str>       Path to a file with per-expert M (token) counts.\n"
+            << "                              One integer per entry (whitespace/newline separated,\n"
+            << "                              lines starting with '#' are ignored).\n"
+            << "                              --n and --k are used for fixed N/K across all groups;\n"
+            << "                              --groups is overridden by the file length.\n";
         return out;
     }
 
@@ -121,6 +139,71 @@ private:
         return problems;
     }
 
+    bool try_parse_count_token(std::string const& tok, int& value) const {
+        try {
+            size_t consumed = 0;
+            int parsed = std::stoi(tok, &consumed);
+            if (consumed != tok.size() || parsed < 0) return false;
+            value = parsed;
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
+    void append_count_tokens(std::vector<UnderlyingProblemShape>& problems,
+                             std::string const& text) const {
+        std::istringstream iss(text);
+        std::string tok;
+        while (iss >> tok) {
+            int m = 0;
+            if (try_parse_count_token(tok, m)) {
+                problems.push_back({m, this->n, this->k});
+            }
+        }
+    }
+
+    // Load per-expert M counts from a text file. Uses the global --n and --k as the
+    // (fixed) N/K for every group; groups is overridden by the number of entries found.
+    //
+    // File format:
+    //   - One non-negative integer per entry (whitespace or newline separated).
+    //   - Lines containing '=' are treated as logs like "expert[i] = count"; only
+    //     the right-hand side is parsed so expert indices are never mistaken for M.
+    //   - Lines starting with '#' are treated as comments.
+    std::vector<UnderlyingProblemShape> load_expert_counts_problems() {
+        std::ifstream file(expert_counts_path);
+        if (!file) {
+            throw std::runtime_error("Failed to open expert_counts file: " + expert_counts_path);
+        }
+
+        if (this->k % alignment != 0) {
+            throw std::runtime_error("Error: k dimension must be a multiple of " +
+                                     std::to_string(alignment));
+        }
+
+        std::vector<UnderlyingProblemShape> problems;
+        std::string line;
+        while (std::getline(file, line)) {
+            auto hash = line.find('#');
+            if (hash != std::string::npos) line.erase(hash);
+
+            auto equals = line.find('=');
+            if (equals != std::string::npos) {
+                append_count_tokens(problems, line.substr(equals + 1));
+            } else {
+                append_count_tokens(problems, line);
+            }
+        }
+
+        if (problems.empty()) {
+            throw std::runtime_error("No expert counts parsed from: " + expert_counts_path);
+        }
+
+        groups = static_cast<int>(problems.size());
+        return problems;
+    }
+
     std::vector<UnderlyingProblemShape> load_benchmark_problems() {
         std::ifstream file(benchmark_path);
         if (!file) {
@@ -146,6 +229,9 @@ private:
             if (extent.product()) {
                 problems.push_back({extent.m(), extent.n(), extent.k()});
             }
+        }
+        if (problems.empty()) {
+            throw std::runtime_error("No benchmark problems parsed from: " + benchmark_path);
         }
         groups = static_cast<int>(problems.size());
         return problems;
@@ -198,12 +284,35 @@ void grouped_mixed_dtype_profiling(
     result.gflops = options.gflops(result.avg_runtime_ms / 1000.0);
 
     if (!options.explore) {
-        std::cout << "  Problem Sizes G x (M, N, K), Alpha, Beta\n";
-        // for (int32_t i = 0; i < options.groups; ++i) {
-        //     std::cout << "    " << options.problem_sizes_host[i] << ", " << alpha_host[i] << ", " << beta_host[i] << '\n';
-        // }
+        // Compute aggregate M stats so variable-M (e.g. MoE expert_counts) runs
+        // are printed accurately instead of just showing the first group's M.
+        int64_t total_m = 0;
+        int     min_m   = std::numeric_limits<int>::max();
+        int     max_m   = 0;
+        int     zero_m_groups = 0;
+        for (int i = 0; i < options.groups; ++i) {
+            int m = cute::get<0>(options.problem_sizes_host[i]);
+            total_m += m;
+            min_m = std::min(min_m, m);
+            max_m = std::max(max_m, m);
+            if (m == 0) ++zero_m_groups;
+        }
+        const auto fixed_n = cute::get<1>(options.problem_sizes_host[0]);
+        const auto fixed_k = cute::get<2>(options.problem_sizes_host[0]);
 
-        std::cout << "    " << options.groups << " x " << options.problem_sizes_host[0] << ", " << alpha_host[0] << ", " << beta_host[0] << '\n';
+        std::cout << "  Problem Sizes G x (M, N, K), Alpha, Beta\n";
+        if (min_m == max_m) {
+            std::cout << "    " << options.groups << " x " << options.problem_sizes_host[0]
+                      << ", " << alpha_host[0] << ", " << beta_host[0] << '\n';
+        } else {
+            std::cout << "    " << options.groups << " x (M_var, " << fixed_n << ", " << fixed_k << ")"
+                      << ", " << alpha_host[0] << ", " << beta_host[0] << '\n'
+                      << "    M: total=" << total_m
+                      << " avg=" << (total_m / std::max(1, options.groups))
+                      << " min=" << min_m
+                      << " max=" << max_m
+                      << " zero_groups=" << zero_m_groups << '\n';
+        }
         std::cout << "  Avg runtime : " << result.avg_runtime_ms * 1000.0 << " us\n"
                   << "  GFLOPS      : " << result.gflops << '\n';
     }
