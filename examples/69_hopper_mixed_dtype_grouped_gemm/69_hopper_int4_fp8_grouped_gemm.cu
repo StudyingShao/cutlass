@@ -258,14 +258,16 @@ void initialize(Options& options) {
         N, K);
     }
   }
-  else if constexpr (cute::is_same_v<QuantType, cutlass::int4b_t> &&
-    cute::is_same_v<MmaType, cutlass::float_e4m3_t>)
+  else if constexpr (cute::is_same_v<MmaType, cutlass::float_e4m3_t> &&
+    (cute::is_same_v<QuantType, cutlass::int4b_t> ||
+     cute::is_same_v<QuantType, cutlass::float_e2m1_t>))
   {
+    // Both 4-bit weight formats use the W4A8 Hopper offline layout.
     for (int32_t i = 0; i < options.groups; ++i) {
       auto problem = options.problem_sizes_host.at(i);
       auto N = get<1>(problem);
       auto K = get<2>(problem);
-      interleave_int4xfp8_Hopper<QuantType>(
+      interleave_w4a8_Hopper<QuantType>(
         block_B.get() + offset_B.at(i), block_B_interleaved.get() + offset_B.at(i),
         N, K);
     }

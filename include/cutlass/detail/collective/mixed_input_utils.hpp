@@ -662,6 +662,45 @@ psx_cvt_lut_prmt_fp4x8_to_bf16x8_interleaved
     return bf16x8_raw;
 }
 
+// FP4 E2M1 [0, 0.5, 1, 1.5] encoded as FP8 E4M3.
+__constant__ static uint32_t FP4_POS_E4M3s_REG1_[2] = {0x3C383000, 0x3C383000};
+// FP4 E2M1 [2, 3, 4, 6] encoded as FP8 E4M3.
+__constant__ static uint32_t FP4_POS_E4M3s_REG2_[2] = {0x4C484440, 0x4C484440};
+
+
+__device__ __inline__
+__nv_fp8x8_storage_t
+psx_cvt_lut_prmt_fp4x8_to_fp8x8
+(
+    const __nv_fp4x8_storage_t fp4x8
+)
+{
+    __nv_fp8x8_storage_t fp8x8_raw;
+    __nv_fp8x4_storage_t *fp8x4_raw = reinterpret_cast<__nv_fp8x4_storage_t *>(&fp8x8_raw);
+
+    __nv_fp8x4_storage_t hb_sign_fp8x4 = (fp4x8 & 0x80808080U);
+    __nv_fp8x4_storage_t lb_sign_fp8x4 = (fp4x8 & 0x08080808U) << 4U;
+
+    __nv_fp8x4_storage_t h4b_sign_fp8x4 = prmt(hb_sign_fp8x4, lb_sign_fp8x4, 0x7362U);
+    __nv_fp8x4_storage_t l4b_sign_fp8x4 = prmt(hb_sign_fp8x4, lb_sign_fp8x4, 0x5140U);
+
+    // PRMT consumes only the low 16 bits of its selector in generic mode, so
+    // the low half does not need its high selector half cleared.
+    unsigned l4b_em_fp4x4 = fp4x8 & 0x77777777U;
+    unsigned h4b_em_fp4x4 = l4b_em_fp4x4 >> 16U;
+
+    auto lane_id = threadIdx.x & 0x1;
+    uint32_t h4b_lut = FP4_POS_E4M3s_REG2_[lane_id];
+    uint32_t l4b_lut = FP4_POS_E4M3s_REG1_[lane_id];
+    __nv_fp8x4_storage_t h4b_em_fp8x4 = prmt(h4b_lut, l4b_lut, h4b_em_fp4x4);
+    __nv_fp8x4_storage_t l4b_em_fp8x4 = prmt(h4b_lut, l4b_lut, l4b_em_fp4x4);
+
+    fp8x4_raw[0] = l4b_sign_fp8x4 | l4b_em_fp8x4;
+    fp8x4_raw[1] = h4b_sign_fp8x4 | h4b_em_fp8x4;
+
+    return fp8x8_raw;
+}
+
 
 // [ 0,  1,  2,  3] encoded as FP8
 __constant__ static uint32_t POS_E4M3s_REG1_[2] = {0x44403800, 0x44403800};
@@ -744,6 +783,7 @@ private:
   static constexpr auto ModeHasScales = Collective::ModeHasScales;
   static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
   static constexpr auto UseFP4ToBF16LookupTable = Collective::UseFP4ToBF16LookupTable;
+  static constexpr auto UseFP4ToFP8LookupTable = Collective::UseFP4ToFP8LookupTable;
   static constexpr auto UseInt4ToFP8LookupTable = Collective::UseInt4ToFP8LookupTable;
 
 public:
@@ -1045,6 +1085,32 @@ public:
     dst_ = psx_cvt_lut_prmt_int4x8_to_fp8x8(src_);
   }
 
+  template <class EngineIn,
+            class LayoutIn,
+            class EngineOut,
+            class LayoutOut>
+  CUTLASS_DEVICE
+  static void fp4tofp8_lookup_table_convert( // Accept mutable temporaries
+    Tensor<EngineIn, LayoutIn>       const& src,
+    Tensor<EngineOut, LayoutOut>         && dst) {
+    fp4tofp8_lookup_table_convert(src, dst);
+  }
+
+  template <class EngineIn,
+            class LayoutIn,
+            class EngineOut,
+            class LayoutOut>
+  CUTLASS_DEVICE
+  static void fp4tofp8_lookup_table_convert(
+    Tensor<EngineIn, LayoutIn>       const& src,
+    Tensor<EngineOut, LayoutOut>          & dst) {
+
+    auto&& src_ = cute::recast<__nv_fp4x8_storage_t>(src)(0);
+    auto&& dst_ = cute::recast<__nv_fp8x8_storage_t>(dst)(0);
+
+    dst_ = psx_cvt_lut_prmt_fp4x8_to_fp8x8(src_);
+  }
+
   /// Utilities to dequantize A.
   template <class Layout>
   CUTLASS_DEVICE
@@ -1235,6 +1301,9 @@ public:
     for (int i = 0; i < size<1>(dst_vm); ++i) {
       if constexpr (UseFP4ToBF16LookupTable) {
         fp4tobf16_lookup_table_convert(src_vm(_, i), dst_vm(_, i));
+      }
+      else if constexpr (UseFP4ToFP8LookupTable) {
+        fp4tofp8_lookup_table_convert(src_vm(_, i), dst_vm(_, i));
       }
       else if constexpr (UseInt4ToFP8LookupTable) {
         int4tofp8_lookup_table_convert(src_vm(_, i), dst_vm(_, i));

@@ -275,6 +275,9 @@ public:
   static constexpr bool UseFP4ToBF16LookupTable = KernelConversionMode == ConversionMode::ConvertAndScale &&
                                                   cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
                                                   cute::is_same_v<ElementB, cutlass::bfloat16_t>;
+  static constexpr bool UseFP4ToFP8LookupTable = KernelConversionMode == ConversionMode::ConvertAndScale &&
+                                                 cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+                                                 cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
   static constexpr bool UseInt4ToFP8LookupTable = KernelConversionMode == ConversionMode::ConvertAndScale &&
                                                   cute::is_same_v<ElementA, cutlass::int4_t> &&
                                                   cute::is_same_v<ElementB, cutlass::float_e4m3_t>;

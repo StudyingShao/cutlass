@@ -116,6 +116,11 @@ typedef uint32_t            __nv_bf16x2_storage_t;
 typedef uint64_t            __nv_fp8x8_storage_t;
 typedef cutlass::uint128_t  __nv_bf16x8_storage_t;
 
+// FP4 E2M1 [0, 0.5, 1, 1.5] encoded as FP8 E4M3.
+__constant__ static uint32_t FP4_POS_E4M3s_REG1_TEST_[2] = {0x3C383000, 0x3C383000};
+// FP4 E2M1 [2, 3, 4, 6] encoded as FP8 E4M3.
+__constant__ static uint32_t FP4_POS_E4M3s_REG2_TEST_[2] = {0x4C484440, 0x4C484440};
+
 inline __device__ unsigned
 prmt(unsigned hi, unsigned lo, unsigned select_code)
 {
@@ -138,8 +143,9 @@ cvt_lut
     const unsigned index
 )
 {
-    const __nv_fp8x4_storage_t h4b_lut = 0x4C484440U; //7654
-    const __nv_fp8x4_storage_t l4b_lut = 0x3C383000U; //3210
+    auto lane_id = threadIdx.x & 0x1;
+    const __nv_fp8x4_storage_t h4b_lut = FP4_POS_E4M3s_REG2_TEST_[lane_id]; //7654
+    const __nv_fp8x4_storage_t l4b_lut = FP4_POS_E4M3s_REG1_TEST_[lane_id]; //3210
 
     __nv_fp8x4_storage_t lut_res = prmt(h4b_lut, l4b_lut, index);
 
@@ -161,8 +167,8 @@ psx_cvt_lut_prmt_fp4x8_to_fp8x8
     __nv_fp8x4_storage_t h4b_sign_fp8x4 = prmt(hb_sign_fp8x4, lb_sign_fp8x4, 0x7362U); //7362
     __nv_fp8x4_storage_t l4b_sign_fp8x4 = prmt(hb_sign_fp8x4, lb_sign_fp8x4, 0x5140U); //5140
 
-    unsigned h4b_em_fp4x4 = (fp4x8 & 0x77770000U) >> 16U;
-    unsigned l4b_em_fp4x4 = (fp4x8 & 0x00007777U);
+    unsigned l4b_em_fp4x4 = fp4x8 & 0x77777777U;
+    unsigned h4b_em_fp4x4 = l4b_em_fp4x4 >> 16U;
 
     __nv_fp8x4_storage_t h4b_em_fp8x4 = cvt_lut(h4b_em_fp4x4);
     __nv_fp8x4_storage_t l4b_em_fp8x4 = cvt_lut(l4b_em_fp4x4);
@@ -785,10 +791,10 @@ __global__ void interleave_fp4xbf16_Hopper_kernel_combine_triton(
 
 
 template<typename T>
-__global__ void interleave_int4xfp8_Hopper_kernel(
-    T *ptr_4b, 
-    T *ptr_4b_interleaved, 
-    const int rows, 
+__global__ void interleave_w4a8_Hopper_kernel(
+    T *ptr_4b,
+    T *ptr_4b_interleaved,
+    const int rows,
     const int cols
 ) {
     uint16_t *uint16_ptr = reinterpret_cast<uint16_t *>(ptr_4b);
@@ -812,13 +818,13 @@ __global__ void interleave_int4xfp8_Hopper_kernel(
             int src_id_a = row_id * cols / 4 + col_id;
             int src_id_b = (row_id + 8) * cols / 4 + col_id;
             
-            uint16_t fp4x2_a = uint16_ptr[src_id_a];
-            uint16_t fp4x2_b = uint16_ptr[src_id_b];
+            uint16_t packed_4b_a = uint16_ptr[src_id_a];
+            uint16_t packed_4b_b = uint16_ptr[src_id_b];
 
             int dst_id = dst_row_id * cols / 4 + dst_col_id;
 
-            uint16_interleaved_ptr[dst_id] = fp4x2_a;
-            uint16_interleaved_ptr[dst_id + 1] = fp4x2_b;
+            uint16_interleaved_ptr[dst_id] = packed_4b_a;
+            uint16_interleaved_ptr[dst_id + 1] = packed_4b_b;
         }
     }
 }
@@ -859,15 +865,15 @@ void interleave_fp4xbf16_Hopper(
 
 
 template<typename T>
-void interleave_int4xfp8_Hopper(
-    T *int4_ptr, 
-    T *int4_interleaved_ptr,
-    const int rows, 
+void interleave_w4a8_Hopper(
+    T *ptr_4b,
+    T *ptr_4b_interleaved,
+    const int rows,
     const int cols
 ) {
     // row-major input
     dim3 block(16, 32);
-    interleave_int4xfp8_Hopper_kernel<<<1024, block>>>(int4_ptr, int4_interleaved_ptr, rows, cols);
+    interleave_w4a8_Hopper_kernel<<<1024, block>>>(ptr_4b, ptr_4b_interleaved, rows, cols);
 }
 
 
@@ -898,7 +904,7 @@ void interleave_w4a16_Hopper_test()
 
     // interleave_fp4_Hopper(d_a, d_a_interleaved, rows, cols);
     // interleave_fp4xbf16_Hopper(d_a, d_a_interleaved, rows, cols);
-    interleave_int4xfp8_Hopper(d_a, d_a_interleaved, rows, cols);
+    interleave_w4a8_Hopper(d_a, d_a_interleaved, rows, cols);
 
     cudaMemcpy(a_interleaved, d_a_interleaved, rows * cols * sizeof(T), cudaMemcpyDeviceToHost);
     
@@ -1119,4 +1125,3 @@ void UE8M0_FP32_test() {
         // printFloatBits(fp32_a[i]);
     }
 }
-
