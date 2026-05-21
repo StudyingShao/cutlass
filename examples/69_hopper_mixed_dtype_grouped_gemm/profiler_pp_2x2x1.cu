@@ -12,7 +12,11 @@ void profile_pp_2x2x1(Options& options, std::vector<MixedDtypeResult>& results, 
     capture_results<Schedule, Cluster, Shape< _64, _16, cute::Int<TileShapeK>>>(options, results, configs, PX + " Shape< _64, _16, " + K + ">");
     capture_results<Schedule, Cluster, Shape< _64, _32, cute::Int<TileShapeK>>>(options, results, configs, PX + " Shape< _64, _32, " + K + ">");
     capture_results<Schedule, Cluster, Shape< _64, _64, cute::Int<TileShapeK>>>(options, results, configs, PX + " Shape< _64, _64, " + K + ">");
-    capture_results<Schedule, Cluster, Shape< _64,_128, cute::Int<TileShapeK>>>(options, results, configs, PX + " Shape< _64,_128, " + K + ">");
+    if constexpr (!(TileShapeK == 512 &&
+          cute::is_same_v<MmaType, cutlass::bfloat16_t> &&
+          cute::is_same_v<QuantType, cutlass::float_e2m1_t>)) {
+        capture_results<Schedule, Cluster, Shape< _64,_128, cute::Int<TileShapeK>>>(options, results, configs, PX + " Shape< _64,_128, " + K + ">");
+    }
 
     // capture_results<Schedule, Cluster, Shape<_128, _16, cute::Int<TileShapeK>>>(options, results, configs, PX + " Shape<_128, _16, " + K + ">");
     // capture_results<Schedule, Cluster, Shape<_128, _32, cute::Int<TileShapeK>>>(options, results, configs, PX + " Shape<_128, _32, " + K + ">");

@@ -1,7 +1,8 @@
 #pragma once
 
-// Uncomment to enable the kernel config profiler (parallel compilation across 8 TUs).
-// Then just run: make -j 69_hopper_int4_fp8_grouped_gemm
+// Dedicated CMake targets enable the kernel config profiler across 8 TUs, e.g.
+// 69_hopper_int4_fp8_grouped_gemm_k512.
+// Keep this local toggle for ad-hoc builds only.
 // #define PROFILE
 
 /***************************************************************************************************
@@ -64,10 +65,34 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
 // using ElementScale = cutlass::float_ue8m0_t;
 // inline constexpr int TileShapeM = 128;
 // inline constexpr int TileShapeN = 32;
-// inline constexpr int TileShapeK = 128; // 128 only
+// inline constexpr int TileShapeK = 8192 / TileShapeN;
 
 //--------------------------------------------------------------------------------------------
 
+#ifndef CUTLASS_MIXED_GEMM_TILE_SHAPE_K
+#define CUTLASS_MIXED_GEMM_TILE_SHAPE_K (8192 / TileShapeN)
+#endif
+
+#if defined(CUTLASS_MIXED_GEMM_MXFP4_BF16)
+using MmaType = cutlass::bfloat16_t;     // activations
+using QuantType = cutlass::float_e2m1_t; // weights
+#define GROUP_SIZE 32
+using ElementScale = cutlass::float_ue8m0_t;
+inline constexpr int TileShapeM = 128;
+inline constexpr int TileShapeN = 16;
+inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
+#elif defined(CUTLASS_MIXED_GEMM_MXFP4_FP8)
+// MXFP4 x FP8 experimental path.  This keeps the same MXFP4 weight semantics
+// as the MXFP4 x BF16 path: e2m1 payload, UE8M0 block scale, group size 32.
+// The offline weight layout still follows the W4A8 INT4xFP8 path.
+using MmaType = cutlass::float_e4m3_t;      // activations
+using QuantType = cutlass::float_e2m1_t;    // weights
+#define GROUP_SIZE 32
+using ElementScale = cutlass::float_ue8m0_t;
+inline constexpr int TileShapeM = 128;
+inline constexpr int TileShapeN = 16;
+inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
+#else
 // INT4 x FP8
 using MmaType = cutlass::float_e4m3_t;      // activations
 using QuantType = cutlass::int4b_t;         // weights
@@ -75,7 +100,8 @@ using QuantType = cutlass::int4b_t;         // weights
 using ElementScale = cutlass::bfloat16_t;
 inline constexpr int TileShapeM = 128;
 inline constexpr int TileShapeN = 16;
-inline constexpr int TileShapeK = 8192 / TileShapeN;
+inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
+#endif
 
 //--------------------------------------------------------------------------------------------
 
