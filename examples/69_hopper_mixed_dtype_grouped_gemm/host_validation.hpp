@@ -257,14 +257,19 @@ __global__ void compare_device(
 template <
     typename ElementA,
     typename ElementB,
-    typename ElementScalePacked,
+    typename ElementWeightScalePacked,
+    typename ElementActivationScalePacked,
     typename ElementD
 >
 __device__ void single_gemm_varify(
   int bid, int tid,
   int block_tile_k, int group_size,
   int M, int N, int K,
-  ElementA *A_ptr, ElementB *B_ptr, ElementScalePacked *scale_ptr, ElementD *D_ptr) {
+  ElementA *A_ptr,
+  ElementB *B_ptr,
+  ElementWeightScalePacked *weight_scale_ptr,
+  ElementActivationScalePacked *activation_scale_ptr,
+  ElementD *D_ptr) {
 
   float lut[16];
 
@@ -291,7 +296,6 @@ __device__ void single_gemm_varify(
 
             ElementA *local_A_ptr = A_ptr + m * K + k;
             uint8_t *local_B_ptr = reinterpret_cast<uint8_t *>(B_ptr) + n * K / 2 + k / 2;
-            ElementScalePacked *local_scale_ptr = scale_ptr + (k / block_tile_k) * N + n;
 
             float elem_A_0 = local_A_ptr[0];
             float elem_A_1 = local_A_ptr[1];
@@ -302,8 +306,18 @@ __device__ void single_gemm_varify(
             float elem_B_low = lut[elem_B_low_];
             float elem_B_high = lut[elem_B_high_];
 
+            ElementWeightScalePacked *local_weight_scale_ptr =
+                weight_scale_ptr + (k / block_tile_k) * N + n;
             int scale_idx = (k % block_tile_k) / group_size;
-            float scale = static_cast<float>((*local_scale_ptr)[scale_idx]);
+            float scale = static_cast<float>((*local_weight_scale_ptr)[scale_idx]);
+
+            if constexpr (ScaleAppliesToActivation) {
+              int scale_tile = k / block_tile_k;
+              int scale_m_padded = ((M + TileShapeN - 1) / TileShapeN) * TileShapeN;
+              ElementActivationScalePacked *local_activation_scale_ptr =
+                  activation_scale_ptr + scale_tile * scale_m_padded + m;
+              scale *= static_cast<float>((*local_activation_scale_ptr)[scale_idx]);
+            }
 
             accum += elem_A_0 * elem_B_low * scale + elem_A_1 * elem_B_high * scale;
 
@@ -330,7 +344,8 @@ template <
     typename ProblemSizes,
     typename ElementA, // fp8
     typename ElementB, // int4
-    typename ElementScalePacked,
+    typename ElementWeightScalePacked,
+    typename ElementActivationScalePacked,
     typename ElementD,
     typename StrideA,
     typename StrideB
@@ -338,7 +353,11 @@ template <
 __global__ void groupwise_verify_kernel(
     ProblemSizes problem_sizes,
     int group_num,
-    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementD *D,
+    ElementA *A,
+    ElementB *B,
+    ElementWeightScalePacked *weight_scale,
+    ElementActivationScalePacked *activation_scale,
+    ElementD *D,
     int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
@@ -371,27 +390,32 @@ __global__ void groupwise_verify_kernel(
 
     ElementA *A_ptr = A;
     ElementB *B_ptr = B;
-    ElementScalePacked *scale_ptr = scale;
+    ElementWeightScalePacked *weight_scale_ptr = weight_scale;
+    ElementActivationScalePacked *activation_scale_ptr = activation_scale;
     ElementD *D_ptr = D;
 
     int bid = blockIdx.x;
     int tid = threadIdx.x;
 
     for (int group_id = 0; group_id < group_num; group_id++) {
-        int M = get<0>(problem_sizes[group_id]);
-        int N = get<1>(problem_sizes[group_id]);
+        int N = get<0>(problem_sizes[group_id]);
+        int M = get<1>(problem_sizes[group_id]);
         int K = get<2>(problem_sizes[group_id]);
 
         single_gemm_varify(
           bid, tid,
           block_tile_k, group_size,
           M, N, K,
-          A_ptr, B_ptr, scale_ptr, D_ptr
+          A_ptr, B_ptr, weight_scale_ptr, activation_scale_ptr, D_ptr
         );
 
         A_ptr += M * K;
         B_ptr += N * K / 2;
-        scale_ptr += N * K / block_tile_k;
+        weight_scale_ptr += N * K / block_tile_k;
+        if constexpr (ScaleAppliesToActivation) {
+          int scale_m_padded = ((M + TileShapeN - 1) / TileShapeN) * TileShapeN;
+          activation_scale_ptr += scale_m_padded * K / block_tile_k;
+        }
         D_ptr += M * N;
     }
 }
@@ -401,7 +425,8 @@ template <
     typename ProblemSizes,
     typename ElementA,
     typename ElementB,
-    typename ElementScalePacked,
+    typename ElementWeightScalePacked,
+    typename ElementActivationScalePacked,
     typename ElementD,
     typename StrideA,
     typename StrideB
@@ -409,14 +434,18 @@ template <
 void groupwise_verify(
     ProblemSizes problem_sizes,
     int group_num,
-    ElementA *A, ElementB *B, ElementScalePacked *scale, ElementD *D,
+    ElementA *A,
+    ElementB *B,
+    ElementWeightScalePacked *weight_scale,
+    ElementActivationScalePacked *activation_scale,
+    ElementD *D,
     int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
     groupwise_verify_kernel<<<1024, 1024>>>(
         problem_sizes, 
         group_num, 
-        A, B, scale, D,
+        A, B, weight_scale, activation_scale, D,
         block_tile_k, group_size,
         stride_A, stride_B);
     cudaDeviceSynchronize();

@@ -92,6 +92,16 @@ using ElementScale = cutlass::float_ue8m0_t;
 inline constexpr int TileShapeM = 128;
 inline constexpr int TileShapeN = 16;
 inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
+#elif defined(CUTLASS_MIXED_GEMM_MXFP4_MXFP8)
+// MXFP4 x MXFP8 keeps the activation payload as plain FP8 and reads the
+// activation UE8M0 scale from its original M x K/32, K-contiguous layout.
+using MmaType = cutlass::float_e4m3_t;      // activation payload
+using QuantType = cutlass::float_e2m1_t;    // weights
+#define GROUP_SIZE 32
+using ElementScale = cutlass::float_ue8m0_t;
+inline constexpr int TileShapeM = 128;
+inline constexpr int TileShapeN = 16;
+inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 #else
 // INT4 x FP8
 using MmaType = cutlass::float_e4m3_t;      // activations
@@ -105,8 +115,16 @@ inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 
 //--------------------------------------------------------------------------------------------
 
-// ElementScalePacked maximum 8xfp8 -> 64 bits
+// Weight scales are the normal mixed-input scale attached to the 4-bit weight operand.
 using ElementScalePacked = cutlass::Array<ElementScale, TileShapeK / GROUP_SIZE>;
+inline constexpr bool ScaleAppliesToActivation =
+#if defined(CUTLASS_MIXED_GEMM_MXFP4_MXFP8)
+    true;
+#else
+    false;
+#endif
+using ElementActivationScale = cutlass::float_ue8m0_t;
+using ElementActivationScalePacked = cutlass::Array<ElementActivationScale, TileShapeK / GROUP_SIZE>;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Options struct (defined here so all part files share the same type)
@@ -298,21 +316,14 @@ public:
 /// Extern declarations — defined in 69_hopper_int4_fp8_grouped_gemm.cu
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-extern std::vector<int64_t> offset_A;
-extern std::vector<int64_t> offset_B;
-extern std::vector<int64_t> offset_C;
-extern std::vector<int64_t> offset_D;
-extern std::vector<int64_t> offset_scale;
-extern std::vector<int64_t> offset_zero;
-
 extern std::vector<StrideA>     stride_A_host;
 extern std::vector<StrideB>     stride_B_host;
 extern std::vector<StrideC>     stride_C_host;
 extern std::vector<StrideD>     stride_D_host;
 extern std::vector<StrideC_ref> stride_C_host_ref;
 extern std::vector<StrideD_ref> stride_D_host_ref;
-extern std::vector<StrideS>     stride_S_host;
-extern std::vector<StrideS_ref> stride_S_host_ref;
+extern std::vector<StrideS>     stride_weight_scale_host;
+extern std::vector<StrideS>     stride_activation_scale_host;
 
 extern std::vector<ElementAccumulator> alpha_host;
 extern std::vector<ElementAccumulator> beta_host;
@@ -321,21 +332,26 @@ extern uint64_t seed;
 extern bool setup;
 
 extern cutlass::DeviceAllocation<typename ProblemShape::UnderlyingProblemShape> problem_sizes;
-extern cutlass::DeviceAllocation<MmaType>           block_A;
-extern cutlass::DeviceAllocation<QuantType>         block_B;
-extern cutlass::DeviceAllocation<QuantType>         block_B_interleaved;
-extern cutlass::DeviceAllocation<ElementScale>      block_scale;
-extern cutlass::DeviceAllocation<ElementScalePacked> block_scale_packed;
-extern cutlass::DeviceAllocation<ElementZero>       block_zero;
-extern cutlass::DeviceAllocation<ElementC>          block_C;
+
+extern cutlass::DeviceAllocation<MmaType>                                               block_A;
+extern cutlass::DeviceAllocation<QuantType>                                             block_B;
+extern cutlass::DeviceAllocation<QuantType>                                             block_B_interleaved;
+extern cutlass::DeviceAllocation<ElementScale>                                          block_weight_scale;
+extern cutlass::DeviceAllocation<ElementScalePacked>                                    block_weight_scale_packed;
+extern cutlass::DeviceAllocation<ElementActivationScale>                                block_activation_scale;
+extern cutlass::DeviceAllocation<ElementActivationScalePacked>                          block_activation_scale_packed;
+extern cutlass::DeviceAllocation<ElementZero>                                           block_zero;
+extern cutlass::DeviceAllocation<ElementC>                                              block_C;
 extern cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput> block_D;
 extern cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput> block_ref_D;
 
-extern cutlass::DeviceAllocation<const MmaType *>           ptr_A;
-extern cutlass::DeviceAllocation<const QuantType *>         ptr_B;
-extern cutlass::DeviceAllocation<const ElementScalePacked *> ptr_scale_packed;
-extern cutlass::DeviceAllocation<const ElementZero *>        ptr_zero;
-extern cutlass::DeviceAllocation<const ElementC *>           ptr_C;
+extern cutlass::DeviceAllocation<const MmaType *>                    ptr_A;
+extern cutlass::DeviceAllocation<const QuantType *>                  ptr_B;
+extern cutlass::DeviceAllocation<const ElementActivationScale *>     ptr_activation_scale;
+extern cutlass::DeviceAllocation<ElementActivationScalePacked *>     ptr_activation_scale_packed;
+extern cutlass::DeviceAllocation<const ElementScalePacked *>         ptr_weight_scale_packed;
+extern cutlass::DeviceAllocation<const ElementZero *>                ptr_zero;
+extern cutlass::DeviceAllocation<const ElementC *>                   ptr_C;
 extern cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput *> ptr_D;
 
 extern cutlass::DeviceAllocation<StrideA>     stride_A;
@@ -344,8 +360,8 @@ extern cutlass::DeviceAllocation<StrideC>     stride_C;
 extern cutlass::DeviceAllocation<StrideD>     stride_D;
 extern cutlass::DeviceAllocation<StrideC_ref> stride_C_ref;
 extern cutlass::DeviceAllocation<StrideD_ref> stride_D_ref;
-extern cutlass::DeviceAllocation<StrideS_ref> stride_S_ref;
-extern cutlass::DeviceAllocation<StrideS>     stride_S;
+extern cutlass::DeviceAllocation<StrideS>     stride_weight_scale;
+extern cutlass::DeviceAllocation<StrideS>     stride_activation_scale;
 
 extern cutlass::DeviceAllocation<ElementAccumulator*> alpha_device;
 extern cutlass::DeviceAllocation<ElementAccumulator*> beta_device;
@@ -359,6 +375,7 @@ extern cutlass::DeviceAllocation<ElementAccumulator>  block_beta;
 void allocate(Options const& options);
 void initialize(Options& options);
 bool verify(Options const& options);
+void prepare_activation_scale_tensor(Options const& options);
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Template implementations (must live in header for cross-TU instantiation)
@@ -397,10 +414,20 @@ typename Gemm::Arguments args_from_options(Options const& options, bool host_pro
     fusion_args.dBeta  = {cute::_0{}, cute::_0{}, 1};
   }
 
+  decltype(arguments.mainloop) mainloop_args{
+    ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_weight_scale_packed.get(), stride_weight_scale.get(), GROUP_SIZE
+  };
+  if constexpr (ScaleAppliesToActivation) {
+    // The repack kernel writes through this pointer array; the GEMM mainloop only reads it.
+    mainloop_args.ptr_ActivationScale =
+        const_cast<decltype(mainloop_args.ptr_ActivationScale)>(ptr_activation_scale_packed.get());
+    mainloop_args.dActivationScale = stride_activation_scale.get();
+  }
+
   arguments = Args {
     cutlass::gemm::GemmUniversalMode::kGrouped,
     {options.groups, problem_sizes.get(), nullptr},
-    {ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_scale_packed.get(), stride_S.get(), GROUP_SIZE},
+    mainloop_args,
     {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
     hw_info
   };
@@ -409,6 +436,86 @@ typename Gemm::Arguments args_from_options(Options const& options, bool host_pro
   arguments.scheduler.raster_order     = RasterOrderOptions::Heuristic;
 
   return arguments;
+}
+
+template <class Gemm>
+void profile_grouped_mixed_dtype(
+    Gemm& gemm,
+    const Options& options,
+    MixedDtypeResult& result,
+    const std::vector<ElementAccumulator>& alpha_host,
+    const std::vector<ElementAccumulator>& beta_host) {
+
+  if (options.iterations <= 0) return;
+
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  std::vector<float> runtimes;
+  runtimes.reserve(options.iterations);
+
+  for (int iter = 0; iter < options.warmup + options.iterations; ++iter) {
+    cudaEventRecord(start);
+    if constexpr (ScaleAppliesToActivation) {
+      prepare_activation_scale_tensor(options);
+    }
+    result.status = gemm.run();
+    if (result.status != cutlass::Status::kSuccess) {
+      result.passed = false;
+      cudaEventDestroy(start);
+      cudaEventDestroy(stop);
+      return;
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    if (iter >= options.warmup) {
+      float milliseconds = 0;
+      cudaEventElapsedTime(&milliseconds, start, stop);
+      runtimes.push_back(milliseconds);
+    }
+  }
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+
+  if (runtimes.empty()) return;
+  result.avg_runtime_ms = std::accumulate(runtimes.begin(), runtimes.end(), 0.0f) / runtimes.size();
+  result.gflops = options.gflops(result.avg_runtime_ms / 1000.0);
+
+  if (!options.explore) {
+    int64_t total_m = 0;
+    int min_m = std::numeric_limits<int>::max();
+    int max_m = 0;
+    int zero_m_groups = 0;
+    for (int i = 0; i < options.groups; ++i) {
+      int m = cute::get<0>(options.problem_sizes_host[i]);
+      total_m += m;
+      min_m = std::min(min_m, m);
+      max_m = std::max(max_m, m);
+      if (m == 0) ++zero_m_groups;
+    }
+    const auto fixed_n = cute::get<1>(options.problem_sizes_host[0]);
+    const auto fixed_k = cute::get<2>(options.problem_sizes_host[0]);
+
+    std::cout << "  Problem Sizes G x (M, N, K), Alpha, Beta\n";
+    if (min_m == max_m) {
+      std::cout << "    " << options.groups << " x " << options.problem_sizes_host[0]
+                << ", " << alpha_host[0] << ", " << beta_host[0] << '\n';
+    }
+    else {
+      std::cout << "    " << options.groups << " x (M_var, " << fixed_n << ", " << fixed_k << ")"
+                << ", " << alpha_host[0] << ", " << beta_host[0] << '\n'
+                << "    M: total=" << total_m
+                << " avg=" << (total_m / std::max(1, options.groups))
+                << " min=" << min_m
+                << " max=" << max_m
+                << " zero_groups=" << zero_m_groups << '\n';
+    }
+    std::cout << "  Avg runtime : " << result.avg_runtime_ms * 1000.0 << " us\n"
+              << "  GFLOPS      : " << result.gflops << '\n';
+  }
 }
 
 template <typename Gemm>
@@ -449,7 +556,7 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
   }
 
   result.passed = verify(options);
-  grouped_mixed_dtype_profiling(gemm, options, result, alpha_host, beta_host);
+  profile_grouped_mixed_dtype(gemm, options, result, alpha_host, beta_host);
 
   return result;
 }

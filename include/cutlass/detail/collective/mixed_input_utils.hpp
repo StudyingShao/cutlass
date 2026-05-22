@@ -772,6 +772,7 @@ private:
   using SmemLayoutA = typename Collective::SmemLayoutA;
   using SmemLayoutB = typename Collective::SmemLayoutB;
   using SmemLayoutScale = typename Collective::SmemLayoutScale;
+  using SmemLayoutActivationScale = typename Collective::SmemLayoutActivationScale;
   using SwappedElementA = typename Collective::SwappedElementA;
   using SwappedElementB = typename Collective::SwappedElementB;
   using RealSwappedElementA = typename Collective::RealSwappedElementA;
@@ -785,6 +786,7 @@ private:
   static constexpr auto UseFP4ToBF16LookupTable = Collective::UseFP4ToBF16LookupTable;
   static constexpr auto UseFP4ToFP8LookupTable = Collective::UseFP4ToFP8LookupTable;
   static constexpr auto UseInt4ToFP8LookupTable = Collective::UseInt4ToFP8LookupTable;
+  static constexpr auto HasActivationScale = Collective::HasActivationScale;
 
 public:
   static constexpr auto
@@ -834,7 +836,15 @@ public:
       constexpr uint32_t scale_tx_bytes = cutlass::bits_to_bytes(size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) * static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
       static_assert(scale_tx_bytes % 128 == 0, "Each scale stage must be 128B aligned."); // required by TMA
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return scale_tx_bytes;
+        if constexpr (HasActivationScale) {
+          constexpr uint32_t activation_scale_tx_bytes = cutlass::bits_to_bytes(
+              size<0>(SmemLayoutActivationScale{}) * size<1>(SmemLayoutActivationScale{}) *
+              static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
+          return scale_tx_bytes + activation_scale_tx_bytes;
+        }
+        else {
+          return scale_tx_bytes;
+        }
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         // Scale and zero share smem layout
@@ -889,7 +899,6 @@ public:
       auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
       auto tCrS_copy_view    = cute::get<1>(tiled_copy_and_views);
       auto tCsS              = cute::get<0>(partitioned_mma_extra_info);
-
       copy(smem_tiled_copy_S, tCsS(_,_,k_block,read_stage), tCrS_copy_view(_,_,k_block));
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
         // Nothing extra to do

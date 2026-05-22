@@ -140,7 +140,18 @@ public:
   using InternalStrideA = cute::remove_pointer_t<StrideA>;
   using StrideB = StrideB_;
   using InternalStrideB = cute::remove_pointer_t<StrideB>;
-  
+
+  static constexpr bool IsMXFP4 = cute::is_same_v<ElementA, cutlass::float_e2m1_t>;
+  static constexpr bool HasActivationScale =
+#if defined(CUTLASS_MIXED_GEMM_MXFP4_MXFP8)
+      IsATransformed &&
+      cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+      cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
+#else
+      false;
+#endif
+  // The GEMM kernel consumes scales in Ktile-major, MN-contiguous form.  MXFP8
+  // activation scales are packed into this layout by a small setup kernel.
   using StrideScale = cute::Stride<cute::Int<1>, int64_t, int64_t>;
   using NonVoidStrideScale = cute::conditional_t<cute::is_void_v<StrideScale>, cute::Stride<_1, int64_t, int64_t>, StrideScale>;
 
@@ -154,10 +165,9 @@ public:
                  (cutlass::gemm::detail::is_k_major<StrideB>() || is_layout<StrideB>::value || is_layout<InternalStrideB>::value)), 
                 "The unscaled element must be 2 bytes OR both inputs must be K-major");
 
-  static_assert(cutlass::gemm::detail::is_mn_major<NonVoidStrideScale>(), 
-    "Scale must be MN major [Col Major if A is scaled, Row Major if B is scaled].");
-  
-  static constexpr bool IsMXFP4 = cute::is_same_v<ElementA, cutlass::float_e2m1_t>;
+  static_assert(cutlass::gemm::detail::is_mn_major<NonVoidStrideScale>(),
+    "Scale tensor consumed by the GEMM kernel must be MN major.");
+
   // Group size 128 for int4 weights
   // Group size 32 for mxfp4 weights
   static constexpr int ScalingGroupSize = IsMXFP4? 32 : 128;
@@ -211,6 +221,10 @@ public:
 
   static constexpr int NumProducerThreadEvents = 1;
 
+  static constexpr int NumScaleChunksPerTileK = size<2>(TileShape{}) / ScalingGroupSize;
+  static constexpr int ScaleNRawElementsPerStage = size<1>(TileShape{}) * NumScaleChunksPerTileK;
+  static constexpr int ScaleNElementsPerStage = size<1>(TileShape{});
+
   using SmemLayoutAtomScale = Layout<Shape<decltype(cute::shape<0>(SwappedSmemLayoutAtomA{})), cute::Int<1>>>;
   using ScaleTileShape = decltype(make_shape(shape<0>(TileShape{}), shape<1>(SmemLayoutAtomScale{})));
 
@@ -230,11 +244,19 @@ public:
   using SmemLayoutA = decltype(detail::get_smem_layout<DispatchPolicy::Stages>(SwappedSmemLayoutAtomA{}, select<0,2>(TileShape{}), InternalSwappedStrideA{}));
   using SmemLayoutB = decltype(detail::get_smem_layout<DispatchPolicy::Stages>(SwappedSmemLayoutAtomB{}, select<1,2>(TileShape{}), InternalSwappedStrideB{}));
   
-  // It is assumed that the scales and zero-points share the same smem layout
+  // It is assumed that weight scales and zero-points share the same smem layout.
   using SmemLayoutScale = decltype(tile_to_shape(
-    SmemLayoutAtomScale{}, 
-    make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<Stages>{}),
-    cute::conditional_t< ::cutlass::gemm::detail::is_major<0,NonVoidStrideScale>(), Step<_2,_1,_3>, Step<_1,_2,_3>>{}));
+      SmemLayoutAtomScale{},
+      make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<Stages>{}),
+      cute::conditional_t< ::cutlass::gemm::detail::is_major<0,NonVoidStrideScale>(), Step<_2,_1,_3>, Step<_1,_2,_3>>{}));
+  // MXFP8 activation scales are independent from MXFP4 weight scales and are
+  // packed by setup into Ktile-major arrays shaped as (BLK_N, 1, PIPE).
+  using SmemLayoutActivationScale = cute::conditional_t<
+      HasActivationScale,
+      Layout<
+          Shape<decltype(shape<1>(TileShape{})), cute::Int<1>, Int<Stages>>,
+          Stride<_1, Int<ScaleNElementsPerStage>, Int<ScaleNElementsPerStage>>>,
+      Layout<Shape<cute::Int<1>, cute::Int<1>, Int<Stages>>>>;
 
   static_assert(DispatchPolicy::Stages >= 2, "Specialization requires Stages set to value 2 or more.");
   static_assert(not cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value &&
@@ -290,10 +312,12 @@ public:
   struct SharedStorage {
     static constexpr int scale_elements = Utils::elements_per_smem_scale();
     static constexpr int zero_elements = Utils::elements_per_smem_zero();
+    static constexpr int activation_scale_elements = HasActivationScale ? cute::cosize_v<SmemLayoutActivationScale> : 0;
     struct TensorStorage {
       CUTE_ALIGNAS(SmemAlignmentA) cute::ArrayEngine<RealSwappedElementA, cute::cosize_v<SmemLayoutA>> smem_A;
       CUTE_ALIGNAS(SmemAlignmentB) cute::ArrayEngine<typename TiledMma::ValTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
       cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
+      cute::ArrayEngine<NonVoidElementScale, activation_scale_elements> smem_activation_scale;
       cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
     } tensors;
 
@@ -322,6 +346,8 @@ public:
     NonVoidStrideScale const* dS{};
     int chunk_size = 0;
     ElementZero const** ptr_Z = nullptr;
+    ElementScale const** ptr_ActivationScale = nullptr;
+    NonVoidStrideScale const* dActivationScale{};
   };
 
   // Device side kernel params
@@ -372,6 +398,8 @@ public:
     SwappedStrideB ptr_dB;
     NonVoidElementScale const** ptr_S;
     NonVoidStrideScale const* dS;
+    NonVoidElementScale const** ptr_ActivationScale;
+    NonVoidStrideScale const* dActivationScale;
     NonVoidElementZero const** ptr_Z;
     int64_t scale_k;
     int chunk_size;
@@ -506,6 +534,8 @@ public:
           ptr_dB,
           reinterpret_cast<NonVoidElementScale const**>(args.ptr_S),
           args.dS,
+          reinterpret_cast<NonVoidElementScale const**>(args.ptr_ActivationScale),
+          args.dActivationScale,
           reinterpret_cast<NonVoidElementZero const**>(args.ptr_Z),
           scale_k,
           chunk_size,
@@ -590,6 +620,9 @@ public:
           implementable = implementable && (args.chunk_size == K || ((args.chunk_size % size<2>(TileShape{})) == 0));
           implementable = implementable && args.chunk_size != 0;
           implementable = implementable && (args.ptr_S != nullptr);
+          if constexpr (HasActivationScale) {
+            implementable = implementable && (args.ptr_ActivationScale != nullptr);
+          }
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
             implementable = implementable && (args.ptr_Z == nullptr);
           }
@@ -652,8 +685,15 @@ public:
     } 
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       // Scale ptr/stride placeholders — set correctly by tensors_perform_update before first load()
-      return cute::make_tuple(gA_mkl, gB_nkl,
-          static_cast<NonVoidElementScale const*>(nullptr), int64_t(0));
+      if constexpr (HasActivationScale) {
+        return cute::make_tuple(gA_mkl, gB_nkl,
+            static_cast<NonVoidElementScale const*>(nullptr), int64_t(0),
+            static_cast<NonVoidElementScale const*>(nullptr), int64_t(0));
+      }
+      else {
+        return cute::make_tuple(gA_mkl, gB_nkl,
+            static_cast<NonVoidElementScale const*>(nullptr), int64_t(0));
+      }
     }
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       return cute::make_tuple(gA_mkl, gB_nkl,
@@ -690,7 +730,12 @@ public:
       static_assert(sizeof... (Ts) == 2, "Direct convert needs two inputs");
     } 
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      static_assert(sizeof... (Ts) == 4, "Scaled convert needs four inputs (gA, gB, scale_ptr, stride_k)");
+      if constexpr (HasActivationScale) {
+        static_assert(sizeof... (Ts) == 6, "MXFP8 activation scale needs six inputs (gA, gB, weight_scale_ptr, weight_stride_k, act_scale_ptr, act_stride_k)");
+      }
+      else {
+        static_assert(sizeof... (Ts) == 4, "Scaled convert needs four inputs (gA, gB, scale_ptr, stride_k)");
+      }
     } 
     else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       static_assert(sizeof... (Ts) == 5, "Scaled+zero convert needs five inputs (gA, gB, scale_ptr, stride_k, zero_ptr)");
@@ -787,22 +832,39 @@ public:
         if constexpr (ModeHasScales) {
           auto scale_ptr = get<2>(load_inputs);
           auto scale_stride_k = get<3>(load_inputs);
-          const int scale_load_k = *k_tile_iter / 1;
+          const int scale_k_tile = *k_tile_iter;
           constexpr int BLK_M = size<0>(TileShape{});
           constexpr int scale_load_bytes = BLK_M * sizeof(NonVoidElementScale);
 
           auto* scale_gmem_addr = reinterpret_cast<void const*>(
-              scale_ptr + m_coord * BLK_M + scale_load_k * scale_stride_k);
+              scale_ptr + m_coord * BLK_M + scale_k_tile * scale_stride_k);
           auto* scale_smem_addr = static_cast<void*>(&sS(0, 0, write_stage));
           cute::SM90_BULK_COPY_G2S::copy(scale_gmem_addr,
               reinterpret_cast<uint64_t*>(tma_barrier), scale_smem_addr, scale_load_bytes);
+
+          if constexpr (HasActivationScale) {
+            Tensor sActS = make_tensor(
+                make_smem_ptr(shared_tensors.smem_activation_scale.begin()), SmemLayoutActivationScale{});
+            auto activation_scale_ptr = get<4>(load_inputs);
+            auto activation_scale_stride_k = get<5>(load_inputs);
+            constexpr int BLK_N = size<1>(TileShape{});
+            constexpr int activation_scale_load_bytes = BLK_N * sizeof(NonVoidElementScale);
+            const int tile_n_start = n_coord * BLK_N;
+
+            auto* activation_scale_gmem_addr = reinterpret_cast<void const*>(
+                activation_scale_ptr + tile_n_start + scale_k_tile * activation_scale_stride_k);
+            auto* activation_scale_smem_addr = static_cast<void*>(&sActS(0, 0, write_stage));
+            cute::SM90_BULK_COPY_G2S::copy(activation_scale_gmem_addr,
+                reinterpret_cast<uint64_t*>(tma_barrier), activation_scale_smem_addr,
+                activation_scale_load_bytes);
+          }
 
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
             auto zero_ptr = get<4>(load_inputs);
             constexpr int zero_load_bytes = BLK_M * sizeof(NonVoidElementZero);
 
             auto* zero_gmem_addr = reinterpret_cast<void const*>(
-                zero_ptr + m_coord * BLK_M + scale_load_k * scale_stride_k);
+                zero_ptr + m_coord * BLK_M + scale_k_tile * scale_stride_k);
             auto* zero_smem_addr = static_cast<void*>(&sZ(0, 0, write_stage));
             cute::SM90_BULK_COPY_G2S::copy(zero_gmem_addr,
                 reinterpret_cast<uint64_t*>(tma_barrier), zero_smem_addr, zero_load_bytes);
@@ -873,6 +935,62 @@ public:
 
             auto coord = make_coord(make_tuple(e, m, n), mma_m, 0);
             
+            if (is_first_accum) {
+              accum(coord) = intermediate(coord) * scale_val;
+            } else {
+              accum(coord) = fma_op(intermediate(coord), scale_val, accum(coord));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  template <class TiledMma, class TensorStorage, class ScaleTensor>
+  CUTLASS_DEVICE void
+  copy_activation_scale_for_chunk(
+      TiledMma const& tiled_mma,
+      int thread_idx,
+      TensorStorage& shared_tensors,
+      ScaleTensor& tCrScaleN,
+      int scale_idx,
+      int read_stage)
+  {
+    using ElementScaleN = typename NonVoidElementScale::Element;
+    auto scale_smem_ptr = make_smem_ptr(
+        reinterpret_cast<ElementScaleN *>(shared_tensors.smem_activation_scale.begin()) + scale_idx);
+    Tensor sScaleNViewAsC = make_tensor(
+        scale_smem_ptr,
+        Layout<
+            Shape<decltype(shape<0>(TileShape{})), decltype(shape<1>(TileShape{})), Int<DispatchPolicy::Stages>>,
+            Stride<_0, Int<NumScaleChunksPerTileK>, Int<ScaleNRawElementsPerStage>>>{});
+    Tensor tCsScaleNViewAsC = tiled_mma.get_slice(thread_idx).partition_C(sScaleNViewAsC);
+    copy(tCsScaleNViewAsC(_, _, _, read_stage), tCrScaleN);
+  }
+
+  template <class AccumTensor, class IntermTensor, class ScaleTensorM, class ScaleTensorN>
+  CUTLASS_DEVICE void
+  apply_groupwise_scale_mn(
+      AccumTensor& accum,
+      IntermTensor const& intermediate,
+      ScaleTensorM const& tCrScaleM,
+      ScaleTensorN const& tCrScaleN,
+      int scale_idx,
+      bool is_first_accum)
+  {
+    multiply_add<ElementAccumulator> fma_op;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < size<0, 1>(accum); m++) {
+        float scale_m = scale_convertor(tCrScaleM(make_coord(make_tuple(0, m, 0), mma_m, 0))[scale_idx]);
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < size<0, 2>(accum); n++) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int e = 0; e < size<0, 0>(accum); e++) {
+            auto coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+            float scale_val = scale_m * scale_convertor(tCrScaleN(coord));
             if (is_first_accum) {
               accum(coord) = intermediate(coord) * scale_val;
             } else {
@@ -966,6 +1084,41 @@ public:
     // Partition of thread -> shared and thread -> RF
     auto partitioned_extra_info = Utils::partition_extra_mma_info(mma_thread_slice, shared_tensors);
     auto copy_partitions_extra_info = Utils::retile_extra_mma_info(tiled_mma, partitioned_extra_info, warp_group_thread_idx);
+    auto tCrScaleN = [&] {
+      if constexpr (HasActivationScale) {
+        using ElementScaleN = typename ElementScale::Element;
+        Tensor sScaleNViewAsC = make_tensor(
+            make_smem_ptr(reinterpret_cast<ElementScaleN *>(shared_tensors.smem_activation_scale.begin())),
+            Layout<
+                Shape<decltype(shape<0>(TileShape{})), decltype(shape<1>(TileShape{})), Int<DispatchPolicy::Stages>>,
+                Stride<_0, Int<NumScaleChunksPerTileK>, Int<ScaleNRawElementsPerStage>>>{});
+        Tensor tCsScaleNViewAsC = tiled_mma.get_slice(thread_idx).partition_C(sScaleNViewAsC);
+        return make_tensor_like<ElementScaleN>(tCsScaleNViewAsC(_, _, _, Int<0>{}));
+      }
+      else {
+        return make_tensor<ElementScale>(make_shape(Int<1>{}));
+      }
+    }();
+    auto copy_scale_for_tile = [&](int read_stage) {
+      Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+    };
+    cute::array<decltype(tCrScaleN), 2> tCrScaleN_pipe;
+    auto copy_activation_scale_for_pipeline = [&](int scale_idx, int read_stage) {
+      if constexpr (HasActivationScale) {
+        copy_activation_scale_for_chunk(
+            tiled_mma, thread_idx, shared_tensors, tCrScaleN_pipe[scale_idx & 1], scale_idx, read_stage);
+      }
+    };
+    auto scale_intermediate = [&](auto const& intermediate, int scale_idx, bool is_first_accum) {
+      if constexpr (HasActivationScale) {
+        apply_groupwise_scale_mn(accum, intermediate,
+            cute::get<1>(partitioned_extra_info), tCrScaleN_pipe[scale_idx & 1], scale_idx, is_first_accum);
+      }
+      else {
+        apply_groupwise_scale(accum, intermediate,
+            cute::get<1>(partitioned_extra_info), scale_idx, is_first_accum);
+      }
+    };
 
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));                                            // CPY_M
     CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));                                            // CPY_K
@@ -1048,7 +1201,10 @@ public:
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
           if (k_block == 0) {
-            Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+            copy_scale_for_tile(read_stage);
+          }
+          if (mma_id == 0) {
+            copy_activation_scale_for_pipeline(chunk_id, read_stage);
           }
 
           if (k_block < K_BLOCK_MAX - 2) {
@@ -1067,8 +1223,7 @@ public:
           int chunk_id_ = chunk_id - 1;
           warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-          apply_groupwise_scale(accum, intermediate_array[chunk_id_],
-              cute::get<1>(partitioned_extra_info), chunk_id_, chunk_id_ == 0);
+          scale_intermediate(intermediate_array[chunk_id_], chunk_id_, chunk_id_ == 0);
         }
 
       }
@@ -1078,8 +1233,7 @@ public:
       int chunk_id_ = NumChunksPerTileK - 1;
       warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-      apply_groupwise_scale(accum, intermediate_array[chunk_id_],
-          cute::get<1>(partitioned_extra_info), chunk_id_, false);
+      scale_intermediate(intermediate_array[chunk_id_], chunk_id_, false);
 
       --k_tile_count;
       if (k_tile_count > 0) {
@@ -1129,7 +1283,10 @@ public:
 
           if (k_block == 0) {
             barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
-            Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+            copy_scale_for_tile(read_stage);
+          }
+          if (mma_id == 0) {
+            copy_activation_scale_for_pipeline(chunk_id, read_stage);
           }
 
           if (k_block == K_BLOCK_MAX - 1) {
@@ -1144,8 +1301,7 @@ public:
 
             warpgroup_fence_operand(intermediate_array[chunk_id]);
 
-            apply_groupwise_scale(accum, intermediate_array[chunk_id],
-                cute::get<1>(partitioned_extra_info), chunk_id, false);
+            scale_intermediate(intermediate_array[chunk_id], chunk_id, false);
 
             Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
           }
@@ -1165,8 +1321,7 @@ public:
           int chunk_id_ = chunk_id - 1;          
           warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-          apply_groupwise_scale(accum, intermediate_array[chunk_id_],
-              cute::get<1>(partitioned_extra_info), chunk_id_, false);
+          scale_intermediate(intermediate_array[chunk_id_], chunk_id_, false);
         }
 
       }
@@ -1192,7 +1347,10 @@ public:
         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
         if (k_block == 0) {
-          Utils::copy_tensors_SFA(partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
+          copy_scale_for_tile(read_stage);
+        }
+        if (k_block % NumMMAsPerChunk == 0) {
+          copy_activation_scale_for_pipeline(k_block / NumMMAsPerChunk, read_stage);
         }
 
         if (k_block == K_BLOCK_MAX - 1) {
@@ -1215,8 +1373,7 @@ public:
           warpgroup_wait<0>();
           warpgroup_fence_operand(intermediate);
 
-          apply_groupwise_scale(accum, intermediate,
-              cute::get<1>(partitioned_extra_info), k_block / NumMMAsPerChunk, false);
+          scale_intermediate(intermediate, k_block / NumMMAsPerChunk, false);
         }
       }
     }
@@ -1463,8 +1620,23 @@ public:
         new_stride_k = get<1>(mainloop_params.dS[0]);
       }
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(get<0>(input_tensors), get<1>(input_tensors),
-                                new_scale_ptr, new_stride_k);
+        if constexpr (HasActivationScale) {
+          auto new_activation_scale_ptr = mainloop_params.ptr_ActivationScale[next_batch];
+          int64_t new_activation_scale_stride_k;
+          if constexpr (IsGroupedGemmKernel) {
+            new_activation_scale_stride_k = get<1>(mainloop_params.dActivationScale[next_batch]);
+          } else {
+            new_activation_scale_stride_k = get<1>(mainloop_params.dActivationScale[0]);
+          }
+          return cute::make_tuple(get<0>(input_tensors), get<1>(input_tensors),
+                                  new_scale_ptr, new_stride_k,
+                                  new_activation_scale_ptr,
+                                  new_activation_scale_stride_k);
+        }
+        else {
+          return cute::make_tuple(get<0>(input_tensors), get<1>(input_tensors),
+                                  new_scale_ptr, new_stride_k);
+        }
       }
       else {
         auto new_zero_ptr = mainloop_params.ptr_Z[next_batch];

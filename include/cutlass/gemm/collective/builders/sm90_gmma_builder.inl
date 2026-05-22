@@ -136,9 +136,20 @@ compute_stage_count_or_override_single_affine_transformed_input(StageCountAutoCa
   constexpr auto s_bits = get_bits_for_possibly_void_element<ElementScale>();
   constexpr auto z_bits = get_bits_for_possibly_void_element<ElementZero>();
 
-  constexpr auto scale_bytes = cutlass::bits_to_bytes(s_bits * size<0>(TileShapeMNK{}) * scale_zero_k_tile);
+  constexpr bool has_activation_scale =
+#if defined(CUTLASS_MIXED_GEMM_MXFP4_MXFP8)
+      cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+      cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
+#else
+      false;
+#endif
+  constexpr int weight_scale_elements = size<0>(TileShapeMNK{}) * scale_zero_k_tile;
+  constexpr int activation_scale_elements = has_activation_scale ? size<1>(TileShapeMNK{}) : 0;
+  constexpr auto weight_scale_bytes = cutlass::bits_to_bytes(s_bits * weight_scale_elements);
+  constexpr auto activation_scale_bytes = cutlass::bits_to_bytes(s_bits * activation_scale_elements);
+  constexpr auto scale_bytes = weight_scale_bytes + activation_scale_bytes;
   constexpr auto zero_bytes  = cutlass::bits_to_bytes(z_bits * size<0>(TileShapeMNK{}) * scale_zero_k_tile);
-  static_assert(scale_bytes % 128 == 0, "Scale bytes must be a multiple of 128");
+  static_assert(weight_scale_bytes % 128 == 0, "Weight scale bytes must be a multiple of 128");
   static_assert(zero_bytes  % 128 == 0, "Zero bytes must be a multiple of 128");
 
   // When scales are void, s_bits will be 0 so no smem will be allocated for scales.

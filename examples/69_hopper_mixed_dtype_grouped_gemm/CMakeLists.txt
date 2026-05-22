@@ -102,35 +102,33 @@ set(CUTLASS_MIXED_GEMM_69_PROFILER_SOURCES
   profiler_coop_2x2x1.cu
 )
 
-# Kernel config profiler part files. Each is guarded by #ifdef PROFILE internally,
-# so they compile to empty TUs unless PROFILE is defined by the build.
-target_sources(69_hopper_int4_fp8_grouped_gemm PRIVATE
-  ${CUTLASS_MIXED_GEMM_69_PROFILER_SOURCES}
-)
+function(cutlass_mixed_gemm_add_69_run_target target_name)
+  cutlass_example_add_executable(
+    ${target_name}
+    69_hopper_int4_fp8_grouped_gemm.cu
+    TEST_COMMAND_OPTIONS
+    TEST_RANDOM
+    TEST_RANDOM_LARGE_GROUP
+    TEST_EPILOGUE
+    TEST_EPILOGUE_LARGE_GROUP
+    TEST_EPILOGUE_OP
+    TEST_EPILOGUE_OP_LARGE_GROUP
+    TEST_FIXED
+    TEST_FIXED_LARGE_GROUP
+    TEST_SMALL
+    TEST_SMALL_LARGE_GROUP
+    TEST_RANDOM_PERF
+    TEST_RANDOM_PERF_LARGE_GROUP
+    TEST_DIRECT_BATCHED
+    TEST_SCALE_PERCOL
+  )
+  foreach(extra_definition ${ARGN})
+    target_compile_definitions(${target_name} PRIVATE ${extra_definition})
+  endforeach()
+endfunction()
 
-cutlass_example_add_executable(
-  69_hopper_mxfp4_fp8_grouped_gemm
-  69_hopper_int4_fp8_grouped_gemm.cu
-  TEST_COMMAND_OPTIONS
-  TEST_RANDOM
-  TEST_RANDOM_LARGE_GROUP
-  TEST_EPILOGUE
-  TEST_EPILOGUE_LARGE_GROUP
-  TEST_EPILOGUE_OP
-  TEST_EPILOGUE_OP_LARGE_GROUP
-  TEST_FIXED
-  TEST_FIXED_LARGE_GROUP
-  TEST_SMALL
-  TEST_SMALL_LARGE_GROUP
-  TEST_RANDOM_PERF
-  TEST_RANDOM_PERF_LARGE_GROUP
-  TEST_DIRECT_BATCHED
-  TEST_SCALE_PERCOL
-)
-target_compile_definitions(69_hopper_mxfp4_fp8_grouped_gemm PRIVATE CUTLASS_MIXED_GEMM_MXFP4_FP8=1)
-target_sources(69_hopper_mxfp4_fp8_grouped_gemm PRIVATE
-  ${CUTLASS_MIXED_GEMM_69_PROFILER_SOURCES}
-)
+cutlass_mixed_gemm_add_69_run_target(69_hopper_mxfp4_fp8_grouped_gemm CUTLASS_MIXED_GEMM_MXFP4_FP8=1)
+cutlass_mixed_gemm_add_69_run_target(69_hopper_mxfp4_mxfp8_grouped_gemm CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1)
 
 function(cutlass_mixed_gemm_add_69_profile_target target_name ktile)
   cutlass_example_add_executable(
@@ -157,6 +155,10 @@ cutlass_mixed_gemm_add_69_profile_target(69_hopper_int4_fp8_grouped_gemm_k512 51
 cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_fp8_grouped_gemm_k128 128 CUTLASS_MIXED_GEMM_MXFP4_FP8=1)
 cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_fp8_grouped_gemm_k256 256 CUTLASS_MIXED_GEMM_MXFP4_FP8=1)
 cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_fp8_grouped_gemm_k512 512 CUTLASS_MIXED_GEMM_MXFP4_FP8=1)
+
+cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_mxfp8_grouped_gemm_k128 128 CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1)
+cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_mxfp8_grouped_gemm_k256 256 CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1)
+cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_mxfp8_grouped_gemm_k512 512 CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1)
 
 cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_bf16_grouped_gemm_k128 128 CUTLASS_MIXED_GEMM_MXFP4_BF16=1)
 cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_bf16_grouped_gemm_k256 256 CUTLASS_MIXED_GEMM_MXFP4_BF16=1)

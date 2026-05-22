@@ -4,6 +4,7 @@
 #include "cutlass/float_subbyte.h"
 #include "cutlass/integer_subbyte.h"
 #include "cutlass/numeric_conversion.h"
+#include "cute/tensor.hpp"
 
 #include <cuda_bf16.h>
 
@@ -16,7 +17,106 @@ ncu --clock-control none --kernel-id ::: \
 
 */
 
+namespace cmx {
 
+template <
+    int TileShapeN_,
+    int TileShapeK_,
+    int GroupSize_,
+    typename ProblemSizes,
+    typename ElementScaleRaw,
+    typename ElementScaleStorage
+>
+__global__ void pack_activation_scale_ktile_mn_major_grouped_kernel(
+    ProblemSizes problem_sizes,
+    int groups,
+    ElementScaleRaw const** src_ptrs,
+    ElementScaleStorage** dst_ptrs,
+    int max_m_blocks,
+    int max_scale_k_blocks)
+{
+  constexpr int PackMTile = 16;
+  constexpr int PackKTile = 8;
+  static_assert(PackMTile * PackKTile == 128);
+
+  int group = blockIdx.y;
+  int idx = threadIdx.x;
+  int scale_k_block = blockIdx.x % max_scale_k_blocks;
+  int m_block = blockIdx.x / max_scale_k_blocks;
+  if (group >= groups || idx >= PackMTile * PackKTile || m_block >= max_m_blocks) {
+    return;
+  }
+
+  auto problem = problem_sizes[group];
+  int m_extent = cute::get<1>(problem);
+  int k_extent = cute::get<2>(problem);
+  int scale_k = k_extent / TileShapeK_;
+  int m_padded = ((m_extent + TileShapeN_ - 1) / TileShapeN_) * TileShapeN_;
+  if (m_extent <= 0) {
+    return;
+  }
+
+  ElementScaleRaw const* src = src_ptrs[group];
+  ElementScaleStorage* dst = dst_ptrs[group];
+
+  __shared__ ElementScaleStorage tile[PackMTile][PackKTile + 1];
+
+  int load_m_local = idx / PackKTile;
+  int load_k_local = idx - load_m_local * PackKTile;
+  int load_m_packed = m_block * PackMTile + load_m_local;
+  int load_m = (load_m_packed < m_extent) ? load_m_packed : (m_extent - 1);
+  int load_scale_k = scale_k_block * PackKTile + load_k_local;
+
+  if (load_m_packed < m_padded && load_scale_k < scale_k) {
+    int scale_groups = k_extent / GroupSize_;
+    auto src_array = reinterpret_cast<ElementScaleStorage const*>(
+        src + load_m * scale_groups + load_scale_k * ElementScaleStorage::kElements);
+    tile[load_m_local][load_k_local] = *src_array;
+  }
+
+  __syncthreads();
+
+  int store_k_local = idx / PackMTile;
+  int store_m_local = idx - store_k_local * PackMTile;
+  int store_m = m_block * PackMTile + store_m_local;
+  int store_scale_k = scale_k_block * PackKTile + store_k_local;
+  if (store_m < m_padded && store_scale_k < scale_k) {
+    dst[store_scale_k * m_padded + store_m] = tile[store_m_local][store_k_local];
+  }
+}
+
+}  // namespace cmx
+
+void prepare_activation_scale_tensor(Options const& options) {
+  if constexpr (ScaleAppliesToActivation) {
+    constexpr int PackMTile = 16;
+    constexpr int PackKTile = 8;
+    int max_m_blocks = 0;
+    int max_scale_k_blocks = 0;
+    for (int32_t i = 0; i < options.groups; ++i) {
+      auto problem = options.problem_sizes_host.at(i);
+      auto M = get<0>(problem);
+      auto K = get<2>(problem);
+      int scale_k = K / TileShapeK;
+      int m_padded = ((M + TileShapeN - 1) / TileShapeN) * TileShapeN;
+      max_m_blocks = std::max(max_m_blocks, (m_padded + PackMTile - 1) / PackMTile);
+      max_scale_k_blocks = std::max(max_scale_k_blocks, (scale_k + PackKTile - 1) / PackKTile);
+    }
+    if (max_m_blocks == 0 || max_scale_k_blocks == 0) {
+      return;
+    }
+
+    constexpr int threads = PackMTile * PackKTile;
+    dim3 grid(max_m_blocks * max_scale_k_blocks, options.groups);
+    cmx::pack_activation_scale_ktile_mn_major_grouped_kernel<TileShapeN, TileShapeK, GROUP_SIZE><<<grid, threads>>>(
+        problem_sizes.get(),
+        options.groups,
+        ptr_activation_scale.get(),
+        ptr_activation_scale_packed.get(),
+        max_m_blocks,
+        max_scale_k_blocks);
+  }
+}
 
 template<typename T>
 void set_host_uint4(T *ptr_, int count) {
