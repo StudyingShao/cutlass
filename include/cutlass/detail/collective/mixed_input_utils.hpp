@@ -701,6 +701,36 @@ psx_cvt_lut_prmt_fp4x8_to_fp8x8
     return fp8x8_raw;
 }
 
+__device__ __inline__
+__nv_fp8x8_storage_t
+psx_cvt_lut_prmt_fp4x8_to_fp8x8_preprocessed_signs
+(
+    const __nv_fp4x8_storage_t fp4x8
+)
+{
+    __nv_fp8x8_storage_t fp8x8_raw;
+    __nv_fp8x4_storage_t *fp8x4_raw = reinterpret_cast<__nv_fp8x4_storage_t *>(&fp8x8_raw);
+
+    // Offline preprocessing keeps each nibble's low 3 EM bits in place, but
+    // repacks signs so outputs 0..3 are already in byte bit7 and outputs 4..7
+    // are in bit3 of each byte.  That removes the runtime sign-gather PRMTs.
+    // PRMT consumes only the low 16 bits of its selector in generic mode, so
+    // the low half does not need its high selector half cleared.
+    unsigned l4b_em_fp4x4 = fp4x8 & 0x77777777U;
+    unsigned h4b_em_fp4x4 = l4b_em_fp4x4 >> 16U;
+
+    auto lane_id = threadIdx.x & 0x1;
+    uint32_t h4b_lut = FP4_POS_E4M3s_REG2_[lane_id];
+    uint32_t l4b_lut = FP4_POS_E4M3s_REG1_[lane_id];
+    __nv_fp8x4_storage_t h4b_em_fp8x4 = prmt(h4b_lut, l4b_lut, h4b_em_fp4x4);
+    __nv_fp8x4_storage_t l4b_em_fp8x4 = prmt(h4b_lut, l4b_lut, l4b_em_fp4x4);
+
+    fp8x4_raw[0] = (fp4x8 & 0x80808080U) | l4b_em_fp8x4;
+    fp8x4_raw[1] = ((fp4x8 << 4U) & 0x80808080U) | h4b_em_fp8x4;
+
+    return fp8x8_raw;
+}
+
 
 // [ 0,  1,  2,  3] encoded as FP8
 __constant__ static uint32_t POS_E4M3s_REG1_[2] = {0x44403800, 0x44403800};
@@ -1118,7 +1148,11 @@ public:
     auto&& src_ = cute::recast<__nv_fp4x8_storage_t>(src)(0);
     auto&& dst_ = cute::recast<__nv_fp8x8_storage_t>(dst)(0);
 
+#if defined(CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS)
+    dst_ = psx_cvt_lut_prmt_fp4x8_to_fp8x8_preprocessed_signs(src_);
+#else
     dst_ = psx_cvt_lut_prmt_fp4x8_to_fp8x8(src_);
+#endif
   }
 
   /// Utilities to dequantize A.

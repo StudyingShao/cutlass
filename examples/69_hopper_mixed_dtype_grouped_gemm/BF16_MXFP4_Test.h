@@ -890,7 +890,31 @@ __global__ void interleave_fp4xbf16_Hopper_kernel_combine_triton(
 }
 
 
-template<typename T>
+__host__ __device__ __forceinline__
+uint32_t preprocess_fp4x8_signs_for_fp8(uint32_t fp4x8)
+{
+    // Preserve the low 3 EM bits of every FP4 nibble. The mainloop masks sign
+    // bits before LUT indexing, so those bit slots can carry a sign layout
+    // optimized for FP4->FP8 conversion.
+    uint32_t em = fp4x8 & 0x77777777U;
+
+    // Pack signs 0..3 into byte bit7 positions and signs 4..7 into bit3 of
+    // each byte. The FP8 converter then only needs mask and shift.
+    uint32_t signs =
+        ((fp4x8 & 0x00000008U) << 4U)  |
+        ((fp4x8 & 0x00000080U) << 8U)  |
+        ((fp4x8 & 0x00000800U) << 12U) |
+        ((fp4x8 & 0x00008000U) << 16U) |
+        ((fp4x8 & 0x00080000U) >> 16U) |
+        ((fp4x8 & 0x00800000U) >> 12U) |
+        ((fp4x8 & 0x08000000U) >> 8U)  |
+        ((fp4x8 & 0x80000000U) >> 4U);
+
+    return em | signs;
+}
+
+
+template<typename T, bool PreprocessFp4SignsForFp8 = false>
 __global__ void interleave_w4a8_Hopper_kernel(
     T *ptr_4b,
     T *ptr_4b_interleaved,
@@ -922,6 +946,14 @@ __global__ void interleave_w4a8_Hopper_kernel(
             uint16_t packed_4b_b = uint16_ptr[src_id_b];
 
             int dst_id = dst_row_id * cols / 4 + dst_col_id;
+
+            if constexpr (PreprocessFp4SignsForFp8) {
+                uint32_t fp4x8 =
+                    uint32_t(packed_4b_a) | (uint32_t(packed_4b_b) << 16U);
+                fp4x8 = preprocess_fp4x8_signs_for_fp8(fp4x8);
+                packed_4b_a = uint16_t(fp4x8);
+                packed_4b_b = uint16_t(fp4x8 >> 16U);
+            }
 
             uint16_interleaved_ptr[dst_id] = packed_4b_a;
             uint16_interleaved_ptr[dst_id + 1] = packed_4b_b;
@@ -964,7 +996,7 @@ void interleave_fp4xbf16_Hopper(
 }
 
 
-template<typename T>
+template<typename T, bool PreprocessFp4SignsForFp8 = false>
 void interleave_w4a8_Hopper(
     T *ptr_4b,
     T *ptr_4b_interleaved,
@@ -973,7 +1005,8 @@ void interleave_w4a8_Hopper(
 ) {
     // row-major input
     dim3 block(16, 32);
-    interleave_w4a8_Hopper_kernel<<<1024, block>>>(ptr_4b, ptr_4b_interleaved, rows, cols);
+    interleave_w4a8_Hopper_kernel<T, PreprocessFp4SignsForFp8><<<1024, block>>>(
+        ptr_4b, ptr_4b_interleaved, rows, cols);
 }
 
 

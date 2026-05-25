@@ -127,8 +127,16 @@ function(cutlass_mixed_gemm_add_69_run_target target_name)
   endforeach()
 endfunction()
 
-cutlass_mixed_gemm_add_69_run_target(69_hopper_mxfp4_fp8_grouped_gemm CUTLASS_MIXED_GEMM_MXFP4_FP8=1)
-cutlass_mixed_gemm_add_69_run_target(69_hopper_mxfp4_mxfp8_grouped_gemm CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1)
+cutlass_mixed_gemm_add_69_run_target(
+  69_hopper_mxfp4_fp8_grouped_gemm
+  CUTLASS_MIXED_GEMM_MXFP4_FP8=1
+  CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1
+)
+cutlass_mixed_gemm_add_69_run_target(
+  69_hopper_mxfp4_mxfp8_grouped_gemm
+  CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1
+  CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1
+)
 
 function(cutlass_mixed_gemm_add_69_profile_target target_name ktile)
   cutlass_example_add_executable(
@@ -152,13 +160,37 @@ cutlass_mixed_gemm_add_69_profile_target(69_hopper_int4_fp8_grouped_gemm_k128 12
 cutlass_mixed_gemm_add_69_profile_target(69_hopper_int4_fp8_grouped_gemm_k256 256)
 cutlass_mixed_gemm_add_69_profile_target(69_hopper_int4_fp8_grouped_gemm_k512 512)
 
-cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_fp8_grouped_gemm_k128 128 CUTLASS_MIXED_GEMM_MXFP4_FP8=1)
-cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_fp8_grouped_gemm_k256 256 CUTLASS_MIXED_GEMM_MXFP4_FP8=1)
-cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_fp8_grouped_gemm_k512 512 CUTLASS_MIXED_GEMM_MXFP4_FP8=1)
+cutlass_mixed_gemm_add_69_profile_target(
+  69_hopper_mxfp4_fp8_grouped_gemm_k128 128
+  CUTLASS_MIXED_GEMM_MXFP4_FP8=1
+  CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1
+)
+cutlass_mixed_gemm_add_69_profile_target(
+  69_hopper_mxfp4_fp8_grouped_gemm_k256 256
+  CUTLASS_MIXED_GEMM_MXFP4_FP8=1
+  CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1
+)
+cutlass_mixed_gemm_add_69_profile_target(
+  69_hopper_mxfp4_fp8_grouped_gemm_k512 512
+  CUTLASS_MIXED_GEMM_MXFP4_FP8=1
+  CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1
+)
 
-cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_mxfp8_grouped_gemm_k128 128 CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1)
-cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_mxfp8_grouped_gemm_k256 256 CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1)
-cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_mxfp8_grouped_gemm_k512 512 CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1)
+cutlass_mixed_gemm_add_69_profile_target(
+  69_hopper_mxfp4_mxfp8_grouped_gemm_k128 128
+  CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1
+  CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1
+)
+cutlass_mixed_gemm_add_69_profile_target(
+  69_hopper_mxfp4_mxfp8_grouped_gemm_k256 256
+  CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1
+  CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1
+)
+cutlass_mixed_gemm_add_69_profile_target(
+  69_hopper_mxfp4_mxfp8_grouped_gemm_k512 512
+  CUTLASS_MIXED_GEMM_MXFP4_MXFP8=1
+  CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1
+)
 
 cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_bf16_grouped_gemm_k128 128 CUTLASS_MIXED_GEMM_MXFP4_BF16=1)
 cutlass_mixed_gemm_add_69_profile_target(69_hopper_mxfp4_bf16_grouped_gemm_k256 256 CUTLASS_MIXED_GEMM_MXFP4_BF16=1)

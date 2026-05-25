@@ -307,7 +307,13 @@ void initialize(Options& options) {
       auto problem = options.problem_sizes_host.at(i);
       auto N = get<1>(problem);
       auto K = get<2>(problem);
-      interleave_w4a8_Hopper<QuantType>(
+#if defined(CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS)
+      static constexpr bool PreprocessFp4SignsForFp8 =
+        cute::is_same_v<QuantType, cutlass::float_e2m1_t>;
+#else
+      static constexpr bool PreprocessFp4SignsForFp8 = false;
+#endif
+      interleave_w4a8_Hopper<QuantType, PreprocessFp4SignsForFp8>(
         block_B.get() + offset_B.at(i), block_B_interleaved.get() + offset_B.at(i),
         N, K);
     }
