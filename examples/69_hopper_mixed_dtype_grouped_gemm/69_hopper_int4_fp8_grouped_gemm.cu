@@ -75,7 +75,7 @@ std::vector<StrideD>     stride_D_host;
 std::vector<StrideC_ref> stride_C_host_ref;
 std::vector<StrideD_ref> stride_D_host_ref;
 std::vector<StrideS>     stride_weight_scale_host;
-std::vector<StrideS>     stride_activation_scale_host;
+std::vector<StrideActivationScale> stride_activation_scale_host;
 
 std::vector<ElementAccumulator> alpha_host;
 std::vector<ElementAccumulator> beta_host;
@@ -113,7 +113,7 @@ cutlass::DeviceAllocation<StrideD>     stride_D;
 cutlass::DeviceAllocation<StrideC_ref> stride_C_ref;
 cutlass::DeviceAllocation<StrideD_ref> stride_D_ref;
 cutlass::DeviceAllocation<StrideS>     stride_weight_scale;
-cutlass::DeviceAllocation<StrideS>     stride_activation_scale;
+cutlass::DeviceAllocation<StrideActivationScale> stride_activation_scale;
 
 cutlass::DeviceAllocation<ElementAccumulator*> alpha_device;
 cutlass::DeviceAllocation<ElementAccumulator*> beta_device;
@@ -183,7 +183,8 @@ void allocate(Options const& options) {
     stride_C_host_ref.push_back(cutlass::make_cute_packed_stride(StrideC_ref{}, {M, N, 1}));
     stride_D_host_ref.push_back(cutlass::make_cute_packed_stride(StrideD_ref{}, {M, N, 1}));
     stride_weight_scale_host.push_back(cutlass::make_cute_packed_stride(StrideS{}, {N, scale_k, 1}));
-    stride_activation_scale_host.push_back(cutlass::make_cute_packed_stride(StrideS{}, {scale_m_padded, scale_k, 1}));
+    stride_activation_scale_host.push_back(cutlass::make_cute_packed_stride(
+        StrideActivationScale{}, {M, scale_groups, 1}));
   }
 
   block_A.reset(total_elements_A);
@@ -349,9 +350,6 @@ void initialize(Options& options) {
     print_device<<<1, 1>>>(
         options.enable_print, block_activation_scale.get(), block_activation_scale.size(), options.groups, 's');
     cudaDeviceSynchronize();
-    prepare_activation_scale_tensor(options);
-    print_device_packed<<<1, 1>>>(
-        options.enable_print, block_activation_scale_packed.get(), block_activation_scale_packed.size(), 'p');
   }
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -359,7 +357,7 @@ void initialize(Options& options) {
     problem_sizes.get(),
     options.groups,
     block_A.get(), block_B.get(),
-    block_weight_scale_packed.get(), block_activation_scale_packed.get(), block_ref_D.get(),
+    block_weight_scale_packed.get(), block_activation_scale.get(), block_ref_D.get(),
     TileShapeK,
     GROUP_SIZE,
     stride_A.get(), stride_B.get()

@@ -258,7 +258,7 @@ template <
     typename ElementA,
     typename ElementB,
     typename ElementWeightScalePacked,
-    typename ElementActivationScalePacked,
+    typename ElementActivationScaleRaw,
     typename ElementD
 >
 __device__ void single_gemm_varify(
@@ -268,7 +268,7 @@ __device__ void single_gemm_varify(
   ElementA *A_ptr,
   ElementB *B_ptr,
   ElementWeightScalePacked *weight_scale_ptr,
-  ElementActivationScalePacked *activation_scale_ptr,
+  ElementActivationScaleRaw *activation_scale_ptr,
   ElementD *D_ptr) {
 
   float lut[16];
@@ -312,11 +312,9 @@ __device__ void single_gemm_varify(
             float scale = static_cast<float>((*local_weight_scale_ptr)[scale_idx]);
 
             if constexpr (ScaleAppliesToActivation) {
-              int scale_tile = k / block_tile_k;
-              int scale_m_padded = ((M + TileShapeN - 1) / TileShapeN) * TileShapeN;
-              ElementActivationScalePacked *local_activation_scale_ptr =
-                  activation_scale_ptr + scale_tile * scale_m_padded + m;
-              scale *= static_cast<float>((*local_activation_scale_ptr)[scale_idx]);
+              ElementActivationScaleRaw *local_activation_scale_ptr =
+                  activation_scale_ptr + m * (K / group_size) + k / group_size;
+              scale *= static_cast<float>(*local_activation_scale_ptr);
             }
 
             accum += elem_A_0 * elem_B_low * scale + elem_A_1 * elem_B_high * scale;
@@ -345,7 +343,7 @@ template <
     typename ElementA, // fp8
     typename ElementB, // int4
     typename ElementWeightScalePacked,
-    typename ElementActivationScalePacked,
+    typename ElementActivationScaleRaw,
     typename ElementD,
     typename StrideA,
     typename StrideB
@@ -356,7 +354,7 @@ __global__ void groupwise_verify_kernel(
     ElementA *A,
     ElementB *B,
     ElementWeightScalePacked *weight_scale,
-    ElementActivationScalePacked *activation_scale,
+    ElementActivationScaleRaw *activation_scale,
     ElementD *D,
     int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
@@ -391,7 +389,7 @@ __global__ void groupwise_verify_kernel(
     ElementA *A_ptr = A;
     ElementB *B_ptr = B;
     ElementWeightScalePacked *weight_scale_ptr = weight_scale;
-    ElementActivationScalePacked *activation_scale_ptr = activation_scale;
+    ElementActivationScaleRaw *activation_scale_ptr = activation_scale;
     ElementD *D_ptr = D;
 
     int bid = blockIdx.x;
@@ -413,8 +411,7 @@ __global__ void groupwise_verify_kernel(
         B_ptr += N * K / 2;
         weight_scale_ptr += N * K / block_tile_k;
         if constexpr (ScaleAppliesToActivation) {
-          int scale_m_padded = ((M + TileShapeN - 1) / TileShapeN) * TileShapeN;
-          activation_scale_ptr += scale_m_padded * K / block_tile_k;
+          activation_scale_ptr += M * K / group_size;
         }
         D_ptr += M * N;
     }
@@ -426,7 +423,7 @@ template <
     typename ElementA,
     typename ElementB,
     typename ElementWeightScalePacked,
-    typename ElementActivationScalePacked,
+    typename ElementActivationScaleRaw,
     typename ElementD,
     typename StrideA,
     typename StrideB
@@ -437,7 +434,7 @@ void groupwise_verify(
     ElementA *A,
     ElementB *B,
     ElementWeightScalePacked *weight_scale,
-    ElementActivationScalePacked *activation_scale,
+    ElementActivationScaleRaw *activation_scale,
     ElementD *D,
     int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B

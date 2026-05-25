@@ -779,6 +779,7 @@ private:
   using RealSwappedElementB = typename Collective::RealSwappedElementB;
   using ElementScale = typename Collective::ElementScale;
   using ElementZero = typename Collective::ElementZero;
+  using NonVoidElementActivationScale = typename Collective::NonVoidElementActivationScale;
   using SmemCopyAtomScale = typename Collective::SmemCopyAtomScale;
   static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
   static constexpr auto ModeHasScales = Collective::ModeHasScales;
@@ -839,7 +840,7 @@ public:
         if constexpr (HasActivationScale) {
           constexpr uint32_t activation_scale_tx_bytes = cutlass::bits_to_bytes(
               size<0>(SmemLayoutActivationScale{}) * size<1>(SmemLayoutActivationScale{}) *
-              static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
+              static_cast<uint32_t>(cute::sizeof_bits_v<NonVoidElementActivationScale>));
           return scale_tx_bytes + activation_scale_tx_bytes;
         }
         else {

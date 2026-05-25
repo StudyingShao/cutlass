@@ -195,6 +195,12 @@ using         ElementB    = QuantType;
 using         LayoutB     = cutlass::layout::ColumnMajor;
 inline constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
 
+using MainloopElementA = cute::conditional_t<
+    ScaleAppliesToActivation,
+    cute::tuple<ElementA, ElementActivationScale>,
+    ElementA>;
+using MainloopElementB = cute::tuple<ElementB, ElementScalePacked>;
+
 using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
 using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
 
@@ -239,8 +245,8 @@ using DefaultCollectiveEpilogue = typename cutlass::epilogue::collective::Collec
 
 using DefaultCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
-    cute::tuple<ElementB, ElementScalePacked>, LayoutB_Transpose *, AlignmentB,
-    ElementA, LayoutA_Transpose *, AlignmentA,
+    MainloopElementB, LayoutB_Transpose *, AlignmentB,
+    MainloopElementA, LayoutA_Transpose *, AlignmentA,
     ElementAccumulator,
     DefaultTileShape, DefaultClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
@@ -263,6 +269,7 @@ using StrideD     = typename DefaultGemmKernel::InternalStrideD;
 using StrideC_ref = cutlass::detail::TagToStrideC_t<LayoutC>;
 using StrideD_ref = cutlass::detail::TagToStrideC_t<LayoutD>;
 using StrideS     = typename DefaultCollectiveMainloop::StrideScale;
+using StrideActivationScale = typename DefaultCollectiveMainloop::StrideActivationScale;
 using StrideS_ref = cutlass::detail::TagToStrideB_t<LayoutScale>;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -294,8 +301,8 @@ public:
 
     using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilder<
         ArchTag, OperatorClass,
-        cute::tuple<ElementB, ElementScalePacked>, LayoutB_Transpose *, AlignmentB,
-        ElementA, LayoutA_Transpose *, AlignmentA,
+        MainloopElementB, LayoutB_Transpose *, AlignmentB,
+        MainloopElementA, LayoutA_Transpose *, AlignmentA,
         ElementAccumulator,
         TileShape, ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<
@@ -323,7 +330,7 @@ extern std::vector<StrideD>     stride_D_host;
 extern std::vector<StrideC_ref> stride_C_host_ref;
 extern std::vector<StrideD_ref> stride_D_host_ref;
 extern std::vector<StrideS>     stride_weight_scale_host;
-extern std::vector<StrideS>     stride_activation_scale_host;
+extern std::vector<StrideActivationScale> stride_activation_scale_host;
 
 extern std::vector<ElementAccumulator> alpha_host;
 extern std::vector<ElementAccumulator> beta_host;
@@ -361,7 +368,7 @@ extern cutlass::DeviceAllocation<StrideD>     stride_D;
 extern cutlass::DeviceAllocation<StrideC_ref> stride_C_ref;
 extern cutlass::DeviceAllocation<StrideD_ref> stride_D_ref;
 extern cutlass::DeviceAllocation<StrideS>     stride_weight_scale;
-extern cutlass::DeviceAllocation<StrideS>     stride_activation_scale;
+extern cutlass::DeviceAllocation<StrideActivationScale> stride_activation_scale;
 
 extern cutlass::DeviceAllocation<ElementAccumulator*> alpha_device;
 extern cutlass::DeviceAllocation<ElementAccumulator*> beta_device;
@@ -375,7 +382,6 @@ extern cutlass::DeviceAllocation<ElementAccumulator>  block_beta;
 void allocate(Options const& options);
 void initialize(Options& options);
 bool verify(Options const& options);
-void prepare_activation_scale_tensor(Options const& options);
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Template implementations (must live in header for cross-TU instantiation)
@@ -418,9 +424,7 @@ typename Gemm::Arguments args_from_options(Options const& options, bool host_pro
     ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_weight_scale_packed.get(), stride_weight_scale.get(), GROUP_SIZE
   };
   if constexpr (ScaleAppliesToActivation) {
-    // The repack kernel writes through this pointer array; the GEMM mainloop only reads it.
-    mainloop_args.ptr_ActivationScale =
-        const_cast<decltype(mainloop_args.ptr_ActivationScale)>(ptr_activation_scale_packed.get());
+    mainloop_args.ptr_ActivationScale = ptr_activation_scale.get();
     mainloop_args.dActivationScale = stride_activation_scale.get();
   }
 
@@ -457,9 +461,6 @@ void profile_grouped_mixed_dtype(
 
   for (int iter = 0; iter < options.warmup + options.iterations; ++iter) {
     cudaEventRecord(start);
-    if constexpr (ScaleAppliesToActivation) {
-      prepare_activation_scale_tensor(options);
-    }
     result.status = gemm.run();
     if (result.status != cutlass::Status::kSuccess) {
       result.passed = false;
