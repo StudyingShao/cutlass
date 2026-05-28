@@ -767,12 +767,9 @@ public:
     if constexpr (cute::is_same_v<ElementA, cutlass::float_e2m1_t>) {
 
       cutlass::float_ue8m0_t scale_ue8m0 = scale;
-      // uint16_t scale_bits = *reinterpret_cast<uint8_t*>(&scale_ue8m0);
-      // printf("Scale value: %f, Scale bits: 0x%04x\n", static_cast<float>(scale), scale_bits);
 
-      uint32_t temp = 0;
-      temp = (temp | *reinterpret_cast<uint8_t*>(&scale_ue8m0)) << 23;
-      return *reinterpret_cast<float*>(&temp);
+      uint32_t temp = static_cast<uint32_t>(scale_ue8m0.storage) << 23;
+      return cutlass::detail::copy_bits<uint32_t, float>(temp);
     }
     else {
       return scale;

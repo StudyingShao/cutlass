@@ -935,9 +935,8 @@ public:
 
       cutlass::float_ue8m0_t scale_ue8m0 = scale;
 
-      uint32_t temp = 0;
-      temp = (temp | *reinterpret_cast<uint8_t*>(&scale_ue8m0)) << 23;
-      return *reinterpret_cast<float*>(&temp);
+      uint32_t temp = static_cast<uint32_t>(scale_ue8m0.storage) << 23;
+      return cutlass::detail::copy_bits<uint32_t, float>(temp);
     }
     else {
       return static_cast<float>(scale);
@@ -955,23 +954,34 @@ public:
   {
     multiply_add<ElementAccumulator> fma_op;
     
-    CUTLASS_PRAGMA_UNROLL
-    for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+    if (is_first_accum) {
       CUTLASS_PRAGMA_UNROLL
-      for (int m = 0; m < size<0, 1>(accum); m++) {
-        
-        float scale_val = scale_convertor(tCrS(make_coord(make_tuple(0, m, 0), mma_m, 0))[scale_idx]);
-        
+      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
         CUTLASS_PRAGMA_UNROLL
-        for (int n = 0; n < size<0, 2>(accum); n++) {
+        for (int m = 0; m < size<0, 1>(accum); m++) {
+          float scale_val = scale_convertor(tCrS(make_coord(make_tuple(0, m, 0), mma_m, 0))[scale_idx]);
           CUTLASS_PRAGMA_UNROLL
-          for (int e = 0; e < size<0, 0>(accum); e++) {
-
-            auto coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-            
-            if (is_first_accum) {
+          for (int n = 0; n < size<0, 2>(accum); n++) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int e = 0; e < size<0, 0>(accum); e++) {
+              auto coord = make_coord(make_tuple(e, m, n), mma_m, 0);
               accum(coord) = intermediate(coord) * scale_val;
-            } else {
+            }
+          }
+        }
+      }
+    }
+    else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < size<0, 1>(accum); m++) {
+          float scale_val = scale_convertor(tCrS(make_coord(make_tuple(0, m, 0), mma_m, 0))[scale_idx]);
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < size<0, 2>(accum); n++) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int e = 0; e < size<0, 0>(accum); e++) {
+              auto coord = make_coord(make_tuple(e, m, n), mma_m, 0);
               accum(coord) = fma_op(intermediate(coord), scale_val, accum(coord));
             }
           }
@@ -1016,20 +1026,36 @@ public:
   {
     multiply_add<ElementAccumulator> fma_op;
 
-    CUTLASS_PRAGMA_UNROLL
-    for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+    if (is_first_accum) {
       CUTLASS_PRAGMA_UNROLL
-      for (int m = 0; m < size<0, 1>(accum); m++) {
-        float scale_m = scale_convertor(tCrScaleM(make_coord(make_tuple(0, m, 0), mma_m, 0))[scale_idx]);
+      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
         CUTLASS_PRAGMA_UNROLL
-        for (int n = 0; n < size<0, 2>(accum); n++) {
+        for (int m = 0; m < size<0, 1>(accum); m++) {
+          float scale_m = scale_convertor(tCrScaleM(make_coord(make_tuple(0, m, 0), mma_m, 0))[scale_idx]);
           CUTLASS_PRAGMA_UNROLL
-          for (int e = 0; e < size<0, 0>(accum); e++) {
-            auto coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-            float scale_val = scale_m * scale_convertor(tCrScaleN(coord));
-            if (is_first_accum) {
+          for (int n = 0; n < size<0, 2>(accum); n++) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int e = 0; e < size<0, 0>(accum); e++) {
+              auto coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+              float scale_val = scale_m * scale_convertor(tCrScaleN(coord));
               accum(coord) = intermediate(coord) * scale_val;
-            } else {
+            }
+          }
+        }
+      }
+    }
+    else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < size<0, 1>(accum); m++) {
+          float scale_m = scale_convertor(tCrScaleM(make_coord(make_tuple(0, m, 0), mma_m, 0))[scale_idx]);
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < size<0, 2>(accum); n++) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int e = 0; e < size<0, 0>(accum); e++) {
+              auto coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+              float scale_val = scale_m * scale_convertor(tCrScaleN(coord));
               accum(coord) = fma_op(intermediate(coord), scale_val, accum(coord));
             }
           }
