@@ -645,6 +645,9 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
   }
 
   result.passed = verify(options);
+  if (!result.passed) {
+    return result;
+  }
   profile_grouped_mixed_dtype<Gemm, TileShape, ClusterShape>(
       gemm, options, result, alpha_host, beta_host);
 
@@ -672,6 +675,11 @@ void capture_results(Options options, std::vector<MixedDtypeResult> &results,
         // Do not push a failing config into the ranking vectors — it cannot be the "best".
         std::cout << "[SKIPPED] " << cutlassGetStatusString(result.status)
                   << "     "     << labeled_config << std::endl;
+        return;
+    }
+    if (!result.passed) {
+        std::cout << "[FAILED] correctness"
+                  << "     " << labeled_config << std::endl;
         return;
     }
     std::cout << "Avg runtime : " << result.avg_runtime_ms << " ms  "

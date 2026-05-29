@@ -444,7 +444,9 @@ int main(int argc, char const **args) {
 
   if (options.explore) {
     #ifdef PROFILE
-    best_config_finder(options);
+    if (!best_config_finder(options)) {
+      return -1;
+    }
     #endif
   }
   else {
@@ -452,6 +454,10 @@ int main(int argc, char const **args) {
       auto result = run<GemmScaleOnly>(options, false);
       if (result.status != cutlass::Status::kSuccess) {
         std::cerr << "Kernel failed: " << cutlassGetStatusString(result.status) << std::endl;
+        return -1;
+      }
+      if (!result.passed) {
+        std::cerr << "Kernel failed correctness verification." << std::endl;
         return -1;
       }
     #endif

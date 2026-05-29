@@ -22,7 +22,7 @@ void profile_coop_2x1x1(Options&, std::vector<MixedDtypeResult>&, std::vector<st
 void profile_coop_1x2x1(Options&, std::vector<MixedDtypeResult>&, std::vector<std::string>&);
 void profile_coop_2x2x1(Options&, std::vector<MixedDtypeResult>&, std::vector<std::string>&);
 
-inline void best_config_finder(Options options) {
+inline bool best_config_finder(Options options) {
     std::vector<MixedDtypeResult> results;
     std::vector<std::string>      configs;
 
@@ -56,10 +56,16 @@ inline void best_config_finder(Options options) {
     auto [M, N, K] = options.problem_sizes_host[0];
     printf("\nProblem %d x (%d, %d, %d)\n", options.groups, M, N, K);
 
+    if (best_config_id < 0) {
+        std::cerr << "No valid CUTLASS config passed correctness verification." << std::endl;
+        return false;
+    }
+
     std::cout << "Best CUTLASS Config:"  << std::endl
               << "Avg Runtime : "        << results[best_config_id].avg_runtime_ms << " ms  "
               << "GFLOPS : "             << results[best_config_id].gflops         << "     "
               << configs[best_config_id] << std::endl;
+    return true;
 }
 
 #endif // defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
