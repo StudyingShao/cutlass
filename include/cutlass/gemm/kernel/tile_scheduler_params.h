@@ -1628,6 +1628,63 @@ struct PersistentTileSchedulerSm90StreamKParams {
 ////////////////////////////////////////////////////////////////////////////////
 
 // Parameters for SM90 persistent group scheduler (only used for Grouped Gemms)
+
+struct PrecomputedGroupWorkTile {
+  static constexpr uint64_t ChannelBits = 20;
+  static constexpr uint64_t TokenBits = 24;
+  static constexpr uint64_t ExpertBits = 19;
+  static constexpr uint64_t ChannelMask = (uint64_t(1) << ChannelBits) - 1;
+  static constexpr uint64_t TokenMask = (uint64_t(1) << TokenBits) - 1;
+  static constexpr uint64_t ExpertMask = (uint64_t(1) << ExpertBits) - 1;
+  static constexpr uint64_t TokenShift = ChannelBits;
+  static constexpr uint64_t ExpertShift = ChannelBits + TokenBits;
+  static constexpr uint64_t Invalid = ~uint64_t(0);
+
+  CUTLASS_HOST_DEVICE
+  static bool
+  fits(uint64_t channel_idx, uint64_t token_idx, uint64_t expert_idx) {
+    return channel_idx <= ChannelMask &&
+           token_idx <= TokenMask &&
+           expert_idx <= ExpertMask;
+  }
+
+  CUTLASS_DEVICE
+  static uint64_t
+  pack(uint64_t channel_idx, uint64_t token_idx, uint64_t expert_idx) {
+    if (!fits(channel_idx, token_idx, expert_idx)) {
+      asm volatile("trap;");
+    }
+
+    return uint64_t(channel_idx) |
+           (uint64_t(token_idx) << TokenShift) |
+           (uint64_t(expert_idx) << ExpertShift);
+  }
+
+  CUTLASS_DEVICE
+  static bool
+  is_invalid(uint64_t packed) {
+    return packed == Invalid;
+  }
+
+  CUTLASS_DEVICE
+  static int32_t
+  channel_idx(uint64_t packed) {
+    return static_cast<int32_t>(packed & ChannelMask);
+  }
+
+  CUTLASS_DEVICE
+  static int32_t
+  token_idx(uint64_t packed) {
+    return static_cast<int32_t>((packed >> TokenShift) & TokenMask);
+  }
+
+  CUTLASS_DEVICE
+  static int32_t
+  expert_idx(uint64_t packed) {
+    return static_cast<int32_t>((packed >> ExpertShift) & ExpertMask);
+  }
+};
+
 template<class ProblemShape>
 struct PersistentTileSchedulerSm90GroupParams {
 
@@ -1649,6 +1706,9 @@ struct PersistentTileSchedulerSm90GroupParams {
 
   uint64_t blocks_across_problem_ = 0;
   bool pre_processed_problem_shapes = true;
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+  uint64_t const* precomputed_work_tiles_ = nullptr;
+#endif
   int32_t log_swizzle_size_ = 0;
   RasterOrder raster_order_ = RasterOrder::AlongN;
 
@@ -1711,6 +1771,29 @@ struct PersistentTileSchedulerSm90GroupParams {
     divmod_cta_shape_m_ = FastDivmodU64(cta_shape_.m());
     divmod_cta_shape_n_ = FastDivmodU64(cta_shape_.n());
   }
+
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+  void
+  initialize_precomputed(
+    dim3 problem_blocks,
+    GemmCoord cluster_shape,
+    int max_swizzle_size,
+    RasterOrderOptions raster_order_option
+  ) {
+    auto log_swizzle_size = get_log_swizzle_size(problem_blocks.x, problem_blocks.y, max_swizzle_size);
+    auto problem_blocks_m = round_up(problem_blocks.x, (1 << log_swizzle_size) * cluster_shape.m());
+    auto problem_blocks_n = round_up(problem_blocks.y, (1 << log_swizzle_size) * cluster_shape.n());
+
+    blocks_across_problem_ = problem_blocks.x * problem_blocks.y * problem_blocks.z;
+    pre_processed_problem_shapes = true;
+    log_swizzle_size_ = log_swizzle_size;
+    raster_order_ = get_rasterization_order(
+      problem_blocks_m,
+      problem_blocks_n,
+      raster_order_option
+    );
+  }
+#endif
 
   // Version of get_tiled_cta_shape_mnl that takes in as input the number of CTAs in the M and N dimensions.
   // This is useful for calculating the tiled shape when a mode of problem and/or CTA shape has rank > 1,

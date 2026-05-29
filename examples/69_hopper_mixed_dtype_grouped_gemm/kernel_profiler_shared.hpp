@@ -73,13 +73,17 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
 #define CUTLASS_MIXED_GEMM_TILE_SHAPE_K (8192 / TileShapeN)
 #endif
 
+#ifndef CUTLASS_MIXED_GEMM_TILE_SHAPE_N
+#define CUTLASS_MIXED_GEMM_TILE_SHAPE_N 16
+#endif
+
 #if defined(CUTLASS_MIXED_GEMM_MXFP4_BF16)
 using MmaType = cutlass::bfloat16_t;     // activations
 using QuantType = cutlass::float_e2m1_t; // weights
 #define GROUP_SIZE 32
 using ElementScale = cutlass::float_ue8m0_t;
 inline constexpr int TileShapeM = 128;
-inline constexpr int TileShapeN = 16;
+inline constexpr int TileShapeN = CUTLASS_MIXED_GEMM_TILE_SHAPE_N;
 inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 #elif defined(CUTLASS_MIXED_GEMM_MXFP4_FP8)
 // MXFP4 x FP8 experimental path.  This keeps the same MXFP4 weight semantics
@@ -90,7 +94,7 @@ using QuantType = cutlass::float_e2m1_t;    // weights
 #define GROUP_SIZE 32
 using ElementScale = cutlass::float_ue8m0_t;
 inline constexpr int TileShapeM = 128;
-inline constexpr int TileShapeN = 16;
+inline constexpr int TileShapeN = CUTLASS_MIXED_GEMM_TILE_SHAPE_N;
 inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 #elif defined(CUTLASS_MIXED_GEMM_MXFP4_MXFP8)
 // MXFP4 x MXFP8 keeps the activation payload as plain FP8 and reads the
@@ -100,7 +104,7 @@ using QuantType = cutlass::float_e2m1_t;    // weights
 #define GROUP_SIZE 32
 using ElementScale = cutlass::float_ue8m0_t;
 inline constexpr int TileShapeM = 128;
-inline constexpr int TileShapeN = 16;
+inline constexpr int TileShapeN = CUTLASS_MIXED_GEMM_TILE_SHAPE_N;
 inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 #else
 // INT4 x FP8
@@ -109,7 +113,7 @@ using QuantType = cutlass::int4b_t;         // weights
 #define GROUP_SIZE 128
 using ElementScale = cutlass::bfloat16_t;
 inline constexpr int TileShapeM = 128;
-inline constexpr int TileShapeN = 16;
+inline constexpr int TileShapeN = CUTLASS_MIXED_GEMM_TILE_SHAPE_N;
 inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 #endif
 
@@ -139,6 +143,7 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
   bool debug_input_act = false;
   bool debug_input_weight = false;
   bool debug_input_scale = false;
+  int64_t total_routed_tokens = -1;
 
   void parse(int argc, char const **args) {
     cutlass::CommandLine cmd(argc, args);
@@ -150,6 +155,7 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
     cmd.get_cmd_line_argument("debug_input_weight", debug_input_weight);
     cmd.get_cmd_line_argument("debug_input_scale", debug_input_scale);
     cmd.get_cmd_line_argument("swizzle", swizzle);
+    cmd.get_cmd_line_argument("total_routed_tokens", total_routed_tokens);
     this->Base::parse(argc, args);
     mode = 1;
   }
@@ -169,6 +175,7 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
       << "  --iterations=<int>          Number of profiling iterations to perform\n\n"
       << "  --warmup=<int>              Number of warmup iterations to perform\n\n"
       << "  --swizzle=<int>             Tile scheduler swizzle size (1, 2, 4, or 8). Default: 2\n"
+      << "  --total_routed_tokens=<int> Override total token count for scheduler capacity sizing.\n"
       << "  --benchmark=<str>           Executes a benchmark problem size.\n";
 
     out << "\n\nExamples:\n\n"
@@ -178,6 +185,27 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
     return out;
   }
 };
+
+void prepare_precomputed_work_tile_map(
+    Options const& options,
+    int tile_shape_m,
+    int tile_shape_n,
+    int cluster_shape_m,
+    int cluster_shape_n);
+
+void build_precomputed_work_tile_map(
+    Options const& options,
+    int tile_shape_m,
+    int tile_shape_n,
+    int cluster_shape_m,
+    int cluster_shape_n,
+    cudaStream_t stream = nullptr);
+
+namespace precomputed_scheduler {
+
+uint64_t const* work_tiles_data();
+
+}  // namespace precomputed_scheduler
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// GEMM type chain
@@ -228,10 +256,28 @@ using RasterOrderOptions = typename cutlass::gemm::kernel::detail::
     PersistentTileSchedulerSm90GroupParams<Shape<int,int,int>>::RasterOrderOptions;
 
 // Default configuration (used for the normal non-profiler run path, and to derive stride types)
+#ifndef CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_M
+#define CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_M 2
+#endif
+#ifndef CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_N
+#define CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_N 1
+#endif
+#ifndef CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_K
+#define CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_K 1
+#endif
+
 using DefaultTileShape    = Shape<cute::Int<TileShapeM>, cute::Int<TileShapeN>, cute::Int<TileShapeK>>;
-using DefaultClusterShape = Shape<_2,_1,_1>;
+using DefaultClusterShape = Shape<
+    cute::Int<CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_M>,
+    cute::Int<CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_N>,
+    cute::Int<CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_K>>;
+#if defined(CUTLASS_MIXED_GEMM_DEFAULT_SCHEDULE_PINGPONG)
+using DefaultKernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
+using DefaultEpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
+#else
 using DefaultKernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
 using DefaultEpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+#endif
 
 using DefaultCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
@@ -437,12 +483,16 @@ typename Gemm::Arguments args_from_options(Options const& options, bool host_pro
   };
 
   arguments.scheduler.max_swizzle_size = options.swizzle;
-  arguments.scheduler.raster_order     = RasterOrderOptions::Heuristic;
+  arguments.scheduler.raster_order     = RasterOrderOptions::AlongM;
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+  arguments.scheduler.precomputed_work_tiles =
+      precomputed_scheduler::work_tiles_data();
+#endif
 
   return arguments;
 }
 
-template <class Gemm>
+template <class Gemm, class TileShape = DefaultTileShape, class ClusterShape = DefaultClusterShape>
 void profile_grouped_mixed_dtype(
     Gemm& gemm,
     const Options& options,
@@ -458,17 +508,35 @@ void profile_grouped_mixed_dtype(
 
   std::vector<float> runtimes;
   runtimes.reserve(options.iterations);
+  cudaStream_t stream = nullptr;
+  constexpr int CurrentTileShapeM = cute::size<0>(TileShape{});
+  constexpr int CurrentTileShapeN = cute::size<1>(TileShape{});
+  constexpr int CurrentClusterShapeM = cute::size<0>(ClusterShape{});
+  constexpr int CurrentClusterShapeN = cute::size<1>(ClusterShape{});
+  prepare_precomputed_work_tile_map(
+      options,
+      CurrentTileShapeM,
+      CurrentTileShapeN,
+      CurrentClusterShapeM,
+      CurrentClusterShapeN);
 
   for (int iter = 0; iter < options.warmup + options.iterations; ++iter) {
-    cudaEventRecord(start);
-    result.status = gemm.run();
+    cudaEventRecord(start, stream);
+    build_precomputed_work_tile_map(
+        options,
+        CurrentTileShapeM,
+        CurrentTileShapeN,
+        CurrentClusterShapeM,
+        CurrentClusterShapeN,
+        stream);
+    result.status = gemm.run(stream);
     if (result.status != cutlass::Status::kSuccess) {
       result.passed = false;
       cudaEventDestroy(start);
       cudaEventDestroy(stop);
       return;
     }
-    cudaEventRecord(stop);
+    cudaEventRecord(stop, stream);
     cudaEventSynchronize(stop);
 
     if (iter >= options.warmup) {
@@ -519,7 +587,10 @@ void profile_grouped_mixed_dtype(
   }
 }
 
-template <typename Gemm>
+template <
+    typename Gemm,
+    typename TileShape = DefaultTileShape,
+    typename ClusterShape = DefaultClusterShape>
 MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true)
 {
   if (!setup) {
@@ -530,6 +601,17 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
   }
 
   MixedDtypeResult result;
+  constexpr int CurrentTileShapeM = cute::size<0>(TileShape{});
+  constexpr int CurrentTileShapeN = cute::size<1>(TileShape{});
+  constexpr int CurrentClusterShapeM = cute::size<0>(ClusterShape{});
+  constexpr int CurrentClusterShapeN = cute::size<1>(ClusterShape{});
+
+  prepare_precomputed_work_tile_map(
+      options,
+      CurrentTileShapeM,
+      CurrentTileShapeN,
+      CurrentClusterShapeM,
+      CurrentClusterShapeN);
 
   Gemm gemm;
   auto arguments    = args_from_options<Gemm>(options, host_problem_shapes_available);
@@ -550,6 +632,12 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
     return result;
   }
 
+  build_precomputed_work_tile_map(
+      options,
+      CurrentTileShapeM,
+      CurrentTileShapeN,
+      CurrentClusterShapeM,
+      CurrentClusterShapeN);
   result.status = gemm.run();
   if (result.status != cutlass::Status::kSuccess) {
     result.passed = false;
@@ -557,7 +645,8 @@ MixedDtypeResult run(Options &options, bool host_problem_shapes_available = true
   }
 
   result.passed = verify(options);
-  profile_grouped_mixed_dtype(gemm, options, result, alpha_host, beta_host);
+  profile_grouped_mixed_dtype<Gemm, TileShape, ClusterShape>(
+      gemm, options, result, alpha_host, beta_host);
 
   return result;
 }
@@ -578,7 +667,7 @@ void capture_results(Options options, std::vector<MixedDtypeResult> &results,
     const std::string labeled_config =
         config + " Stages=" + std::to_string(resolved_stages);
 
-    MixedDtypeResult result = run<gemm>(options, false);
+    MixedDtypeResult result = run<gemm, TileShape, ClusterShape>(options, false);
     if (result.status != cutlass::Status::kSuccess) {
         // Do not push a failing config into the ranking vectors — it cannot be the "best".
         std::cout << "[SKIPPED] " << cutlassGetStatusString(result.status)

@@ -50,8 +50,13 @@ class PersistentTileSchedulerSm90Group {
   //
 
 private:
-  uint64_t current_work_linear_idx_ = 0;
-  uint64_t total_grid_size_ = 0;
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+  using WorkLinearIdx = uint32_t;
+#else
+  using WorkLinearIdx = uint64_t;
+#endif
+  WorkLinearIdx current_work_linear_idx_ = 0;
+  WorkLinearIdx total_grid_size_ = 0;
 
   // Tracking current group, its starting linear idx and total tiles
   struct GroupInfo {
@@ -104,6 +109,9 @@ public:
     int max_swizzle_size = 1;
     // Not applying Heuristics for Grouped problems, since largest dimension can change per group
     RasterOrderOptions raster_order = RasterOrderOptions::AlongM;
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+    uint64_t const* precomputed_work_tiles = nullptr;
+#endif
   };
 
   // Sink scheduler params as a member
@@ -137,6 +145,15 @@ public:
       tile_shape, cluster_shape);
 
     Params params;
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+    params.initialize_precomputed(
+      problem_blocks,
+      to_gemm_coord(cluster_shape),
+      arguments.max_swizzle_size,
+      RasterOrderOptions::AlongM
+    );
+    params.precomputed_work_tiles_ = arguments.precomputed_work_tiles;
+#else
     params.initialize(
       problem_blocks,
       problem_shapes.groups(),
@@ -148,6 +165,7 @@ public:
       arguments.max_swizzle_size, 
       arguments.raster_order
     );
+#endif
 
     return params;
   }
@@ -176,7 +194,11 @@ public:
       to_gemm_coord(cluster_shape),
       hw_info,
       arguments.max_swizzle_size,
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+      RasterOrderOptions::AlongM,
+#else
       arguments.raster_order,
+#endif
       /* truncate_by_problem_size = */true
     );
   }
@@ -222,14 +244,26 @@ public:
     // MSVC requires protecting use of CUDA-specific nonstandard syntax,
     // like blockIdx and gridDim, with __CUDA_ARCH__.
 #if defined(__CUDA_ARCH__)
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+    current_work_linear_idx_ =
+        uint32_t(blockIdx.x) * uint32_t(gridDim.y) +
+        uint32_t(blockIdx.y) +
+        uint32_t(blockIdx.z) * uint32_t(gridDim.x) * uint32_t(gridDim.y);
+#else
     if (scheduler_params.raster_order_ == RasterOrder::AlongN) {
       current_work_linear_idx_ = uint64_t(blockIdx.x) + uint64_t(blockIdx.y) * uint64_t(gridDim.x);
     }
     else {
       current_work_linear_idx_ = uint64_t(blockIdx.x) * uint64_t(gridDim.y) + uint64_t(blockIdx.y);
     }
+#endif
 
-    total_grid_size_ = uint64_t(gridDim.x) * uint64_t(gridDim.y) * uint64_t(gridDim.z);
+    total_grid_size_ = WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
+
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+    CUTLASS_ASSERT(scheduler_params.precomputed_work_tiles_ != nullptr);
+    return;
+#else
 
     uint64_t ctas_along_m, ctas_along_n;
     if (is_tuple<decltype(cute::shape<0>(params_.problem_shapes_[0]))>::value ||
@@ -248,6 +282,7 @@ public:
     current_group_info_.problem_blocks_m_fixed = problem_blocks_m;
 
     current_group_info_.total_tiles = problem_blocks_m * problem_blocks_n;
+#endif
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");
 #endif
@@ -261,7 +296,12 @@ public:
 
   CUTLASS_DEVICE
   WorkTileInfo
-  get_current_work_for_linear_idx(uint64_t linear_idx) {
+  get_current_work_for_linear_idx(WorkLinearIdx linear_idx) {
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+    return get_precomputed_work_tile(linear_idx,
+                                     scheduler_params.precomputed_work_tiles_);
+#else
+
     if (scheduler_params.pre_processed_problem_shapes && linear_idx >= scheduler_params.blocks_across_problem_) {
       return WorkTileInfo::invalid_work_tile();
     }
@@ -278,13 +318,39 @@ public:
                                 scheduler_params.divmod_cta_shape_n_,
                                 scheduler_params.log_swizzle_size_, 
                                 scheduler_params.raster_order_);
+#endif
   }
 
   CUTLASS_DEVICE
   void
-  advance_to_next_work(uint32_t advance_count = 1) {
-    current_work_linear_idx_ += total_grid_size_ * uint64_t(advance_count);
+  advance_to_next_work() {
+    current_work_linear_idx_ += total_grid_size_;
   }
+
+  CUTLASS_DEVICE
+  void
+  advance_to_next_work(uint32_t advance_count) {
+    current_work_linear_idx_ += total_grid_size_ * WorkLinearIdx(advance_count);
+  }
+
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+  static CUTLASS_DEVICE
+  WorkTileInfo
+  get_precomputed_work_tile(
+      WorkLinearIdx linear_idx,
+      uint64_t const* precomputed_work_tiles) {
+    uint64_t const packed = __ldg(precomputed_work_tiles + linear_idx);
+    if (PrecomputedGroupWorkTile::is_invalid(packed)) {
+      return WorkTileInfo::invalid_work_tile();
+    }
+
+    return {
+        PrecomputedGroupWorkTile::channel_idx(packed),
+        PrecomputedGroupWorkTile::token_idx(packed),
+        PrecomputedGroupWorkTile::expert_idx(packed),
+        true};
+  }
+#endif
 
   // get work_idx_m, work_idx_n from linear_idx while applying swizzle
   static CUTLASS_DEVICE
