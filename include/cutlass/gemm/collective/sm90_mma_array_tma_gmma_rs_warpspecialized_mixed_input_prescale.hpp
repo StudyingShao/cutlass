@@ -1214,8 +1214,15 @@ public:
     
     auto ptr = recast_ptr<RealSwappedElementA>(tCrA_load_LDSM.data());
     auto old_shape = tCrA_load_LDSM.shape();
-    auto new_shape = make_shape(size<0>(old_shape), get<1>(old_shape), size<2>(old_shape) * ABBitWidthRatio{});
-    Tensor tCrA_load_4b_packed = make_tensor(ptr, make_layout(new_shape));
+    // LDSM packs two 4-bit K sub-blocks before advancing to the next MMA_M
+    // slice. Preserve that nested K order so MMA_M > 1 does not alias K.
+    auto tCrA_load_4b_layout = make_layout(
+      make_shape(size<0>(old_shape), get<1>(old_shape),
+                 make_shape(ABBitWidthRatio{}, size<2>(old_shape))),
+      make_stride(Int<1>{}, size<0>(old_shape) * ABBitWidthRatio{},
+                  make_stride(size<0>(old_shape),
+                              size<0>(old_shape) * ABBitWidthRatio{} * size<1>(old_shape))));
+    Tensor tCrA_load_4b_packed = make_tensor(ptr, tCrA_load_4b_layout);
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     

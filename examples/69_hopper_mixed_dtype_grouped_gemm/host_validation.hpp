@@ -210,7 +210,8 @@ if (debug_input_weight) {
 template <typename T, typename ProblemSizes>
 __global__ void compare_device(
     bool compare_print, T *out, T *ref, int count,
-    ProblemSizes problem_sizes_swapped, int Groups)
+    ProblemSizes problem_sizes_swapped, int Groups,
+    int *error_counts = nullptr)
 {
     if (!thread0()) return;
 
@@ -251,6 +252,11 @@ __global__ void compare_device(
     printf("P99_error_count %d %.2f%%\n", P99_error_count, float(P99_error_count) / count * 100.0f);
     printf("P98_error_count %d %.2f%%\n", P98_error_count, float(P98_error_count) / count * 100.0f);
     printf("P95_error_count %d %.2f%%\n", P95_error_count, float(P95_error_count) / count * 100.0f);
+    if (error_counts != nullptr) {
+      error_counts[0] = P99_error_count;
+      error_counts[1] = P98_error_count;
+      error_counts[2] = P95_error_count;
+    }
 }
 
 
@@ -292,32 +298,37 @@ __device__ void single_gemm_varify(
 
         float accum = 0.0f;
 
-        for (int k = 0; k < K; k += 2) {
+        for (int k_group = 0; k_group < K; k_group += group_size) {
+            float group_accum = 0.0f;
 
-            ElementA *local_A_ptr = A_ptr + m * K + k;
-            uint8_t *local_B_ptr = reinterpret_cast<uint8_t *>(B_ptr) + n * K / 2 + k / 2;
+            for (int k = k_group; k < k_group + group_size; k += 2) {
+                ElementA *local_A_ptr = A_ptr + m * K + k;
+                uint8_t *local_B_ptr = reinterpret_cast<uint8_t *>(B_ptr) + n * K / 2 + k / 2;
 
-            float elem_A_0 = local_A_ptr[0];
-            float elem_A_1 = local_A_ptr[1];
-            uint8_t elem_B_low_ = (*local_B_ptr) & 0xF;
-            uint8_t elem_B_high_  = ((*local_B_ptr) & 0xF0) >> 4;
-            // float elem_B_low = (elem_B_low_ < 8) ? elem_B_low_ : (float)elem_B_low_ - 16;
-            // float elem_B_high = (elem_B_high_ < 8) ? elem_B_high_ : (float)elem_B_high_ - 16;
-            float elem_B_low = lut[elem_B_low_];
-            float elem_B_high = lut[elem_B_high_];
+                float elem_A_0 = local_A_ptr[0];
+                float elem_A_1 = local_A_ptr[1];
+                uint8_t elem_B_low_ = (*local_B_ptr) & 0xF;
+                uint8_t elem_B_high_  = ((*local_B_ptr) & 0xF0) >> 4;
+                // float elem_B_low = (elem_B_low_ < 8) ? elem_B_low_ : (float)elem_B_low_ - 16;
+                // float elem_B_high = (elem_B_high_ < 8) ? elem_B_high_ : (float)elem_B_high_ - 16;
+                float elem_B_low = lut[elem_B_low_];
+                float elem_B_high = lut[elem_B_high_];
+
+                group_accum += elem_A_0 * elem_B_low + elem_A_1 * elem_B_high;
+            }
 
             ElementWeightScalePacked *local_weight_scale_ptr =
-                weight_scale_ptr + (k / block_tile_k) * N + n;
-            int scale_idx = (k % block_tile_k) / group_size;
+                weight_scale_ptr + (k_group / block_tile_k) * N + n;
+            int scale_idx = (k_group % block_tile_k) / group_size;
             float scale = static_cast<float>((*local_weight_scale_ptr)[scale_idx]);
 
             if constexpr (ScaleAppliesToActivation) {
               ElementActivationScaleRaw *local_activation_scale_ptr =
-                  activation_scale_ptr + m * (K / group_size) + k / group_size;
+                  activation_scale_ptr + m * (K / group_size) + k_group / group_size;
               scale *= static_cast<float>(*local_activation_scale_ptr);
             }
 
-            accum += elem_A_0 * elem_B_low * scale + elem_A_1 * elem_B_high * scale;
+            accum += group_accum * scale;
 
             // if (group_id == 0 && bid == 0 && tid == 0)
             //     printf("A %f %f B %f %f scale %f accum %f\n",

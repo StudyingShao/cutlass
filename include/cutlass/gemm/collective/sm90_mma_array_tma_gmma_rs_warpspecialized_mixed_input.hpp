@@ -225,13 +225,24 @@ public:
 
   static constexpr int NumProducerThreadEvents = 1;
 
-  static constexpr int NumScaleChunksPerTileK = size<2>(TileShape{}) / ScalingGroupSize;
-  static constexpr int ActScaleMinTmaChunks =
-      128 / cutlass::sizeof_bits<NonVoidElementActivationScale>::value;
+  static constexpr int RawActScaleChunksPerTileK = size<2>(TileShape{}) / ScalingGroupSize;
+  // Keep the derived value nonzero so the modulo static_assert below remains
+  // well-formed; RawActScaleChunksPerTileK carries the actual validity check.
+  static constexpr int ActScaleChunksPerTileK =
+      HasActivationScale ? ((RawActScaleChunksPerTileK > 0) ? RawActScaleChunksPerTileK : 1) : 1;
+  static constexpr int ActScaleTmaAlignmentChunks =
+      HasActivationScale ? (128 / cutlass::sizeof_bits<NonVoidElementActivationScale>::value) : 1;
+  static constexpr bool ActScaleTmaUsesMinWindow =
+      ActScaleChunksPerTileK <= ActScaleTmaAlignmentChunks;
   static constexpr int ActScaleTmaChunks =
-      (NumScaleChunksPerTileK > ActScaleMinTmaChunks) ? NumScaleChunksPerTileK : ActScaleMinTmaChunks;
-  static_assert(ActScaleTmaChunks % NumScaleChunksPerTileK == 0,
-      "Activation scale TMA window must cover an integer number of compute Ktiles.");
+      ActScaleTmaUsesMinWindow ? ActScaleTmaAlignmentChunks : ActScaleChunksPerTileK;
+  static_assert(!HasActivationScale || RawActScaleChunksPerTileK > 0,
+      "Activation scale TMA requires TileShapeK to cover at least one scale group.");
+  static_assert(!HasActivationScale ||
+      (ActScaleTmaUsesMinWindow
+          ? (ActScaleTmaAlignmentChunks % ActScaleChunksPerTileK == 0)
+          : (ActScaleChunksPerTileK % ActScaleTmaAlignmentChunks == 0)),
+      "Activation scale TileShapeK must divide or be a multiple of the 16B TMA scale window.");
   static constexpr int ScaleNRawElementsPerStage = size<1>(TileShape{}) * ActScaleTmaChunks;
   static constexpr int ScaleNElementsPerStage = size<1>(TileShape{});
 
@@ -261,8 +272,9 @@ public:
       cute::conditional_t< ::cutlass::gemm::detail::is_major<0,NonVoidStrideScale>(), Step<_2,_1,_3>, Step<_1,_2,_3>>{}));
   // MXFP8 activation scales are independent from MXFP4 weight scales.  They are
   // stored in raw M-major, K-contiguous form and TMA-loaded into this raw scale
-  // layout: (BLK_N, ActScaleTmaChunks, PIPE).  The TMA window is at least
-  // 16B wide for ue8m0 scales; smaller compute Ktiles reuse a subrange.
+  // layout: (BLK_N, ActScaleTmaChunks, PIPE).  The TMA window is 16B-aligned:
+  // smaller compute Ktiles reuse a subrange, while larger Ktiles must already
+  // span a 16B-aligned activation-scale row.
   using SmemLayoutActivationScale = Layout<
       Shape<decltype(shape<1>(TileShape{})), Int<ActScaleTmaChunks>, Int<Stages>>,
       Stride<Int<ActScaleTmaChunks>, _1, Int<ScaleNRawElementsPerStage>>>;
@@ -529,9 +541,13 @@ public:
         size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
     typename Params::TMA_ActivationScale tma_load_activation_scale{};
     if constexpr (HasActivationScale) {
+      auto init_activation_scale_shape =
+          make_shape(int32_t(size<1>(TileShape{})), int32_t(ActScaleTmaChunks), mock_L);
+      auto init_activation_scale_stride =
+          cute::make_stride(int64_t(ActScaleTmaChunks), cute::Int<1>{}, int64_t(0));
       Tensor tensor_activation_scale = make_tensor(
           ptr_activation_scale_first_batch,
-          detail::get_gmem_layout(make_shape(init_N, int32_t(ActScaleTmaChunks), mock_L), StrideActivationScale{}));
+          detail::get_gmem_layout(init_activation_scale_shape, init_activation_scale_stride));
       tma_load_activation_scale = make_tma_copy(
           SM90_TMA_LOAD{},
           tensor_activation_scale,
@@ -646,6 +662,7 @@ public:
           implementable = implementable && (args.ptr_S != nullptr);
           if constexpr (HasActivationScale) {
             implementable = implementable && (args.ptr_ActivationScale != nullptr);
+            implementable = implementable && ((K % (ScalingGroupSize * ActScaleTmaAlignmentChunks)) == 0);
           }
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
             implementable = implementable && (args.ptr_Z == nullptr);
@@ -884,7 +901,7 @@ public:
             Tensor gActS_nkl = get<4>(load_inputs);
             auto block_tma_activation_scale = mainloop_params.tma_load_activation_scale.get_slice(Int<0>{});
             auto act_l_coord = l_coord;
-            int act_scale_window = (scale_k_tile * NumScaleChunksPerTileK) / ActScaleTmaChunks;
+            int act_scale_window = (scale_k_tile * ActScaleChunksPerTileK) / ActScaleTmaChunks;
             Tensor gActS = gActS_nkl(_,_,n_coord,act_scale_window,act_l_coord);
             Tensor tActSgActS = block_tma_activation_scale.partition_S(gActS);
             Tensor tActSsActS = block_tma_activation_scale.partition_D(sActS);
@@ -1008,8 +1025,8 @@ public:
     Tensor sScaleNViewAsC = make_tensor(
         scale_smem_ptr,
         Layout<
-            Shape<decltype(shape<0>(TileShape{})), decltype(shape<1>(TileShape{})), Int<DispatchPolicy::Stages>>,
-            Stride<_0, Int<ActScaleTmaChunks>, Int<ScaleNRawElementsPerStage>>>{});
+            Shape<decltype(shape<0>(TileShape{})), Shape<Int<1>, decltype(shape<1>(TileShape{}))>, Int<DispatchPolicy::Stages>>,
+            Stride<_0, Stride<_0, Int<ActScaleTmaChunks>>, Int<ScaleNRawElementsPerStage>>>{});
     Tensor tCsScaleNViewAsC = tiled_mma.get_slice(thread_idx).partition_C(sScaleNViewAsC);
     copy(tCsScaleNViewAsC(_, _, _, read_stage), tCrScaleN);
   }
@@ -1152,8 +1169,8 @@ public:
         Tensor sScaleNViewAsC = make_tensor(
             make_smem_ptr(reinterpret_cast<ElementScaleN *>(shared_tensors.smem_activation_scale.begin())),
             Layout<
-                Shape<decltype(shape<0>(TileShape{})), decltype(shape<1>(TileShape{})), Int<DispatchPolicy::Stages>>,
-                Stride<_0, Int<ActScaleTmaChunks>, Int<ScaleNRawElementsPerStage>>>{});
+                Shape<decltype(shape<0>(TileShape{})), Shape<Int<1>, decltype(shape<1>(TileShape{}))>, Int<DispatchPolicy::Stages>>,
+                Stride<_0, Stride<_0, Int<ActScaleTmaChunks>>, Int<ScaleNRawElementsPerStage>>>{});
         Tensor tCsScaleNViewAsC = tiled_mma.get_slice(thread_idx).partition_C(sScaleNViewAsC);
         return make_tensor_like<ElementScaleN>(tCsScaleNViewAsC(_, _, _, Int<0>{}));
       }
@@ -1168,7 +1185,7 @@ public:
     auto copy_activation_scale_for_pipeline = [&](int scale_idx, int read_stage, int current_k_tile) {
       if constexpr (HasActivationScale) {
         int scale_window_offset =
-            (current_k_tile * NumScaleChunksPerTileK) % ActScaleTmaChunks;
+            (current_k_tile * ActScaleChunksPerTileK) % ActScaleTmaChunks;
         copy_activation_scale_for_chunk(
             tiled_mma, thread_idx, shared_tensors, tCrScaleN_pipe[scale_idx & 1],
             scale_idx, scale_window_offset, read_stage);
@@ -1211,8 +1228,15 @@ public:
     
     auto ptr = recast_ptr<RealSwappedElementA>(tCrA_load_LDSM.data());
     auto old_shape = tCrA_load_LDSM.shape();
-    auto new_shape = make_shape(size<0>(old_shape), get<1>(old_shape), size<2>(old_shape) * ABBitWidthRatio{});
-    Tensor tCrA_load_4b_packed = make_tensor(ptr, make_layout(new_shape));
+    // LDSM packs two 4-bit K sub-blocks before advancing to the next MMA_M
+    // slice. Preserve that nested K order so MMA_M > 1 does not alias K.
+    auto tCrA_load_4b_layout = make_layout(
+      make_shape(size<0>(old_shape), get<1>(old_shape),
+                 make_shape(ABBitWidthRatio{}, size<2>(old_shape))),
+      make_stride(Int<1>{}, size<0>(old_shape) * ABBitWidthRatio{},
+                  make_stride(size<0>(old_shape),
+                              size<0>(old_shape) * ABBitWidthRatio{} * size<1>(old_shape))));
+    Tensor tCrA_load_4b_packed = make_tensor(ptr, tCrA_load_4b_layout);
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     
