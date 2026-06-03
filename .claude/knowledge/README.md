@@ -72,6 +72,12 @@ Examples:
 - `scaling-overlap.md` - Groupwise scaling optimization patterns
 - `memory-layout-patterns.md` - Shared memory strategies
 - `scheduler-selection.md` - Cooperative vs Pingpong trade-offs
+- `cmx-best-config-cache.md` - Cached CMX best configs for repeated
+  production comparison shapes; check this before re-running profiler sweeps
+- `cmx-fp4-fp8-sign-preprocessing.md` - Offline FP4 weight sign preprocessing
+  for CMX FP4->FP8/MXFP8 converter PRMT reduction
+- `mxfp4-mxfp8-activation-scale-loading.md` - Runtime pack vs direct TMA
+  tradeoffs for activation scale loading
 
 ### `modules/`
 **Code module deep-dives**

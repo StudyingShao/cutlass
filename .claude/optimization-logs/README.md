@@ -57,6 +57,15 @@ Optimization Log (detailed history)
 Knowledge Document (distilled wisdom)
 ```
 
+## Artifact Policy
+
+- Commit markdown summaries and small CSV summaries that are useful for review.
+- Treat raw profiler `.log` dumps as local artifacts unless the user explicitly
+  asks to preserve them in git.
+- Historical notebooks that do not fit the log lifecycle, such as
+  `.claude/malogemm-optimization/`, should carry an explicit status note so old
+  "active" wording is not mistaken for current implementation scope.
+
 ## Log Status
 
 Active logs (optimization in progress):
@@ -71,4 +80,4 @@ Completed logs:
 
 ---
 
-**Last Updated**: 2026-06-02
+**Last Updated**: 2026-06-03
