@@ -54,8 +54,6 @@
 
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 
-#include "precomputed_scheduler_work_map.hpp"
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Global variable definitions (extern-declared in kernel_profiler_shared.hpp)
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -451,7 +449,7 @@ int main(int argc, char const **args) {
   }
   else {
     #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
-      auto result = run<GemmScaleOnly>(options, false);
+      auto result = run<GemmScaleOnly>(options);
       if (result.status != cutlass::Status::kSuccess) {
         std::cerr << "Kernel failed: " << cutlassGetStatusString(result.status) << std::endl;
         return -1;

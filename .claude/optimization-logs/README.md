@@ -63,8 +63,12 @@ Active logs (optimization in progress):
 - [To be filled when sessions start]
 
 Completed logs:
-- [To be filled as sessions complete]
+- [2026-03-19-scheduler-work-switching.md](2026-03-19-scheduler-work-switching.md)
+- [2026-05-21-cmx-four-impl-best-configs.md](2026-05-21-cmx-four-impl-best-configs.md)
+- [2026-05-22-mxfp4-mxfp8-activation-scale-tma-vs-pack.md](2026-05-22-mxfp4-mxfp8-activation-scale-tma-vs-pack.md)
+- [2026-05-29-cmx-precomputed-work-order.md](2026-05-29-cmx-precomputed-work-order.md)
+- [2026-06-02-cmx-prebuilt-tma-descriptors.md](2026-06-02-cmx-prebuilt-tma-descriptors.md)
 
 ---
 
-**Last Updated**: 2026-03-19
+**Last Updated**: 2026-06-02

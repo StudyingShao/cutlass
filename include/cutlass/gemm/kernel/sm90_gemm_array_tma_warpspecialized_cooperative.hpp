@@ -30,6 +30,8 @@
  **************************************************************************************************/
 #pragma once
 
+#include <type_traits>
+
 #include "cutlass/cutlass.h"
 #include "cutlass/workspace.h"
 #include "cutlass/fast_math.h"
@@ -52,6 +54,32 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::kernel {
+
+///////////////////////////////////////////////////////////////////////////////
+
+template <class CollectiveMainloop, class = void>
+struct RequiresBatchTensormapUpdate {
+  static constexpr bool value = true;
+};
+
+template <class CollectiveMainloop>
+struct RequiresBatchTensormapUpdate<
+    CollectiveMainloop,
+    std::void_t<decltype(CollectiveMainloop::RequiresTensormapUpdateOnBatchChange)>> {
+  static constexpr bool value = CollectiveMainloop::RequiresTensormapUpdateOnBatchChange;
+};
+
+template <class CollectiveMainloop, class = void>
+struct RequiresBatchTensormapAcquire {
+  static constexpr bool value = false;
+};
+
+template <class CollectiveMainloop>
+struct RequiresBatchTensormapAcquire<
+    CollectiveMainloop,
+    std::void_t<decltype(CollectiveMainloop::RequiresPrebuiltTensormapAcquireOnBatchChange)>> {
+  static constexpr bool value = CollectiveMainloop::RequiresPrebuiltTensormapAcquireOnBatchChange;
+};
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -560,6 +588,7 @@ public:
 
         bool do_load_order_arrive = true;
         bool did_batch_change = true;
+        bool needs_tensormap_acquire = work_tile_info.is_valid();
         while (work_tile_info.is_valid()) {
           if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
             auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
@@ -579,7 +608,10 @@ public:
 
           if (did_batch_change) {
             load_inputs = collective_mainloop.tensors_perform_update(load_inputs, params.mainloop, problem_shape_MNKL, curr_batch);
-            collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
+            if (needs_tensormap_acquire || RequiresBatchTensormapAcquire<CollectiveMainloop>::value) {
+              collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
+              needs_tensormap_acquire = false;
+            }
           }
 
           collective_mainloop.load(
@@ -614,22 +646,25 @@ public:
             if constexpr (IsGroupedGemmKernel) {
               problem_shape_MNKL = append<4>(params.problem_shape.get_problem_shape(curr_batch), 1);
             }
-            // Purpose of this pipeline state is to make sure TMA loads have finished before doing descriptor updates
-            // Since this state is waiting for loads to finish, it must start in the inverted phase.
-            typename CollectiveMainloop::PipelineState mainloop_pipe_tma_consumer_state =
-              {mainloop_pipe_producer_state.index(), !mainloop_pipe_producer_state.phase(), mainloop_pipe_producer_state.count()};
-            mainloop_pipeline.consumer_wait(mainloop_pipe_tma_consumer_state);
-            collective_mainloop.tensormaps_perform_update(
-              shared_storage.tensormaps.mainloop,
-              params.mainloop,
-              input_tensormaps,
-              problem_shape_MNKL,
-              curr_batch
-            );
-            // Ensure warp is converged before issuing tensor replace
-            __syncwarp();
-            // Entire warp must do this (i.e. it's aligned)
-            collective_mainloop.tensormaps_cp_fence_release(shared_storage.tensormaps.mainloop, input_tensormaps);
+            if constexpr (RequiresBatchTensormapUpdate<CollectiveMainloop>::value) {
+              // Purpose of this pipeline state is to make sure TMA loads have finished before doing descriptor updates
+              // Since this state is waiting for loads to finish, it must start in the inverted phase.
+              typename CollectiveMainloop::PipelineState mainloop_pipe_tma_consumer_state =
+                {mainloop_pipe_producer_state.index(), !mainloop_pipe_producer_state.phase(), mainloop_pipe_producer_state.count()};
+              mainloop_pipeline.consumer_wait(mainloop_pipe_tma_consumer_state);
+              collective_mainloop.tensormaps_perform_update(
+                shared_storage.tensormaps.mainloop,
+                params.mainloop,
+                input_tensormaps,
+                problem_shape_MNKL,
+                curr_batch
+              );
+              // Ensure warp is converged before issuing tensor replace
+              __syncwarp();
+              // Entire warp must do this (i.e. it's aligned)
+              collective_mainloop.tensormaps_cp_fence_release(shared_storage.tensormaps.mainloop, input_tensormaps);
+              needs_tensormap_acquire = true;
+            }
           }
           // Advance the producer state for the last remaining stage that was being waited for above
           mainloop_pipe_producer_state.advance(1);
