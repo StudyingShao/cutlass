@@ -96,6 +96,7 @@ cutlass::DeviceAllocation<ElementZero>                                          
 cutlass::DeviceAllocation<ElementC>                                              block_C;
 cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput> block_D;
 cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput> block_ref_D;
+cutlass::DeviceAllocation<float>                                                 block_ref_abs_error_bound;
 
 cutlass::DeviceAllocation<const MmaType *>                                         ptr_A;
 cutlass::DeviceAllocation<const QuantType *>                                       ptr_B;
@@ -193,6 +194,7 @@ void allocate(Options const& options) {
   block_C.reset(total_elements_C);
   block_D.reset(total_elements_D);
   block_ref_D.reset(total_elements_D);
+  block_ref_abs_error_bound.reset(total_elements_D);
   block_weight_scale.reset(total_elements_weight_scale);
   block_weight_scale_packed.reset(total_elements_weight_scale_packed);
   block_activation_scale.reset(total_elements_activation_scale);
@@ -364,6 +366,7 @@ void initialize(Options& options) {
     options.groups,
     block_A.get(), block_B.get(),
     block_weight_scale_packed.get(), block_activation_scale.get(), block_ref_D.get(),
+    block_ref_abs_error_bound.get(),
     TileShapeK,
     GROUP_SIZE,
     stride_A.get(), stride_B.get()
@@ -380,21 +383,22 @@ bool verify(Options const& options) {
   bool passed = true;
 
   cutlass::DeviceAllocation<int> error_counts;
-  error_counts.reset(3);
-  CUDA_CHECK(cudaMemset(error_counts.get(), 0, sizeof(int) * 3));
+  error_counts.reset(kMixedGemmValidationCounterCount);
+  CUDA_CHECK(cudaMemset(
+      error_counts.get(), 0, sizeof(int) * kMixedGemmValidationCounterCount));
+
+  // Mixed low-precision paths validate against a K/input-dependent absolute
+  // reduction/output bound.
+  float const *reduction_abs_error_bound = block_ref_abs_error_bound.get();
 
   compare_device<<<1,1>>>(
       options.compare, block_D.get(), block_ref_D.get(), block_D.size(),
-      problem_sizes.get(), options.groups, error_counts.get());
-  // Mixed low-precision WGMMA does not generally match scalar verification at
-  // strict per-element 1% relative tolerance. Accept only sparse outliers so
-  // layout/broadcast bugs still fail.
-  int error_counts_host[3] = {0, 0, 0};
+      problem_sizes.get(), options.groups, error_counts.get(), reduction_abs_error_bound);
+  // Reject any element whose measured error exceeds the K/input-dependent
+  // reduction/output budget.
+  int error_counts_host[kMixedGemmValidationCounterCount] = {};
   error_counts.copy_to_host(error_counts_host);
-  int const p99_limit = std::max(16, int(block_D.size() / 1000));
-  int const p95_limit = std::max(8, int(block_D.size() / 5000));
-  passed &= (error_counts_host[0] <= p99_limit);
-  passed &= (error_counts_host[2] <= p95_limit);
+  passed &= (error_counts_host[kReductionBoundErrorCount] == 0);
   print_device<<<1,1>>>(options.enable_print, block_ref_D.get(), block_ref_D.size(), options.groups, 'R');
   print_device<<<1,1>>>(options.enable_print, block_D.get(), block_D.size(), options.groups, 'D');
 

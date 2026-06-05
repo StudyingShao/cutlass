@@ -207,11 +207,45 @@ if (debug_input_weight) {
 // NOTE: at the point this kernel is launched (from verify()), the device-side
 // `problem_sizes` array has already been transposed for SwapAB by initialize(),
 // so each entry is laid out as (N, M, K) — original M lives at index 1.
+enum MixedGemmValidationCounter : int {
+  kP99ErrorCount = 0,
+  kP98ErrorCount = 1,
+  kP95ErrorCount = 2,
+  kReductionBoundErrorCount = 3,
+  // Sentinel used as the device counter array length; not a real counter slot.
+  kMixedGemmValidationCounterCount = 4
+};
+
+__device__ float bf16_ulp_from_abs(float ref_abs) {
+  if (!(ref_abs > 0.0f)) {
+    return 0x1p-133f;
+  }
+
+  uint32_t const bits = __float_as_uint(ref_abs);
+  int const exponent = int((bits >> 23) & 0xff);
+  if (exponent <= 7) {
+    return 0x1p-133f;
+  }
+
+  return __uint_as_float(uint32_t(exponent - 7) << 23);
+}
+
+template <typename T>
+__device__ float output_round_budget(float ref_abs) {
+  if constexpr (cute::is_same_v<T, cutlass::bfloat16_t>) {
+    return 2.0f * bf16_ulp_from_abs(ref_abs);
+  }
+  else {
+    return 0.0f;
+  }
+}
+
 template <typename T, typename ProblemSizes>
 __global__ void compare_device(
     bool compare_print, T *out, T *ref, int count,
     ProblemSizes problem_sizes_swapped, int Groups,
-    int *error_counts = nullptr)
+    int *error_counts = nullptr,
+    float const *abs_error_bound = nullptr)
 {
     if (!thread0()) return;
 
@@ -225,25 +259,40 @@ __global__ void compare_device(
     int P99_error_count = 0;
     int P98_error_count = 0;
     int P95_error_count = 0;
+    int reduction_bound_error_count = 0;
 
     int64_t base = 0;
     for (int g = 0; g < Groups; g++) {
       // problem_sizes_swapped[g] = (N_orig, M_orig, K)
       int N = get<0>(problem_sizes_swapped[g]);
       int M = get<1>(problem_sizes_swapped[g]);
+      int K = get<2>(problem_sizes_swapped[g]);
+      float const fp32_unit_roundoff = 0x1p-24f;
+      float const k_roundoff = float(K) * fp32_unit_roundoff;
+      float const gamma_k = k_roundoff / max(1.0f - k_roundoff, fp32_unit_roundoff);
       for (int m = 0; m < M; m++) {
         for (int n = 0; n < N; n++) {
           int64_t idx = base + int64_t(m) * N + n;
+          float ref_abs = abs(float(ref[idx]));
           float abs_error = abs(float(out[idx]) - float(ref[idx]));
-          float rel_error = abs_error / abs(float(ref[idx]));
+          float rel_error = abs_error / max(ref_abs, 1.0e-20f);
 
-          if (rel_error > 0.01) {
+          if (abs_error_bound != nullptr) {
+            float const reduction_budget = 2.0f * gamma_k * abs_error_bound[idx];
+            float const bf16_output_budget = output_round_budget<T>(ref_abs);
+            float const abs_limit = reduction_budget + bf16_output_budget;
+            if (abs_error > abs_limit) {
+              reduction_bound_error_count++;
+            }
+          }
+
+          if (rel_error > 0.01f) {
             P99_error_count++;
             if (compare_print)
               printf("(g=%d, m=%d, n=%d): out %f ref %f abs_error %f rel_error %f\n",
                   g, m, n, float(out[idx]), float(ref[idx]), abs_error, rel_error);
-            if (rel_error > 0.02) P98_error_count++;
-            if (rel_error > 0.05) P95_error_count++;
+            if (rel_error > 0.02f) P98_error_count++;
+            if (rel_error > 0.05f) P95_error_count++;
           }
         }
       }
@@ -252,10 +301,15 @@ __global__ void compare_device(
     printf("P99_error_count %d %.2f%%\n", P99_error_count, float(P99_error_count) / count * 100.0f);
     printf("P98_error_count %d %.2f%%\n", P98_error_count, float(P98_error_count) / count * 100.0f);
     printf("P95_error_count %d %.2f%%\n", P95_error_count, float(P95_error_count) / count * 100.0f);
+    if (abs_error_bound != nullptr) {
+      printf("Reduction_bound_error_count %d %.2f%%\n",
+          reduction_bound_error_count, float(reduction_bound_error_count) / count * 100.0f);
+    }
     if (error_counts != nullptr) {
-      error_counts[0] = P99_error_count;
-      error_counts[1] = P98_error_count;
-      error_counts[2] = P95_error_count;
+      error_counts[kP99ErrorCount] = P99_error_count;
+      error_counts[kP98ErrorCount] = P98_error_count;
+      error_counts[kP95ErrorCount] = P95_error_count;
+      error_counts[kReductionBoundErrorCount] = reduction_bound_error_count;
     }
 }
 
@@ -275,7 +329,8 @@ __device__ void single_gemm_varify(
   ElementB *B_ptr,
   ElementWeightScalePacked *weight_scale_ptr,
   ElementActivationScaleRaw *activation_scale_ptr,
-  ElementD *D_ptr) {
+  ElementD *D_ptr,
+  float *abs_error_bound_ptr = nullptr) {
 
   float lut[16];
 
@@ -297,9 +352,11 @@ __device__ void single_gemm_varify(
     for (int n = tid; n < N; n += blockDim.x) {
 
         float accum = 0.0f;
+        float abs_error_bound = 0.0f;
 
         for (int k_group = 0; k_group < K; k_group += group_size) {
             float group_accum = 0.0f;
+            float group_abs_bound = 0.0f;
 
             for (int k = k_group; k < k_group + group_size; k += 2) {
                 ElementA *local_A_ptr = A_ptr + m * K + k;
@@ -315,6 +372,8 @@ __device__ void single_gemm_varify(
                 float elem_B_high = lut[elem_B_high_];
 
                 group_accum += elem_A_0 * elem_B_low + elem_A_1 * elem_B_high;
+                group_abs_bound +=
+                    abs(elem_A_0) * abs(elem_B_low) + abs(elem_A_1) * abs(elem_B_high);
             }
 
             ElementWeightScalePacked *local_weight_scale_ptr =
@@ -329,6 +388,7 @@ __device__ void single_gemm_varify(
             }
 
             accum += group_accum * scale;
+            abs_error_bound += group_abs_bound * abs(scale);
 
             // if (group_id == 0 && bid == 0 && tid == 0)
             //     printf("A %f %f B %f %f scale %f accum %f\n",
@@ -343,6 +403,9 @@ __device__ void single_gemm_varify(
 
         ElementD *local_D_ptr = D_ptr + m * N + n;
         *local_D_ptr = static_cast<ElementD>(accum);
+        if (abs_error_bound_ptr != nullptr) {
+          abs_error_bound_ptr[m * N + n] = abs_error_bound;
+        }
     }
   }
 }
@@ -367,6 +430,7 @@ __global__ void groupwise_verify_kernel(
     ElementWeightScalePacked *weight_scale,
     ElementActivationScaleRaw *activation_scale,
     ElementD *D,
+    float *abs_error_bound,
     int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
@@ -415,7 +479,8 @@ __global__ void groupwise_verify_kernel(
           bid, tid,
           block_tile_k, group_size,
           M, N, K,
-          A_ptr, B_ptr, weight_scale_ptr, activation_scale_ptr, D_ptr
+          A_ptr, B_ptr, weight_scale_ptr, activation_scale_ptr, D_ptr,
+          abs_error_bound
         );
 
         A_ptr += M * K;
@@ -425,6 +490,9 @@ __global__ void groupwise_verify_kernel(
           activation_scale_ptr += M * K / group_size;
         }
         D_ptr += M * N;
+        if (abs_error_bound != nullptr) {
+          abs_error_bound += M * N;
+        }
     }
 }
 
@@ -447,6 +515,7 @@ void groupwise_verify(
     ElementWeightScalePacked *weight_scale,
     ElementActivationScaleRaw *activation_scale,
     ElementD *D,
+    float *abs_error_bound,
     int block_tile_k, int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
@@ -454,6 +523,7 @@ void groupwise_verify(
         problem_sizes, 
         group_num, 
         A, B, weight_scale, activation_scale, D,
+        abs_error_bound,
         block_tile_k, group_size,
         stride_A, stride_B);
     cudaDeviceSynchronize();
