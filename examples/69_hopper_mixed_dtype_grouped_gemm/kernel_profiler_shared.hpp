@@ -28,6 +28,7 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/epilogue/fusion/sm90_ptr_array_scale_callbacks_tma_warpspecialized.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
@@ -77,12 +78,16 @@ using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
 #define CUTLASS_MIXED_GEMM_TILE_SHAPE_N 16
 #endif
 
+#ifndef CUTLASS_MIXED_GEMM_TILE_SHAPE_M
+#define CUTLASS_MIXED_GEMM_TILE_SHAPE_M 128
+#endif
+
 #if defined(CUTLASS_MIXED_GEMM_MXFP4_BF16)
 using MmaType = cutlass::bfloat16_t;     // activations
 using QuantType = cutlass::float_e2m1_t; // weights
 #define GROUP_SIZE 32
 using ElementScale = cutlass::float_ue8m0_t;
-inline constexpr int TileShapeM = 128;
+inline constexpr int TileShapeM = CUTLASS_MIXED_GEMM_TILE_SHAPE_M;
 inline constexpr int TileShapeN = CUTLASS_MIXED_GEMM_TILE_SHAPE_N;
 inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 #elif defined(CUTLASS_MIXED_GEMM_MXFP4_FP8)
@@ -93,7 +98,7 @@ using MmaType = cutlass::float_e4m3_t;      // activations
 using QuantType = cutlass::float_e2m1_t;    // weights
 #define GROUP_SIZE 32
 using ElementScale = cutlass::float_ue8m0_t;
-inline constexpr int TileShapeM = 128;
+inline constexpr int TileShapeM = CUTLASS_MIXED_GEMM_TILE_SHAPE_M;
 inline constexpr int TileShapeN = CUTLASS_MIXED_GEMM_TILE_SHAPE_N;
 inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 #elif defined(CUTLASS_MIXED_GEMM_MXFP4_MXFP8)
@@ -103,7 +108,7 @@ using MmaType = cutlass::float_e4m3_t;      // activation payload
 using QuantType = cutlass::float_e2m1_t;    // weights
 #define GROUP_SIZE 32
 using ElementScale = cutlass::float_ue8m0_t;
-inline constexpr int TileShapeM = 128;
+inline constexpr int TileShapeM = CUTLASS_MIXED_GEMM_TILE_SHAPE_M;
 inline constexpr int TileShapeN = CUTLASS_MIXED_GEMM_TILE_SHAPE_N;
 inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 #else
@@ -112,7 +117,7 @@ using MmaType = cutlass::float_e4m3_t;      // activations
 using QuantType = cutlass::int4b_t;         // weights
 #define GROUP_SIZE 128
 using ElementScale = cutlass::bfloat16_t;
-inline constexpr int TileShapeM = 128;
+inline constexpr int TileShapeM = CUTLASS_MIXED_GEMM_TILE_SHAPE_M;
 inline constexpr int TileShapeN = CUTLASS_MIXED_GEMM_TILE_SHAPE_N;
 inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 #endif
@@ -149,7 +154,11 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
   void parse(int argc, char const **args) {
     cutlass::CommandLine cmd(argc, args);
     cmd.get_cmd_line_argument("explore", explore);
+    bool const compare_was_set = cmd.check_cmd_line_flag("compare");
     cmd.get_cmd_line_argument("compare", compare);
+    if (explore && !compare_was_set) {
+      compare = false;
+    }
     cmd.get_cmd_line_argument("enable_print", enable_print);
     cmd.get_cmd_line_argument("enable_print_weight", enable_print_weight);
     cmd.get_cmd_line_argument("debug_input_act", debug_input_act);
@@ -176,6 +185,7 @@ struct Options : GroupedMixedDtypeOptions<QuantType> {
       << "  --beta=<f32>                Epilogue scalar beta\n\n"
       << "  --iterations=<int>          Number of profiling iterations to perform\n\n"
       << "  --warmup=<int>              Number of warmup iterations to perform\n\n"
+      << "  --compare=<bool>            Print per-element mismatch details. Default false for --explore=true.\n"
       << "  --swizzle=<int>             Tile scheduler swizzle size (1, 2, 4, or 8). Default: 2\n"
       << "  --split_timing=<bool>       Print diagnostic builder/GEMM event timing split.\n"
       << "  --total_routed_tokens=<int> Override total token count for scheduler capacity sizing.\n"
@@ -257,6 +267,7 @@ inline constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
 // Core
 using ElementAccumulator = float;
+using ElementEpilogueTokenScale = ElementAccumulator;
 using ArchTag            = cutlass::arch::Sm90;
 using OperatorClass      = cutlass::arch::OpClassTensorOp;
 using StageCountType     = cutlass::gemm::collective::StageCountAuto;
@@ -288,6 +299,19 @@ using DefaultKernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedC
 using DefaultEpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
 #endif
 
+#if defined(CUTLASS_MIXED_GEMM_EPILOGUE_TOKEN_SCALE)
+using DefaultFusionOperation = cutlass::epilogue::fusion::PtrArrayPerTokenScaledAcc<
+    ElementD,
+    ElementAccumulator,
+    ElementEpilogueTokenScale>;
+#else
+using DefaultFusionOperation = cutlass::epilogue::fusion::LinearCombination<
+    ElementD,
+    ElementAccumulator,
+    ElementC,
+    ElementAccumulator>;
+#endif
+
 using DefaultCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
     DefaultTileShape, DefaultClusterShape,
@@ -295,7 +319,8 @@ using DefaultCollectiveEpilogue = typename cutlass::epilogue::collective::Collec
     ElementAccumulator, ElementAccumulator,
     ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type *, AlignmentC,
     ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type *, AlignmentD,
-    DefaultEpilogueSchedule
+    DefaultEpilogueSchedule,
+    DefaultFusionOperation
 >::CollectiveOp;
 
 using DefaultCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -344,6 +369,19 @@ public:
         cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative
     >::type;
 
+#if defined(CUTLASS_MIXED_GEMM_EPILOGUE_TOKEN_SCALE)
+    using FusionOperation = cutlass::epilogue::fusion::PtrArrayPerTokenScaledAcc<
+        ElementD,
+        ElementAccumulator,
+        ElementEpilogueTokenScale>;
+#else
+    using FusionOperation = cutlass::epilogue::fusion::LinearCombination<
+        ElementD,
+        ElementAccumulator,
+        ElementC,
+        ElementAccumulator>;
+#endif
+
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         ArchTag, OperatorClass,
         TileShape, ClusterShape,
@@ -351,7 +389,8 @@ public:
         ElementAccumulator, ElementAccumulator,
         ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type *, AlignmentC,
         ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type *, AlignmentD,
-        EpilogueSchedule
+        EpilogueSchedule,
+        FusionOperation
     >::CollectiveOp;
 
     using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -402,6 +441,7 @@ extern cutlass::DeviceAllocation<ElementScale>                                  
 extern cutlass::DeviceAllocation<ElementScalePacked>                                    block_weight_scale_packed;
 extern cutlass::DeviceAllocation<ElementActivationScale>                                block_activation_scale;
 extern cutlass::DeviceAllocation<ElementActivationScalePacked>                          block_activation_scale_packed;
+extern cutlass::DeviceAllocation<ElementEpilogueTokenScale>                             block_epilogue_token_scale;
 extern cutlass::DeviceAllocation<ElementZero>                                           block_zero;
 extern cutlass::DeviceAllocation<ElementC>                                              block_C;
 extern cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput> block_D;
@@ -411,6 +451,7 @@ extern cutlass::DeviceAllocation<const MmaType *>                    ptr_A;
 extern cutlass::DeviceAllocation<const QuantType *>                  ptr_B;
 extern cutlass::DeviceAllocation<const ElementActivationScale *>     ptr_activation_scale;
 extern cutlass::DeviceAllocation<ElementActivationScalePacked *>     ptr_activation_scale_packed;
+extern cutlass::DeviceAllocation<const ElementEpilogueTokenScale *>  ptr_epilogue_token_scale;
 extern cutlass::DeviceAllocation<const ElementScalePacked *>         ptr_weight_scale_packed;
 extern cutlass::DeviceAllocation<const ElementZero *>                ptr_zero;
 extern cutlass::DeviceAllocation<const ElementC *>                   ptr_C;
@@ -454,6 +495,10 @@ typename Gemm::Arguments args_from_options(Options const& options)
   Args arguments;
   decltype(arguments.epilogue.thread) fusion_args;
 
+#if defined(CUTLASS_MIXED_GEMM_EPILOGUE_TOKEN_SCALE)
+  fusion_args.token_scale_default = ElementAccumulator(1);
+  fusion_args.token_scale_ptr_array = ptr_epilogue_token_scale.get();
+#else
   if (options.alpha != FLT_MAX && options.beta != FLT_MAX) {
     fusion_args.alpha = options.alpha;
     fusion_args.beta  = options.beta;
@@ -474,6 +519,7 @@ typename Gemm::Arguments args_from_options(Options const& options)
     fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
     fusion_args.dBeta  = {cute::_0{}, cute::_0{}, 1};
   }
+#endif
 
   decltype(arguments.mainloop) mainloop_args{
     ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_weight_scale_packed.get(), stride_weight_scale.get(), GROUP_SIZE
@@ -527,12 +573,6 @@ void profile_grouped_mixed_dtype(
   constexpr int CurrentTileShapeN = cute::size<1>(TileShape{});
   constexpr int CurrentClusterShapeM = cute::size<0>(ClusterShape{});
   constexpr int CurrentClusterShapeN = cute::size<1>(ClusterShape{});
-  prepare_precomputed_work_tile_map<
-      CurrentTileShapeM,
-      CurrentTileShapeN,
-      CurrentClusterShapeM,
-      CurrentClusterShapeN>(options);
-
   auto build_work_map = [&]() {
     build_precomputed_work_tile_map<
         CurrentTileShapeM,

@@ -69,7 +69,7 @@ Knowledge Document (distilled wisdom)
 ## Log Status
 
 Active logs (optimization in progress):
-- [To be filled when sessions start]
+- [2026-06-05-cmx-fused-e8m0-correctness-revalidation.md](2026-06-05-cmx-fused-e8m0-correctness-revalidation.md)
 
 Completed logs:
 - [2026-03-19-scheduler-work-switching.md](2026-03-19-scheduler-work-switching.md)
@@ -80,4 +80,4 @@ Completed logs:
 
 ---
 
-**Last Updated**: 2026-06-03
+**Last Updated**: 2026-06-05

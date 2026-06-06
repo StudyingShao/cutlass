@@ -794,6 +794,21 @@ psx_cvt_lut_prmt_int4x8_to_fp8x8
     return fp8x8_raw;
 }
 
+template<class...>
+using MixedInputVoid = void;
+
+template<class Collective, class = void>
+struct MixedInputFusedE8M0PreMmaScale {
+  static constexpr bool value = false;
+};
+
+template<class Collective>
+struct MixedInputFusedE8M0PreMmaScale<
+    Collective,
+    MixedInputVoid<decltype(Collective::FusedE8M0PreMmaScale)>> {
+  static constexpr bool value = Collective::FusedE8M0PreMmaScale;
+};
+
 template<class Collective>
 struct MixedInputUtils {
 private:
@@ -818,6 +833,8 @@ private:
   static constexpr auto UseFP4ToFP8LookupTable = Collective::UseFP4ToFP8LookupTable;
   static constexpr auto UseInt4ToFP8LookupTable = Collective::UseInt4ToFP8LookupTable;
   static constexpr auto HasActivationScale = Collective::HasActivationScale;
+  static constexpr bool FusedE8M0PreMmaScale =
+      MixedInputFusedE8M0PreMmaScale<Collective>::value;
 
 public:
   static constexpr auto
@@ -1155,6 +1172,94 @@ public:
 #endif
   }
 
+  __device__ __inline__
+  static void fp4tofp8_fused_e8m0_pre_mma_convert_pair(
+      __nv_fp4x8_storage_t fp4x8_0,
+      __nv_fp4x8_storage_t fp4x8_1,
+      __nv_fp8x8_storage_t& fp8x8_raw_0,
+      __nv_fp8x8_storage_t& fp8x8_raw_1,
+      uint32_t lo_exp_offset,
+      uint32_t hi_exp_offset) {
+    // One WGMMA A operand lane contributes two fp4x8 registers whose low
+    // fp8x4 chunks share one row scale, and high chunks share the other.
+    __nv_fp8x4_storage_t *fp8x4_raw_0 =
+        reinterpret_cast<__nv_fp8x4_storage_t *>(&fp8x8_raw_0);
+    __nv_fp8x4_storage_t *fp8x4_raw_1 =
+        reinterpret_cast<__nv_fp8x4_storage_t *>(&fp8x8_raw_1);
+
+    uint32_t const fp4_raw_0 = reinterpret_cast<uint32_t const&>(fp4x8_0);
+    uint32_t const fp4_raw_1 = reinterpret_cast<uint32_t const&>(fp4x8_1);
+    uint32_t const em_selector_0 = fp4_raw_0 & 0x77777777U;
+    uint32_t const em_selector_1 = fp4_raw_1 & 0x77777777U;
+    constexpr uint32_t fp4_codes_0_to_3_em_bias = 0x0c080000U;
+    constexpr uint32_t fp4_codes_4_to_7_em_bias = 0x1c181410U;
+    uint32_t const lo_l4b_exp_offseted_lut =
+        (lo_exp_offset * 0x08080800U) + fp4_codes_0_to_3_em_bias;
+    uint32_t const lo_h4b_exp_offseted_lut =
+        (lo_exp_offset * 0x08080808U) + fp4_codes_4_to_7_em_bias;
+    uint32_t const hi_l4b_exp_offseted_lut =
+        (hi_exp_offset * 0x08080800U) + fp4_codes_0_to_3_em_bias;
+    uint32_t const hi_h4b_exp_offseted_lut =
+        (hi_exp_offset * 0x08080808U) + fp4_codes_4_to_7_em_bias;
+
+    uint32_t const lo_em_fp8x4_0 =
+        prmt(lo_h4b_exp_offseted_lut, lo_l4b_exp_offseted_lut, em_selector_0);
+    uint32_t const lo_em_fp8x4_1 =
+        prmt(lo_h4b_exp_offseted_lut, lo_l4b_exp_offseted_lut, em_selector_1);
+
+#if defined(CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS)
+    fp8x4_raw_0[0] = (fp4_raw_0 & 0x80808080U) | lo_em_fp8x4_0;
+    fp8x4_raw_1[0] = (fp4_raw_1 & 0x80808080U) | lo_em_fp8x4_1;
+#else
+    uint32_t const hb_sign_fp8x4_0 = fp4_raw_0 & 0x80808080U;
+    uint32_t const hb_sign_fp8x4_1 = fp4_raw_1 & 0x80808080U;
+    uint32_t const lb_sign_fp8x4_0 = (fp4_raw_0 & 0x08080808U) << 4U;
+    uint32_t const lb_sign_fp8x4_1 = (fp4_raw_1 & 0x08080808U) << 4U;
+    uint32_t const l4b_sign_fp8x4_0 = prmt(hb_sign_fp8x4_0, lb_sign_fp8x4_0, 0x5140U);
+    uint32_t const l4b_sign_fp8x4_1 = prmt(hb_sign_fp8x4_1, lb_sign_fp8x4_1, 0x5140U);
+    uint32_t const h4b_sign_fp8x4_0 = prmt(hb_sign_fp8x4_0, lb_sign_fp8x4_0, 0x7362U);
+    uint32_t const h4b_sign_fp8x4_1 = prmt(hb_sign_fp8x4_1, lb_sign_fp8x4_1, 0x7362U);
+
+    fp8x4_raw_0[0] = l4b_sign_fp8x4_0 | lo_em_fp8x4_0;
+    fp8x4_raw_1[0] = l4b_sign_fp8x4_1 | lo_em_fp8x4_1;
+#endif
+
+    uint32_t const hi_em_fp8x4_0 =
+        prmt(hi_h4b_exp_offseted_lut, hi_l4b_exp_offseted_lut, em_selector_0 >> 16U);
+    uint32_t const hi_em_fp8x4_1 =
+        prmt(hi_h4b_exp_offseted_lut, hi_l4b_exp_offseted_lut, em_selector_1 >> 16U);
+
+#if defined(CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS)
+    fp8x4_raw_0[1] = ((fp4_raw_0 << 4U) & 0x80808080U) | hi_em_fp8x4_0;
+    fp8x4_raw_1[1] = ((fp4_raw_1 << 4U) & 0x80808080U) | hi_em_fp8x4_1;
+#else
+    fp8x4_raw_0[1] = h4b_sign_fp8x4_0 | hi_em_fp8x4_0;
+    fp8x4_raw_1[1] = h4b_sign_fp8x4_1 | hi_em_fp8x4_1;
+#endif
+  }
+
+  template <class EngineIn,
+            class LayoutIn,
+            class EngineOut,
+            class LayoutOut>
+  CUTLASS_DEVICE
+  static void fp4tofp8_fused_e8m0_pre_mma_convert_pair(
+    Tensor<EngineIn, LayoutIn>       const& src0,
+    Tensor<EngineIn, LayoutIn>       const& src1,
+    Tensor<EngineOut, LayoutOut>          & dst0,
+    Tensor<EngineOut, LayoutOut>          & dst1,
+    uint32_t lo_exp_offset,
+    uint32_t hi_exp_offset) {
+
+    auto&& src0_ = cute::recast<__nv_fp4x8_storage_t>(src0)(0);
+    auto&& src1_ = cute::recast<__nv_fp4x8_storage_t>(src1)(0);
+    auto&& dst0_ = cute::recast<__nv_fp8x8_storage_t>(dst0)(0);
+    auto&& dst1_ = cute::recast<__nv_fp8x8_storage_t>(dst1)(0);
+
+    fp4tofp8_fused_e8m0_pre_mma_convert_pair(
+        src0_, src1_, dst0_, dst1_, lo_exp_offset, hi_exp_offset);
+  }
+
   /// Utilities to dequantize A.
   template <class Layout>
   CUTLASS_DEVICE
@@ -1356,6 +1461,172 @@ public:
         LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
       }
     }
+  }
+
+  template <class EngineIn,
+            class EngineOut,
+            class LayoutIn,
+            class LayoutOut,
+            class EngineScale,
+            class LayoutScale>
+  CUTLASS_DEVICE
+  static void convert_A_kblock_fused_e8m0_pre_mma_to_slot(
+    Tensor<EngineIn, LayoutIn> const& tCrA_load,
+    Tensor<EngineOut, LayoutOut>& tCrA_mma_slot,
+    Tensor<EngineScale, LayoutScale>& scale_packs,
+    int const k_block,
+    int const scale_idx) {
+
+    static_assert(FusedE8M0PreMmaScale, "This helper is only for fused e8m0 pre-MMA scale.");
+    static_assert(UseFP4ToFP8LookupTable, "Fused e8m0 pre-MMA scale currently supports MXFP4 x FP8 only.");
+    static_assert(cutlass::detail::is_Array_v<ElementScale>,
+        "Fused e8m0 pre-MMA scale expects TileK-packed e8m0 scale arrays.");
+    static_assert(is_rmem<EngineIn>::value, "Input tensor for A conversion must come from registers");
+    static_assert(is_rmem<EngineOut>::value, "Output tensor for A conversion must come from registers");
+    static_assert(is_rmem<EngineScale>::value, "Scale tensor for A conversion must come from registers");
+    using SrcType = typename EngineIn::value_type;
+
+    Tensor src = tCrA_load(_, _, k_block);
+    Tensor dst = tCrA_mma_slot;
+
+    CUTE_STATIC_ASSERT_V(size(src(_, 0)) == cosize(src(_, 0).layout()),
+                         "The first mode of tensor src must be contiguous in memory");
+    CUTE_STATIC_ASSERT_V(size(src) == size(dst));
+    CUTE_STATIC_ASSERT_V(size(src) == size(scale_packs));
+
+    int constexpr NumValPerSrcReg = cute::min(decltype(size(src(_, 0)))::value,
+                                              ceil_div(32, sizeof_bits_v<SrcType>));
+    Tensor src_vm = cute::group_modes<1,-1>(cute::zipped_divide(src, Int<NumValPerSrcReg>{}));
+    Tensor dst_vm = cute::group_modes<1,-1>(cute::zipped_divide(dst, Int<NumValPerSrcReg>{}));
+    Tensor scale_packs_vm = cute::group_modes<1,-1>(
+        cute::zipped_divide(scale_packs, Int<NumValPerSrcReg>{}));
+
+    auto scale_pack_values_0 = cute::filter(scale_packs_vm(_, Int<0>{}));
+    constexpr int ScalePackCount = decltype(size(scale_pack_values_0))::value;
+    constexpr int DstVecCount = decltype(size<1>(dst_vm))::value;
+    static_assert(ScalePackCount == 2,
+        "Fused e8m0 pre-MMA scale expects exactly two row-scale packs per paired A operand.");
+    static_assert((DstVecCount % 2) == 0,
+        "Fused e8m0 pre-MMA pair conversion expects an even number of fp4x8 operands.");
+    using ScaleScalar = typename ElementScale::Element;
+
+    // Make the row-scale pattern explicit: chunks 0/2 use scale 0, chunks
+    // 1/3 use scale 1. Do not rely on ptxas to rediscover this pairing.
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < DstVecCount; i += 2) {
+      auto scale_pack_values = cute::filter(scale_packs_vm(_, i));
+      ScaleScalar const lo_scale = scale_pack_values(0)[scale_idx];
+      ScaleScalar const hi_scale = scale_pack_values(1)[scale_idx];
+      uint32_t const lo_exp_offset = static_cast<uint32_t>(lo_scale.storage);
+      uint32_t const hi_exp_offset = static_cast<uint32_t>(hi_scale.storage);
+      auto src_vec0 = src_vm(_, i);
+      auto src_vec1 = src_vm(_, i + 1);
+      auto dst_vec0 = dst_vm(_, i);
+      auto dst_vec1 = dst_vm(_, i + 1);
+      fp4tofp8_fused_e8m0_pre_mma_convert_pair(
+          src_vec0, src_vec1, dst_vec0, dst_vec1, lo_exp_offset, hi_exp_offset);
+    }
+  }
+
+  template <int KBlock, int ScaleIdx,
+            class EngineIn,
+            class EngineOut,
+            class LayoutIn,
+            class LayoutOut,
+            class EngineScale,
+            class LayoutScale>
+  CUTLASS_DEVICE
+  static void convert_A_kblock_fused_e8m0_pre_mma_to_slot(
+    Tensor<EngineIn, LayoutIn> const& tCrA_load,
+    Tensor<EngineOut, LayoutOut>& tCrA_mma_slot,
+    Tensor<EngineScale, LayoutScale>& scale_packs,
+    cute::Int<KBlock>,
+    cute::Int<ScaleIdx>) {
+
+    static_assert(FusedE8M0PreMmaScale, "This helper is only for fused e8m0 pre-MMA scale.");
+    static_assert(UseFP4ToFP8LookupTable, "Fused e8m0 pre-MMA scale currently supports MXFP4 x FP8 only.");
+    static_assert(cutlass::detail::is_Array_v<ElementScale>,
+        "Fused e8m0 pre-MMA scale expects TileK-packed e8m0 scale arrays.");
+    static_assert(is_rmem<EngineIn>::value, "Input tensor for A conversion must come from registers");
+    static_assert(is_rmem<EngineOut>::value, "Output tensor for A conversion must come from registers");
+    static_assert(is_rmem<EngineScale>::value, "Scale tensor for A conversion must come from registers");
+    using SrcType = typename EngineIn::value_type;
+
+    Tensor src = tCrA_load(_, _, cute::Int<KBlock>{});
+    Tensor dst = tCrA_mma_slot;
+
+    CUTE_STATIC_ASSERT_V(size(src(_, 0)) == cosize(src(_, 0).layout()),
+                         "The first mode of tensor src must be contiguous in memory");
+    CUTE_STATIC_ASSERT_V(size(src) == size(dst));
+    CUTE_STATIC_ASSERT_V(size(src) == size(scale_packs));
+
+    int constexpr NumValPerSrcReg = cute::min(decltype(size(src(_, 0)))::value,
+                                              ceil_div(32, sizeof_bits_v<SrcType>));
+    Tensor src_vm = cute::group_modes<1,-1>(cute::zipped_divide(src, Int<NumValPerSrcReg>{}));
+    Tensor dst_vm = cute::group_modes<1,-1>(cute::zipped_divide(dst, Int<NumValPerSrcReg>{}));
+    Tensor scale_packs_vm = cute::group_modes<1,-1>(
+        cute::zipped_divide(scale_packs, Int<NumValPerSrcReg>{}));
+
+    auto scale_pack_values_0 = cute::filter(scale_packs_vm(_, Int<0>{}));
+    constexpr int ScalePackCount = decltype(size(scale_pack_values_0))::value;
+    constexpr int DstVecCount = decltype(size<1>(dst_vm))::value;
+    static_assert(ScalePackCount == 2,
+        "Fused e8m0 pre-MMA scale expects exactly two row-scale packs per paired A operand.");
+    static_assert((DstVecCount % 2) == 0,
+        "Fused e8m0 pre-MMA pair conversion expects an even number of fp4x8 operands.");
+    using ScaleScalar = typename ElementScale::Element;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < DstVecCount; i += 2) {
+      auto scale_pack_values = cute::filter(scale_packs_vm(_, i));
+      ScaleScalar const lo_scale = scale_pack_values(0)[ScaleIdx];
+      ScaleScalar const hi_scale = scale_pack_values(1)[ScaleIdx];
+      uint32_t const lo_exp_offset = static_cast<uint32_t>(lo_scale.storage);
+      uint32_t const hi_exp_offset = static_cast<uint32_t>(hi_scale.storage);
+      auto src_vec0 = src_vm(_, i);
+      auto src_vec1 = src_vm(_, i + 1);
+      auto dst_vec0 = dst_vm(_, i);
+      auto dst_vec1 = dst_vm(_, i + 1);
+      fp4tofp8_fused_e8m0_pre_mma_convert_pair(
+          src_vec0, src_vec1, dst_vec0, dst_vec1, lo_exp_offset, hi_exp_offset);
+    }
+  }
+
+  template <class EngineIn,
+            class EngineOut,
+            class LayoutIn,
+            class LayoutOut,
+            class... Ts>
+  CUTLASS_DEVICE
+  static void convert_A_kblock_fused_e8m0_pre_mma_to_slot(
+    Tensor<EngineIn, LayoutIn> const& tCrA_load,
+    Tensor<EngineOut, LayoutOut>& tCrA_mma_slot,
+    cute::tuple<Ts...>& partitioned_extra_info,
+    int const k_block,
+    int const scale_idx) {
+
+    Tensor scale_packs = cute::get<1>(partitioned_extra_info)(_, _, Int<0>{});
+    convert_A_kblock_fused_e8m0_pre_mma_to_slot(
+        tCrA_load, tCrA_mma_slot, scale_packs, k_block, scale_idx);
+  }
+
+  template <int KBlock, int ScaleIdx,
+            class EngineIn,
+            class EngineOut,
+            class LayoutIn,
+            class LayoutOut,
+            class... Ts>
+  CUTLASS_DEVICE
+  static void convert_A_kblock_fused_e8m0_pre_mma_to_slot(
+    Tensor<EngineIn, LayoutIn> const& tCrA_load,
+    Tensor<EngineOut, LayoutOut>& tCrA_mma_slot,
+    cute::tuple<Ts...>& partitioned_extra_info,
+    cute::Int<KBlock> k_block,
+    cute::Int<ScaleIdx> scale_idx) {
+
+    Tensor scale_packs = cute::get<1>(partitioned_extra_info)(_, _, Int<0>{});
+    convert_A_kblock_fused_e8m0_pre_mma_to_slot(
+        tCrA_load, tCrA_mma_slot, scale_packs, k_block, scale_idx);
   }
 
   /// Utilities for any additional inputs inside of the TMA load

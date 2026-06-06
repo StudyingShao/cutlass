@@ -483,9 +483,19 @@ public:
       : detail::compute_stage_count_or_override<detail::sm90_smem_capacity_bytes,
           ElementAMma, ElementBMma, TileShape_MNK, StageCountType::bytes, SmemAlignment>(StageCountType{});
 
+#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+  using ArrayMixedInputDispatchPolicy =
+      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<
+          PipelineStages, ClusterShape_MNK, KernelScheduleType>;
+#else
+  using ArrayMixedInputDispatchPolicy =
+      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<
+          PipelineStages, ClusterShape_MNK, KernelScheduleType>;
+#endif
+
   using DispatchPolicy = cute::conditional_t<IsMixedInput,
       cute::conditional_t<IsArrayOfPointersGemm,
-        MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<PipelineStages, ClusterShape_MNK, KernelScheduleType>,
+        ArrayMixedInputDispatchPolicy,
         MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput<PipelineStages, ClusterShape_MNK, KernelScheduleType>>,
         MainloopSm90TmaGmmaRmemAWarpSpecialized<PipelineStages, ClusterShape_MNK, KernelScheduleType>>;
 

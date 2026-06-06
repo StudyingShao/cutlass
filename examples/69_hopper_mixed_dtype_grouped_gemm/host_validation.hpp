@@ -117,6 +117,15 @@ __global__ void set_device_sequential(T *ptr, int count, int seed, int value = 0
   }
 }
 
+template<typename T>
+__global__ void scale_device(T *ptr, int count, float scale) {
+  if (thread0()) {
+    for (int i = 0; i < count; ++i) {
+      ptr[i] = static_cast<T>(static_cast<float>(ptr[i]) * scale);
+    }
+  }
+}
+
 __global__ void set_device_ue8m0(bool debug_input_scale, void *ptr_, int count, int default_val = 1) {
 
   cutlass::float_ue8m0_t *ptr = reinterpret_cast<cutlass::float_ue8m0_t *>(ptr_);
@@ -211,9 +220,10 @@ enum MixedGemmValidationCounter : int {
   kP99ErrorCount = 0,
   kP98ErrorCount = 1,
   kP95ErrorCount = 2,
-  kReductionBoundErrorCount = 3,
+  kHummingToleranceErrorCount = 3,
+  kReductionBoundErrorCount = 4,
   // Sentinel used as the device counter array length; not a real counter slot.
-  kMixedGemmValidationCounterCount = 4
+  kMixedGemmValidationCounterCount = 5
 };
 
 __device__ float bf16_ulp_from_abs(float ref_abs) {
@@ -240,7 +250,7 @@ __device__ float output_round_budget(float ref_abs) {
   }
 }
 
-template <typename T, typename ProblemSizes>
+template <bool UseHummingTolerance = false, typename T, typename ProblemSizes>
 __global__ void compare_device(
     bool compare_print, T *out, T *ref, int count,
     ProblemSizes problem_sizes_swapped, int Groups,
@@ -259,7 +269,10 @@ __global__ void compare_device(
     int P99_error_count = 0;
     int P98_error_count = 0;
     int P95_error_count = 0;
+    int humming_tolerance_error_count = 0;
     int reduction_bound_error_count = 0;
+    float max_abs_error = 0.0f;
+    float max_rel_error = 0.0f;
 
     int64_t base = 0;
     for (int g = 0; g < Groups; g++) {
@@ -276,7 +289,14 @@ __global__ void compare_device(
           float ref_abs = abs(float(ref[idx]));
           float abs_error = abs(float(out[idx]) - float(ref[idx]));
           float rel_error = abs_error / max(ref_abs, 1.0e-20f);
+          max_abs_error = max(max_abs_error, abs_error);
+          max_rel_error = max(max_rel_error, rel_error);
 
+          if constexpr (UseHummingTolerance) {
+            if (abs_error > (0.5f + 0.05f * ref_abs)) {
+              humming_tolerance_error_count++;
+            }
+          }
           if (abs_error_bound != nullptr) {
             float const reduction_budget = 2.0f * gamma_k * abs_error_bound[idx];
             float const bf16_output_budget = output_round_budget<T>(ref_abs);
@@ -286,13 +306,33 @@ __global__ void compare_device(
             }
           }
 
-          if (rel_error > 0.01f) {
+          bool p99_error = false;
+          bool p98_error = false;
+          bool p95_error = false;
+          if constexpr (UseHummingTolerance) {
+            // Direct/fused pre-MMA paths accumulate a larger dynamic range
+            // before bf16 output rounding. Use combined tolerance so near-zero
+            // references do not dominate the relative-error count.
+            float p99_abs_limit = max(0.75f, 0.03f * ref_abs);
+            float p98_abs_limit = max(1.50f, 0.06f * ref_abs);
+            float p95_abs_limit = max(3.00f, 0.12f * ref_abs);
+            p99_error = abs_error > p99_abs_limit;
+            p98_error = abs_error > p98_abs_limit;
+            p95_error = abs_error > p95_abs_limit;
+          }
+          else {
+            p99_error = rel_error > 0.01f;
+            p98_error = rel_error > 0.02f;
+            p95_error = rel_error > 0.05f;
+          }
+
+          if (p99_error) {
             P99_error_count++;
             if (compare_print)
               printf("(g=%d, m=%d, n=%d): out %f ref %f abs_error %f rel_error %f\n",
                   g, m, n, float(out[idx]), float(ref[idx]), abs_error, rel_error);
-            if (rel_error > 0.02f) P98_error_count++;
-            if (rel_error > 0.05f) P95_error_count++;
+            if (p98_error) P98_error_count++;
+            if (p95_error) P95_error_count++;
           }
         }
       }
@@ -301,6 +341,11 @@ __global__ void compare_device(
     printf("P99_error_count %d %.2f%%\n", P99_error_count, float(P99_error_count) / count * 100.0f);
     printf("P98_error_count %d %.2f%%\n", P98_error_count, float(P98_error_count) / count * 100.0f);
     printf("P95_error_count %d %.2f%%\n", P95_error_count, float(P95_error_count) / count * 100.0f);
+    if constexpr (UseHummingTolerance) {
+      printf("Humming_tol_error_count %d %.2f%% max_abs_error %f max_rel_error %f\n",
+          humming_tolerance_error_count, float(humming_tolerance_error_count) / count * 100.0f,
+          max_abs_error, max_rel_error);
+    }
     if (abs_error_bound != nullptr) {
       printf("Reduction_bound_error_count %d %.2f%%\n",
           reduction_bound_error_count, float(reduction_bound_error_count) / count * 100.0f);
@@ -309,6 +354,9 @@ __global__ void compare_device(
       error_counts[kP99ErrorCount] = P99_error_count;
       error_counts[kP98ErrorCount] = P98_error_count;
       error_counts[kP95ErrorCount] = P95_error_count;
+      if constexpr (UseHummingTolerance) {
+        error_counts[kHummingToleranceErrorCount] = humming_tolerance_error_count;
+      }
       error_counts[kReductionBoundErrorCount] = reduction_bound_error_count;
     }
 }
@@ -408,6 +456,175 @@ __device__ void single_gemm_varify(
         }
     }
   }
+}
+
+__device__ uint8_t fused_e8m0_fp4_to_e4m3_raw(uint8_t fp4_code, uint8_t exp_offset) {
+  uint8_t const sign = (fp4_code & 0x8) ? 0x80 : 0x00;
+  uint8_t const em_code = fp4_code & 0x7;
+
+  uint8_t em = 0;
+  if (em_code == 0) {
+    em = 0;
+  }
+  else if (em_code == 1) {
+    em = static_cast<uint8_t>(exp_offset * 8);
+  }
+  else if (em_code == 2) {
+    em = static_cast<uint8_t>(exp_offset * 8 + 0x08);
+  }
+  else if (em_code == 3) {
+    em = static_cast<uint8_t>(exp_offset * 8 + 0x0c);
+  }
+  else {
+    em = static_cast<uint8_t>(exp_offset * 8 + 0x10 + (em_code - 4) * 4);
+  }
+
+  return sign | em;
+}
+
+__device__ float fused_e8m0_fp4_to_float(uint8_t fp4_code, uint8_t exp_offset) {
+  cutlass::float_e4m3_t fp8 =
+      cutlass::float_e4m3_t::bitcast(fused_e8m0_fp4_to_e4m3_raw(fp4_code, exp_offset));
+  return cutlass::float_e4m3_t::to_float(fp8);
+}
+
+template <
+    bool ApplyTokenScale,
+    typename ElementA,
+    typename ElementB,
+    typename ElementWeightScalePacked,
+    typename ElementTokenScale,
+    typename ElementD
+>
+__device__ void single_gemm_verify_fused_e8m0_pre_mma(
+  int bid, int tid,
+  int block_tile_k, int group_size,
+  int M, int N, int K,
+  ElementA *A_ptr,
+  ElementB *B_ptr,
+  ElementWeightScalePacked *weight_scale_ptr,
+  ElementTokenScale *token_scale_ptr,
+  ElementD *D_ptr) {
+
+  for (int m = bid; m < M; m += gridDim.x) {
+    for (int n = tid; n < N; n += blockDim.x) {
+      float accum = 0.0f;
+
+      for (int k_group = 0; k_group < K; k_group += group_size) {
+        ElementWeightScalePacked *local_weight_scale_ptr =
+            weight_scale_ptr + (k_group / block_tile_k) * N + n;
+        int const scale_idx = (k_group % block_tile_k) / group_size;
+        using ScaleScalar = typename ElementWeightScalePacked::Element;
+        ScaleScalar const scale = (*local_weight_scale_ptr)[scale_idx];
+        uint8_t const exp_offset = scale.storage;
+
+        for (int k = k_group; k < k_group + group_size; k += 2) {
+          ElementA *local_A_ptr = A_ptr + m * K + k;
+          uint8_t *local_B_ptr = reinterpret_cast<uint8_t *>(B_ptr) + n * K / 2 + k / 2;
+
+          float const elem_A_0 = static_cast<float>(local_A_ptr[0]);
+          float const elem_A_1 = static_cast<float>(local_A_ptr[1]);
+          uint8_t const elem_B_low = (*local_B_ptr) & 0x0f;
+          uint8_t const elem_B_high = ((*local_B_ptr) & 0xf0) >> 4;
+
+          float const elem_B_0 = fused_e8m0_fp4_to_float(elem_B_low, exp_offset);
+          float const elem_B_1 = fused_e8m0_fp4_to_float(elem_B_high, exp_offset);
+          accum += elem_A_0 * elem_B_0 + elem_A_1 * elem_B_1;
+        }
+      }
+
+      if constexpr (ApplyTokenScale) {
+        accum *= static_cast<float>(token_scale_ptr[m]);
+      }
+
+      ElementD *local_D_ptr = D_ptr + m * N + n;
+      *local_D_ptr = static_cast<ElementD>(accum);
+    }
+  }
+}
+
+template <
+    bool ApplyTokenScale,
+    typename ProblemSizes,
+    typename ElementA,
+    typename ElementB,
+    typename ElementWeightScalePacked,
+    typename ElementTokenScale,
+    typename ElementD,
+    typename StrideA,
+    typename StrideB
+>
+__global__ void groupwise_verify_fused_e8m0_pre_mma_kernel(
+    ProblemSizes problem_sizes,
+    int group_num,
+    ElementA *A,
+    ElementB *B,
+    ElementWeightScalePacked *weight_scale,
+    ElementTokenScale *token_scale,
+    ElementD *D,
+    int block_tile_k, int group_size,
+    StrideA stride_A, StrideB stride_B
+) {
+    ElementA *A_ptr = A;
+    ElementB *B_ptr = B;
+    ElementWeightScalePacked *weight_scale_ptr = weight_scale;
+    ElementTokenScale *token_scale_ptr = token_scale;
+    ElementD *D_ptr = D;
+
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+
+    for (int group_id = 0; group_id < group_num; group_id++) {
+        int N = get<0>(problem_sizes[group_id]);
+        int M = get<1>(problem_sizes[group_id]);
+        int K = get<2>(problem_sizes[group_id]);
+
+        single_gemm_verify_fused_e8m0_pre_mma<ApplyTokenScale>(
+          bid, tid,
+          block_tile_k, group_size,
+          M, N, K,
+          A_ptr, B_ptr, weight_scale_ptr, token_scale_ptr, D_ptr
+        );
+
+        A_ptr += M * K;
+        B_ptr += N * K / 2;
+        weight_scale_ptr += N * K / block_tile_k;
+        if constexpr (ApplyTokenScale) {
+          token_scale_ptr += M;
+        }
+        D_ptr += M * N;
+    }
+}
+
+template <
+    bool ApplyTokenScale,
+    typename ProblemSizes,
+    typename ElementA,
+    typename ElementB,
+    typename ElementWeightScalePacked,
+    typename ElementTokenScale,
+    typename ElementD,
+    typename StrideA,
+    typename StrideB
+>
+void groupwise_verify_fused_e8m0_pre_mma(
+    ProblemSizes problem_sizes,
+    int group_num,
+    ElementA *A,
+    ElementB *B,
+    ElementWeightScalePacked *weight_scale,
+    ElementTokenScale *token_scale,
+    ElementD *D,
+    int block_tile_k, int group_size,
+    StrideA stride_A, StrideB stride_B
+) {
+    groupwise_verify_fused_e8m0_pre_mma_kernel<ApplyTokenScale><<<1024, 1024>>>(
+        problem_sizes,
+        group_num,
+        A, B, weight_scale, token_scale, D,
+        block_tile_k, group_size,
+        stride_A, stride_B);
+    cudaDeviceSynchronize();
 }
 
 

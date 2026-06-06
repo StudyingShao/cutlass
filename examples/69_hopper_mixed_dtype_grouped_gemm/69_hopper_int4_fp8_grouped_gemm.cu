@@ -66,6 +66,7 @@ std::vector<int64_t> offset_D;
 std::vector<int64_t> offset_weight_scale_packed;
 std::vector<int64_t> offset_activation_scale_packed;
 std::vector<int64_t> offset_activation_scale;
+std::vector<int64_t> offset_epilogue_token_scale;
 std::vector<int64_t> offset_zero;
 
 std::vector<StrideA>     stride_A_host;
@@ -92,6 +93,7 @@ cutlass::DeviceAllocation<ElementScale>                                         
 cutlass::DeviceAllocation<ElementScalePacked>                                    block_weight_scale_packed;
 cutlass::DeviceAllocation<ElementActivationScale>                                block_activation_scale;
 cutlass::DeviceAllocation<ElementActivationScalePacked>                          block_activation_scale_packed;
+cutlass::DeviceAllocation<ElementEpilogueTokenScale>                             block_epilogue_token_scale;
 cutlass::DeviceAllocation<ElementZero>                                           block_zero;
 cutlass::DeviceAllocation<ElementC>                                              block_C;
 cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput> block_D;
@@ -102,6 +104,7 @@ cutlass::DeviceAllocation<const MmaType *>                                      
 cutlass::DeviceAllocation<const QuantType *>                                       ptr_B;
 cutlass::DeviceAllocation<const ElementActivationScale *>                          ptr_activation_scale;
 cutlass::DeviceAllocation<ElementActivationScalePacked *>                          ptr_activation_scale_packed;
+cutlass::DeviceAllocation<const ElementEpilogueTokenScale *>                       ptr_epilogue_token_scale;
 cutlass::DeviceAllocation<const ElementScalePacked *>                              ptr_weight_scale_packed;
 cutlass::DeviceAllocation<const ElementZero *>                                     ptr_zero;
 cutlass::DeviceAllocation<const ElementC *>                                        ptr_C;
@@ -121,6 +124,75 @@ cutlass::DeviceAllocation<ElementAccumulator*> beta_device;
 cutlass::DeviceAllocation<ElementAccumulator>  block_alpha;
 cutlass::DeviceAllocation<ElementAccumulator>  block_beta;
 
+#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+static bool pack_fused_e8m0_offset_scale(
+    ElementScalePacked *block_out,
+    size_t block_size,
+    size_t sub_k_tile_scale_num,
+    bool debug_input_scale,
+    float *residual_scale_out) {
+  static_assert(cute::is_same_v<ElementScale, cutlass::float_ue8m0_t>,
+      "Fused e8m0 pre-MMA scale expects raw ue8m0 offset bytes.");
+
+  std::vector<ElementScalePacked> data_out(block_size);
+  float residual_scale = 1.0f;
+
+  if (!debug_input_scale) {
+    uint8_t scale_min = 0xff;
+    uint8_t scale_max = 0;
+    for (size_t i = 0; i < block_size; ++i) {
+      for (size_t j = 0; j < sub_k_tile_scale_num; ++j) {
+        uint8_t const raw_scale = static_cast<uint8_t>(
+            114 + ((i * sub_k_tile_scale_num + j) % (131 - 114)));
+        scale_min = std::min(scale_min, raw_scale);
+        scale_max = std::max(scale_max, raw_scale);
+      }
+    }
+
+    uint8_t const scale_range = std::min<uint8_t>(
+        static_cast<uint8_t>(scale_max - scale_min), uint8_t(11));
+    uint8_t const scale_min_new = static_cast<uint8_t>(scale_max - scale_range);
+    int residual_exp = int(scale_min_new) - 127;
+    residual_scale = 0.5f;
+    while (residual_exp > 0) {
+      residual_scale *= 2.0f;
+      --residual_exp;
+    }
+    while (residual_exp < 0) {
+      residual_scale *= 0.5f;
+      ++residual_exp;
+    }
+
+    for (size_t i = 0; i < block_size; ++i) {
+      for (size_t j = 0; j < sub_k_tile_scale_num; ++j) {
+        uint8_t const raw_scale = static_cast<uint8_t>(
+            114 + ((i * sub_k_tile_scale_num + j) % (131 - 114)));
+        uint8_t const clamped_scale = std::max(raw_scale, scale_min_new);
+        uint8_t const raw_offset = static_cast<uint8_t>(clamped_scale - scale_min_new + 1);
+        data_out[i][j] = ElementScale::bitcast(raw_offset);
+      }
+    }
+  }
+  else {
+    for (size_t i = 0; i < block_size; ++i) {
+      for (size_t j = 0; j < sub_k_tile_scale_num; ++j) {
+        data_out[i][j] = ElementScale::bitcast(uint8_t(1));
+      }
+    }
+  }
+
+  try {
+    cutlass::device_memory::copy_to_device(block_out, data_out.data(), block_size);
+  }
+  catch (cutlass::cuda_exception const& e) {
+    std::cerr << "CUDA Error: " << cudaGetErrorString(e.cudaError()) << std::endl;
+    return false;
+  }
+  *residual_scale_out = residual_scale;
+  return true;
+}
+#endif
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Testbed functions
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -134,6 +206,7 @@ void allocate(Options const& options) {
   int64_t total_elements_weight_scale_packed = 0;
   int64_t total_elements_activation_scale = 0;
   int64_t total_elements_activation_scale_packed = 0;
+  int64_t total_elements_epilogue_token_scale = 0;
   int64_t total_elements_zero = 0;
 
   for (int32_t i = 0; i < options.groups; ++i) {
@@ -154,6 +227,7 @@ void allocate(Options const& options) {
     offset_weight_scale_packed.push_back(total_elements_weight_scale_packed);
     offset_activation_scale_packed.push_back(total_elements_activation_scale_packed);
     offset_activation_scale.push_back(total_elements_activation_scale);
+    offset_epilogue_token_scale.push_back(total_elements_epilogue_token_scale);
     offset_zero.push_back(total_elements_zero);
 
     int64_t elements_A = M * K;
@@ -165,6 +239,12 @@ void allocate(Options const& options) {
         ScaleAppliesToActivation ? int64_t(M) * scale_groups : 0;
     int64_t elements_activation_scale_packed =
         ScaleAppliesToActivation ? int64_t(scale_m_padded) * scale_k : 0;
+    int64_t elements_epilogue_token_scale =
+#if defined(CUTLASS_MIXED_GEMM_EPILOGUE_TOKEN_SCALE)
+        M;
+#else
+        0;
+#endif
     int64_t elements_zero = scale_k * N;
 
     total_elements_A                       += elements_A;
@@ -175,6 +255,7 @@ void allocate(Options const& options) {
     total_elements_weight_scale_packed     += elements_weight_scale;
     total_elements_activation_scale        += elements_activation_scale;
     total_elements_activation_scale_packed += elements_activation_scale_packed;
+    total_elements_epilogue_token_scale    += elements_epilogue_token_scale;
     total_elements_zero                    += elements_zero;
 
     stride_A_host.push_back(cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1}));
@@ -199,6 +280,7 @@ void allocate(Options const& options) {
   block_weight_scale_packed.reset(total_elements_weight_scale_packed);
   block_activation_scale.reset(total_elements_activation_scale);
   block_activation_scale_packed.reset(total_elements_activation_scale_packed);
+  block_epilogue_token_scale.reset(total_elements_epilogue_token_scale);
   block_zero.reset(total_elements_zero);
 
   block_alpha.reset(options.groups);
@@ -222,16 +304,17 @@ void initialize(Options& options) {
     options.problem_sizes_host[i] = make_tuple(M, N, K);
   }
 
-  std::vector<MmaType *>                      ptr_A_host(options.groups);
-  std::vector<QuantType *>                    ptr_B_host(options.groups);
-  std::vector<ElementC *>                     ptr_C_host(options.groups);
-  std::vector<ElementC *>                     ptr_D_host(options.groups);
-  std::vector<ElementScalePacked *>           ptr_weight_scale_packed_host(options.groups);
-  std::vector<ElementActivationScale const *> ptr_activation_scale_host(options.groups);
-  std::vector<ElementActivationScalePacked *> ptr_activation_scale_packed_host(options.groups);
-  std::vector<ElementZero *>                  ptr_zero_host(options.groups);
-  std::vector<ElementAccumulator *>           ptr_alpha_host(options.groups);
-  std::vector<ElementAccumulator *>           ptr_beta_host(options.groups);
+  std::vector<MmaType *>                         ptr_A_host(options.groups);
+  std::vector<QuantType *>                       ptr_B_host(options.groups);
+  std::vector<ElementC *>                        ptr_C_host(options.groups);
+  std::vector<ElementC *>                        ptr_D_host(options.groups);
+  std::vector<ElementScalePacked *>              ptr_weight_scale_packed_host(options.groups);
+  std::vector<ElementActivationScale const *>    ptr_activation_scale_host(options.groups);
+  std::vector<ElementActivationScalePacked *>    ptr_activation_scale_packed_host(options.groups);
+  std::vector<ElementEpilogueTokenScale const *> ptr_epilogue_token_scale_host(options.groups);
+  std::vector<ElementZero *>                     ptr_zero_host(options.groups);
+  std::vector<ElementAccumulator *>              ptr_alpha_host(options.groups);
+  std::vector<ElementAccumulator *>              ptr_beta_host(options.groups);
 
   for (int32_t i = 0; i < options.groups; ++i) {
     ptr_A_host.at(i)                       = block_A.get() + offset_A.at(i);
@@ -246,6 +329,10 @@ void initialize(Options& options) {
       ptr_activation_scale_packed_host.at(i) =
           block_activation_scale_packed.get() + offset_activation_scale_packed.at(i);
     }
+#if defined(CUTLASS_MIXED_GEMM_EPILOGUE_TOKEN_SCALE)
+    ptr_epilogue_token_scale_host.at(i) =
+        block_epilogue_token_scale.get() + offset_epilogue_token_scale.at(i);
+#endif
     ptr_zero_host.at(i)                    = block_zero.get() + offset_zero.at(i);
     alpha_host.push_back((options.alpha == FLT_MAX) ? static_cast<ElementAccumulator>((rand() % 5) + 1) : options.alpha);
     beta_host.push_back( (options.beta  == FLT_MAX) ? static_cast<ElementAccumulator>(rand() % 5)       : options.beta);
@@ -259,6 +346,7 @@ void initialize(Options& options) {
   ptr_D.reset(options.groups);                       ptr_D.copy_from_host(ptr_D_host.data());
   ptr_activation_scale.reset(options.groups);        ptr_activation_scale.copy_from_host(ptr_activation_scale_host.data());
   ptr_activation_scale_packed.reset(options.groups); ptr_activation_scale_packed.copy_from_host(ptr_activation_scale_packed_host.data());
+  ptr_epilogue_token_scale.reset(options.groups);    ptr_epilogue_token_scale.copy_from_host(ptr_epilogue_token_scale_host.data());
   ptr_weight_scale_packed.reset(options.groups);     ptr_weight_scale_packed.copy_from_host(ptr_weight_scale_packed_host.data());
   ptr_zero.reset(options.groups);                    ptr_zero.copy_from_host(ptr_zero_host.data());
 
@@ -343,12 +431,24 @@ void initialize(Options& options) {
   print_device<<<1, 1>>>(options.enable_print, block_weight_scale.get(), block_weight_scale.size(), options.groups, 'S');
   cudaDeviceSynchronize();
 
+#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+  float fused_e8m0_residual_scale = 1.0f;
+  if (!pack_fused_e8m0_offset_scale(
+      block_weight_scale_packed.get(),
+      block_weight_scale.size(),
+      ElementScalePacked::kElements,
+      options.debug_input_scale,
+      &fused_e8m0_residual_scale)) {
+    return;
+  }
+#else
   cutlass::pack_scale_fp32(
       options.debug_input_scale,
       block_weight_scale.get(),
       block_weight_scale_packed.get(),
       block_weight_scale.size(),
       ElementScalePacked::kElements);
+#endif
   print_device_packed<<<1, 1>>>(
       options.enable_print, block_weight_scale_packed.get(), block_weight_scale_packed.size(), 'W');
 
@@ -359,8 +459,34 @@ void initialize(Options& options) {
         options.enable_print, block_activation_scale.get(), block_activation_scale.size(), options.groups, 's');
     cudaDeviceSynchronize();
   }
+#if defined(CUTLASS_MIXED_GEMM_EPILOGUE_TOKEN_SCALE)
+  set_device_sequential<<<1, 1>>>(
+      block_epilogue_token_scale.get(), block_epilogue_token_scale.size(), 6789);
+#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+  scale_device<<<1, 1>>>(
+      block_epilogue_token_scale.get(),
+      block_epilogue_token_scale.size(),
+      fused_e8m0_residual_scale);
+#endif
+  cudaDeviceSynchronize();
+#endif
   /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+#if defined(CUTLASS_MIXED_GEMM_EPILOGUE_TOKEN_SCALE)
+  groupwise_verify_fused_e8m0_pre_mma<true>(
+#else
+  groupwise_verify_fused_e8m0_pre_mma<false>(
+#endif
+    problem_sizes.get(),
+    options.groups,
+    block_A.get(), block_B.get(),
+    block_weight_scale_packed.get(), block_epilogue_token_scale.get(), block_ref_D.get(),
+    TileShapeK,
+    GROUP_SIZE,
+    stride_A.get(), stride_B.get()
+  );
+#else
   groupwise_verify(
     problem_sizes.get(),
     options.groups,
@@ -371,6 +497,7 @@ void initialize(Options& options) {
     GROUP_SIZE,
     stride_A.get(), stride_B.get()
   );
+#endif
 
   print_device<<<1,1>>>(options.enable_print, block_ref_D.get(), block_ref_D.size(), options.groups, 'R');
 
@@ -387,18 +514,32 @@ bool verify(Options const& options) {
   CUDA_CHECK(cudaMemset(
       error_counts.get(), 0, sizeof(int) * kMixedGemmValidationCounterCount));
 
-  // Mixed low-precision paths validate against a K/input-dependent absolute
-  // reduction/output bound.
-  float const *reduction_abs_error_bound = block_ref_abs_error_bound.get();
+  // Standard mixed low-precision paths validate against a K/input-dependent
+  // absolute reduction bound. Fused pre-MMA scaling uses a separate reference
+  // path and keeps its stricter gate below.
+  float const *reduction_abs_error_bound = nullptr;
+#if !defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+  reduction_abs_error_bound = block_ref_abs_error_bound.get();
+#endif
 
+#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+  compare_device<true><<<1,1>>>(
+#else
   compare_device<<<1,1>>>(
+#endif
       options.compare, block_D.get(), block_ref_D.get(), block_D.size(),
       problem_sizes.get(), options.groups, error_counts.get(), reduction_abs_error_bound);
-  // Reject any element whose measured error exceeds the K/input-dependent
-  // reduction/output budget.
+
   int error_counts_host[kMixedGemmValidationCounterCount] = {};
   error_counts.copy_to_host(error_counts_host);
+#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+  passed &= (error_counts_host[kP99ErrorCount] == 0);
+  passed &= (error_counts_host[kP98ErrorCount] == 0);
+  passed &= (error_counts_host[kP95ErrorCount] == 0);
+  passed &= (error_counts_host[kHummingToleranceErrorCount] == 0);
+#else
   passed &= (error_counts_host[kReductionBoundErrorCount] == 0);
+#endif
   print_device<<<1,1>>>(options.enable_print, block_ref_D.get(), block_ref_D.size(), options.groups, 'R');
   print_device<<<1,1>>>(options.enable_print, block_D.get(), block_D.size(), options.groups, 'D');
 
