@@ -1285,52 +1285,56 @@ public:
       if (K_BLOCK_MAX > 1) {
         Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, read_stage);
       }
-      
+
       // src: tCrA_load, dst: tCrA_mma
-      Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
+      Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, cute::Int<0>{});
 
       // Unroll the K mode manually to set scale D to 1
-      CUTLASS_PRAGMA_UNROLL
-      for (int chunk_id = 0; chunk_id < NumChunksPerTileK; ++chunk_id) {
+      cute::for_each(cute::make_seq<NumChunksPerTileK>{}, [&](auto chunk_id_c) {
+        constexpr int chunk_id = decltype(chunk_id_c)::value;
         tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
-        CUTLASS_PRAGMA_UNROLL
-        for (int mma_id = 0; mma_id < NumMMAsPerChunk; ++mma_id) {
-          int k_block = chunk_id * NumMMAsPerChunk + mma_id;
+        cute::for_each(cute::make_seq<NumMMAsPerChunk>{}, [&](auto mma_id_c) {
+          constexpr int mma_id = decltype(mma_id_c)::value;
+          constexpr int k_block = chunk_id * NumMMAsPerChunk + mma_id;
 
           warpgroup_arrive();
             
           // (V,M) x (V,N) => (V,M,N)
-          cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate_array[chunk_id]);
+          cute::gemm(
+              tiled_mma,
+              tCrA_mma(_,_,cute::Int<k_block>{}),
+              tCrB(_,_,cute::Int<k_block>{},read_stage),
+              intermediate_array[chunk_id]);
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
-          if (k_block == 0) {
+          if constexpr (k_block == 0) {
             copy_scale_for_tile(read_stage);
           }
-          if (mma_id == 0) {
+          if constexpr (mma_id == 0) {
             copy_activation_scale_for_pipeline(chunk_id, read_stage, current_k_tile);
           }
 
-          if (k_block < K_BLOCK_MAX - 2) {
+          if constexpr (k_block < K_BLOCK_MAX - 2) {
             Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
           }
-          if (k_block < K_BLOCK_MAX - 1) {
-            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
+          if constexpr (k_block < K_BLOCK_MAX - 1) {
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, cute::Int<k_block + 1>{});
           }
-        }
+        });
 
         warpgroup_commit_batch();
 
-        if (chunk_id > 0) {
+        if constexpr (chunk_id > 0) {
           warpgroup_wait<1>();
 
-          int chunk_id_ = chunk_id - 1;
+          constexpr int chunk_id_ = chunk_id - 1;
           warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
           scale_intermediate(intermediate_array[chunk_id_], chunk_id_, chunk_id_ == 0);
         }
 
-      }
+      });
 
       warpgroup_wait<0>();
 
@@ -1346,8 +1350,8 @@ public:
 
         Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, smem_pipe_read.index());
         Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, smem_pipe_read.index());
-        
-        Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
+
+        Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, cute::Int<0>{});
       }
     }
 
@@ -1368,33 +1372,37 @@ public:
       ++smem_pipe_read;
 
       // Unroll the K mode manually to set scale D to 1
-      CUTLASS_PRAGMA_UNROLL
-      for (int chunk_id = 0; chunk_id < NumChunksPerTileK; ++chunk_id) {
+      cute::for_each(cute::make_seq<NumChunksPerTileK>{}, [&](auto chunk_id_c) {
+        constexpr int chunk_id = decltype(chunk_id_c)::value;
         tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
-        CUTLASS_PRAGMA_UNROLL
-        for (int mma_id = 0; mma_id < NumMMAsPerChunk; ++mma_id) {
-          int k_block = chunk_id * NumMMAsPerChunk + mma_id;
+        cute::for_each(cute::make_seq<NumMMAsPerChunk>{}, [&](auto mma_id_c) {
+          constexpr int mma_id = decltype(mma_id_c)::value;
+          constexpr int k_block = chunk_id * NumMMAsPerChunk + mma_id;
 
           warpgroup_arrive();
           // (V,M) x (V,N) => (V,M,N)
-          cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate_array[chunk_id]);
+          cute::gemm(
+              tiled_mma,
+              tCrA_mma(_,_,cute::Int<k_block>{}),
+              tCrB(_,_,cute::Int<k_block>{},read_stage),
+              intermediate_array[chunk_id]);
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
-          if (k_block == K_BLOCK_MAX - 1) {
+          if constexpr (k_block == K_BLOCK_MAX - 1) {
             pipeline.consumer_release(smem_pipe_release);             // UNLOCK smem_pipe_release, done _computing_ on it
             ++smem_pipe_release;
           }
 
-          if (k_block == 0) {
+          if constexpr (k_block == 0) {
             barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
             copy_scale_for_tile(read_stage);
           }
-          if (mma_id == 0) {
+          if constexpr (mma_id == 0) {
             copy_activation_scale_for_pipeline(chunk_id, read_stage, current_k_tile);
           }
 
-          if (k_block == K_BLOCK_MAX - 1) {
+          if constexpr (k_block == K_BLOCK_MAX - 1) {
             // The last k_block
 
             pipeline.consumer_wait(smem_pipe_read, barrier_token);
@@ -1408,28 +1416,28 @@ public:
 
             scale_intermediate(intermediate_array[chunk_id], chunk_id, false);
 
-            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, 0);
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, cute::Int<0>{});
           }
           else {
-            if (k_block < K_BLOCK_MAX - 2) {
+            if constexpr (k_block < K_BLOCK_MAX - 2) {
               Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
             }
-            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, cute::Int<k_block + 1>{});
           }
-        }
+        });
 
         warpgroup_commit_batch();
 
-        if (chunk_id > 0) {
+        if constexpr (chunk_id > 0) {
           warpgroup_wait<1>();
 
-          int chunk_id_ = chunk_id - 1;          
+          constexpr int chunk_id_ = chunk_id - 1;
           warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
           scale_intermediate(intermediate_array[chunk_id_], chunk_id_, false);
         }
 
-      }
+      });
     }
 
     {
@@ -1444,35 +1452,39 @@ public:
       tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
       // Unroll the K mode manually to set scale D to 1
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
+      cute::for_each(cute::make_seq<K_BLOCK_MAX>{}, [&](auto k_block_c) {
+        constexpr int k_block = decltype(k_block_c)::value;
 
         warpgroup_arrive();
         // (V,M) x (V,N) => (V,M,N)
-        cute::gemm(tiled_mma, tCrA_mma(_,_,k_block), tCrB(_,_,k_block,read_stage), intermediate);
+        cute::gemm(
+            tiled_mma,
+            tCrA_mma(_,_,cute::Int<k_block>{}),
+            tCrB(_,_,cute::Int<k_block>{},read_stage),
+            intermediate);
         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
-        if (k_block == 0) {
+        if constexpr (k_block == 0) {
           copy_scale_for_tile(read_stage);
         }
-        if (k_block % NumMMAsPerChunk == 0) {
+        if constexpr (k_block % NumMMAsPerChunk == 0) {
           copy_activation_scale_for_pipeline(k_block / NumMMAsPerChunk, read_stage, current_k_tile);
         }
 
-        if (k_block == K_BLOCK_MAX - 1) {
+        if constexpr (k_block == K_BLOCK_MAX - 1) {
           // release prior barrier
           pipeline.consumer_release(smem_pipe_release);             // UNLOCK smem_pipe_release, done _computing_ on it
           ++smem_pipe_release;
         }
 
-        if (k_block < K_BLOCK_MAX - 2) {
+        if constexpr (k_block < K_BLOCK_MAX - 2) {
           Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
         }
-        if (k_block < K_BLOCK_MAX - 1) {
-          Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, k_block + 1);
+        if constexpr (k_block < K_BLOCK_MAX - 1) {
+          Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, cute::Int<k_block + 1>{});
         }
 
-        if ((k_block + 1) % NumMMAsPerChunk == 0) {
+        if constexpr ((k_block + 1) % NumMMAsPerChunk == 0) {
           tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
           warpgroup_commit_batch();
@@ -1481,7 +1493,7 @@ public:
 
           scale_intermediate(intermediate, k_block / NumMMAsPerChunk, false);
         }
-      }
+      });
     }
   }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

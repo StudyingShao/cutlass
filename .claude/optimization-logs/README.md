@@ -77,7 +77,8 @@ Completed logs:
 - [2026-05-22-mxfp4-mxfp8-activation-scale-tma-vs-pack.md](2026-05-22-mxfp4-mxfp8-activation-scale-tma-vs-pack.md)
 - [2026-05-29-cmx-precomputed-work-order.md](2026-05-29-cmx-precomputed-work-order.md)
 - [2026-06-02-cmx-prebuilt-tma-descriptors.md](2026-06-02-cmx-prebuilt-tma-descriptors.md)
+- [2026-06-05-cmx-mainloop-transfer-w4a16-w4a8.md](2026-06-05-cmx-mainloop-transfer-w4a16-w4a8.md)
 
 ---
 
-**Last Updated**: 2026-06-05
+**Last Updated**: 2026-06-08

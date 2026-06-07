@@ -1419,26 +1419,19 @@ public:
   template <class EngineIn,
             class EngineOut, 
             class LayoutIn,
-            class LayoutOut,
-            class... Ts>
+            class LayoutOut>
   CUTLASS_DEVICE
-  static void convert_A_kblock(
-    Tensor<EngineIn, LayoutIn> const& tCrA_load, 
-    Tensor<EngineOut, LayoutOut>& tCrA_mma,
-    int const k_block) {
+  static void convert_A_slot(
+    Tensor<EngineIn, LayoutIn> const& src,
+    Tensor<EngineOut, LayoutOut>& dst) {
 
     static_assert(is_rmem<EngineIn>::value, "Input tensor for A conversion must come from registers");
     static_assert(is_rmem<EngineOut>::value, "Output tensor for A conversion must come from registers");
-    static_assert(cosize_v<LayoutIn> == cosize_v<LayoutOut>);
-    static_assert(size_v<LayoutIn> == cosize_v<LayoutIn>);
-    static_assert(size_v<LayoutOut> == cosize_v<LayoutOut>);
     using SrcType = typename EngineIn::value_type;
 
-    Tensor src = tCrA_load(_, _, k_block);
-    Tensor dst = tCrA_mma(_, _, k_block);
-    
     CUTE_STATIC_ASSERT_V(size(src(_, 0)) == cosize(src(_, 0).layout()),
                          "The first mode of tensor src must be contiguous in memory");
+    CUTE_STATIC_ASSERT_V(size(src) == size(dst));
     // try to make the size of the first mode equal to 32bit
     int constexpr NumValPerSrcReg = cute::min(decltype(size(src(_, 0)))::value,
                                               ceil_div(32, sizeof_bits_v<SrcType>));
@@ -1461,6 +1454,37 @@ public:
         LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
       }
     }
+  }
+
+  template <class EngineIn,
+            class EngineOut,
+            class LayoutIn,
+            class LayoutOut>
+  CUTLASS_DEVICE
+  static void convert_A_kblock(
+    Tensor<EngineIn, LayoutIn> const& tCrA_load,
+    Tensor<EngineOut, LayoutOut>& tCrA_mma,
+    int const k_block) {
+
+    Tensor src = tCrA_load(_, _, k_block);
+    Tensor dst = tCrA_mma(_, _, k_block);
+    convert_A_slot(src, dst);
+  }
+
+  template <int KBlock,
+            class EngineIn,
+            class EngineOut,
+            class LayoutIn,
+            class LayoutOut>
+  CUTLASS_DEVICE
+  static void convert_A_kblock(
+    Tensor<EngineIn, LayoutIn> const& tCrA_load,
+    Tensor<EngineOut, LayoutOut>& tCrA_mma,
+    cute::Int<KBlock> k_block) {
+
+    Tensor src = tCrA_load(_, _, k_block);
+    Tensor dst = tCrA_mma(_, _, k_block);
+    convert_A_slot(src, dst);
   }
 
   template <class EngineIn,
