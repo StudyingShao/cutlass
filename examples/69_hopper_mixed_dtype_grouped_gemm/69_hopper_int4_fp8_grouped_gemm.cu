@@ -90,7 +90,7 @@ cutlass::DeviceAllocation<MmaType>                                              
 cutlass::DeviceAllocation<QuantType>                                             block_B;
 cutlass::DeviceAllocation<QuantType>                                             block_B_interleaved;
 cutlass::DeviceAllocation<ElementScale>                                          block_weight_scale;
-cutlass::DeviceAllocation<ElementScalePacked>                                    block_weight_scale_packed;
+cutlass::DeviceAllocation<ElementWeightScaleStorage>                             block_weight_scale_packed;
 cutlass::DeviceAllocation<ElementActivationScale>                                block_activation_scale;
 cutlass::DeviceAllocation<ElementActivationScalePacked>                          block_activation_scale_packed;
 cutlass::DeviceAllocation<ElementEpilogueTokenScale>                             block_epilogue_token_scale;
@@ -126,26 +126,44 @@ cutlass::DeviceAllocation<ElementAccumulator>  block_beta;
 
 #if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
 static bool pack_fused_e8m0_offset_scale(
-    ElementScalePacked *block_out,
+    ElementScale *logical_out,
+    ElementWeightScaleStorage *folded_out,
     size_t block_size,
-    size_t sub_k_tile_scale_num,
+    Options const& options,
     bool debug_input_scale,
     float *residual_scale_out) {
   static_assert(cute::is_same_v<ElementScale, cutlass::float_ue8m0_t>,
       "Fused e8m0 pre-MMA scale expects raw ue8m0 offset bytes.");
 
-  std::vector<ElementScalePacked> data_out(block_size);
+  std::vector<ElementScale> logical_data(block_size);
+  std::vector<ElementWeightScaleStorage> folded_data(block_size);
   float residual_scale = 1.0f;
+
+  // Host preprocessing only: fold each logical 64x128 scale tile into a 16x512
+  // physical tile so the kernel can bulk-copy 16B scale rows for any Ktile.
+  auto folded_scale_index = [](int scale_row, int k_group, int K) {
+    return
+        ((scale_row / 64) * (K / 128) + (k_group / 4)) * 256 + // folded 16x16 block
+        (scale_row % 16) * 16 +                                // row inside the 16-row warp slice
+        ((scale_row % 64) / 16) * 4 +                          // which 16-row warp slice
+        (k_group % 4);                                         // scale group inside K128
+  };
 
   if (!debug_input_scale) {
     uint8_t scale_min = 0xff;
     uint8_t scale_max = 0;
-    for (size_t i = 0; i < block_size; ++i) {
-      for (size_t j = 0; j < sub_k_tile_scale_num; ++j) {
-        uint8_t const raw_scale = static_cast<uint8_t>(
-            114 + ((i * sub_k_tile_scale_num + j) % (131 - 114)));
-        scale_min = std::min(scale_min, raw_scale);
-        scale_max = std::max(scale_max, raw_scale);
+    size_t logical_idx = 0;
+    for (int32_t group = 0; group < options.groups; ++group) {
+      auto problem = options.problem_sizes_host.at(group);
+      int const N = get<1>(problem);
+      int const K = get<2>(problem);
+      int const scale_groups = K / GROUP_SIZE;
+      for (int kg = 0; kg < scale_groups; ++kg) {
+        for (int n = 0; n < N; ++n, ++logical_idx) {
+          uint8_t const raw_scale = static_cast<uint8_t>(114 + (logical_idx % (131 - 114)));
+          scale_min = std::min(scale_min, raw_scale);
+          scale_max = std::max(scale_max, raw_scale);
+        }
       }
     }
 
@@ -163,26 +181,35 @@ static bool pack_fused_e8m0_offset_scale(
       ++residual_exp;
     }
 
-    for (size_t i = 0; i < block_size; ++i) {
-      for (size_t j = 0; j < sub_k_tile_scale_num; ++j) {
-        uint8_t const raw_scale = static_cast<uint8_t>(
-            114 + ((i * sub_k_tile_scale_num + j) % (131 - 114)));
-        uint8_t const clamped_scale = std::max(raw_scale, scale_min_new);
-        uint8_t const raw_offset = static_cast<uint8_t>(clamped_scale - scale_min_new + 1);
-        data_out[i][j] = ElementScale::bitcast(raw_offset);
+    logical_idx = 0;
+    for (int32_t group = 0; group < options.groups; ++group) {
+      auto problem = options.problem_sizes_host.at(group);
+      int const N = get<1>(problem);
+      int const K = get<2>(problem);
+      int const scale_groups = K / GROUP_SIZE;
+      int64_t const group_base = offset_weight_scale_packed.at(group);
+      for (int kg = 0; kg < scale_groups; ++kg) {
+        for (int n = 0; n < N; ++n, ++logical_idx) {
+          uint8_t const raw_scale = static_cast<uint8_t>(114 + (logical_idx % (131 - 114)));
+          uint8_t const clamped_scale = std::max(raw_scale, scale_min_new);
+          uint8_t const raw_offset = static_cast<uint8_t>(clamped_scale - scale_min_new + 1);
+          int const folded_idx = folded_scale_index(n, kg, K);
+          logical_data[group_base + kg * N + n] = ElementScale::bitcast(raw_offset);
+          folded_data[group_base + folded_idx] = ElementScale::bitcast(raw_offset);
+        }
       }
     }
   }
   else {
     for (size_t i = 0; i < block_size; ++i) {
-      for (size_t j = 0; j < sub_k_tile_scale_num; ++j) {
-        data_out[i][j] = ElementScale::bitcast(uint8_t(1));
-      }
+      logical_data[i] = ElementScale::bitcast(uint8_t(1));
+      folded_data[i] = ElementScale::bitcast(uint8_t(1));
     }
   }
 
   try {
-    cutlass::device_memory::copy_to_device(block_out, data_out.data(), block_size);
+    cutlass::device_memory::copy_to_device(logical_out, logical_data.data(), block_size);
+    cutlass::device_memory::copy_to_device(folded_out, folded_data.data(), block_size);
   }
   catch (cutlass::cuda_exception const& e) {
     std::cerr << "CUDA Error: " << cudaGetErrorString(e.cudaError()) << std::endl;
@@ -218,6 +245,12 @@ void allocate(Options const& options) {
 
     const int scale_k = K / TileShapeK;
     const int scale_groups = K / GROUP_SIZE;
+    const int weight_scale_storage_k =
+#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+        scale_groups;
+#else
+        scale_k;
+#endif
     const int scale_m_padded = ((M + TileShapeN - 1) / TileShapeN) * TileShapeN;
 
     offset_A.push_back(total_elements_A);
@@ -234,7 +267,7 @@ void allocate(Options const& options) {
     int64_t elements_B = K * N;
     int64_t elements_C = M * N;
     int64_t elements_D = M * N;
-    int64_t elements_weight_scale = int64_t(scale_k) * N;
+    int64_t elements_weight_scale = int64_t(weight_scale_storage_k) * N;
     int64_t elements_activation_scale =
         ScaleAppliesToActivation ? int64_t(M) * scale_groups : 0;
     int64_t elements_activation_scale_packed =
@@ -264,7 +297,8 @@ void allocate(Options const& options) {
     stride_D_host.push_back(cutlass::make_cute_packed_stride(StrideD{}, {N, M, 1}));
     stride_C_host_ref.push_back(cutlass::make_cute_packed_stride(StrideC_ref{}, {M, N, 1}));
     stride_D_host_ref.push_back(cutlass::make_cute_packed_stride(StrideD_ref{}, {M, N, 1}));
-    stride_weight_scale_host.push_back(cutlass::make_cute_packed_stride(StrideS{}, {N, scale_k, 1}));
+    stride_weight_scale_host.push_back(cutlass::make_cute_packed_stride(
+        StrideS{}, {N, weight_scale_storage_k, 1}));
     stride_activation_scale_host.push_back(cutlass::make_cute_packed_stride(
         StrideActivationScale{}, {M, scale_groups, 1}));
   }
@@ -322,7 +356,8 @@ void initialize(Options& options) {
     ptr_C_host.at(i)                       = block_C.get() + offset_C.at(i);
     ptr_D_host.at(i)                       = block_D.get() + offset_D.at(i);
     ptr_weight_scale_packed_host.at(i)     =
-        block_weight_scale_packed.get() + offset_weight_scale_packed.at(i);
+        reinterpret_cast<ElementScalePacked*>(
+            block_weight_scale_packed.get() + offset_weight_scale_packed.at(i));
     if constexpr (ScaleAppliesToActivation) {
       ptr_activation_scale_host.at(i)        =
           block_activation_scale.get() + offset_activation_scale.at(i);
@@ -434,9 +469,10 @@ void initialize(Options& options) {
 #if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
   float fused_e8m0_residual_scale = 1.0f;
   if (!pack_fused_e8m0_offset_scale(
+      block_weight_scale.get(),
       block_weight_scale_packed.get(),
-      block_weight_scale.size(),
-      ElementScalePacked::kElements,
+      block_weight_scale_packed.size(),
+      options,
       options.debug_input_scale,
       &fused_e8m0_residual_scale)) {
     return;
@@ -449,8 +485,13 @@ void initialize(Options& options) {
       block_weight_scale.size(),
       ElementScalePacked::kElements);
 #endif
+#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+  print_device<<<1, 1>>>(
+      options.enable_print, block_weight_scale_packed.get(), block_weight_scale_packed.size(), options.groups, 'W');
+#else
   print_device_packed<<<1, 1>>>(
       options.enable_print, block_weight_scale_packed.get(), block_weight_scale_packed.size(), 'W');
+#endif
 
   if constexpr (ScaleAppliesToActivation) {
     set_device_ue8m0<<<1, 1>>>(
@@ -481,8 +522,7 @@ void initialize(Options& options) {
     problem_sizes.get(),
     options.groups,
     block_A.get(), block_B.get(),
-    block_weight_scale_packed.get(), block_epilogue_token_scale.get(), block_ref_D.get(),
-    TileShapeK,
+    block_weight_scale.get(), block_epilogue_token_scale.get(), block_ref_D.get(),
     GROUP_SIZE,
     stride_A.get(), stride_B.get()
   );

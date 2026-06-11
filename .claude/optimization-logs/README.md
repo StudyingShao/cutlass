@@ -70,6 +70,8 @@ Knowledge Document (distilled wisdom)
 
 Active logs (optimization in progress):
 - [2026-06-05-cmx-fused-e8m0-correctness-revalidation.md](2026-06-05-cmx-fused-e8m0-correctness-revalidation.md)
+- [2026-06-09-cmx-folded-m64-priority/scale_ktile_decoupling.md](2026-06-09-cmx-folded-m64-priority/scale_ktile_decoupling.md)
+- [2026-06-09-cmx-folded-m64-priority/m64_priority_comparison.md](2026-06-09-cmx-folded-m64-priority/m64_priority_comparison.md)
 
 Completed logs:
 - [2026-03-19-scheduler-work-switching.md](2026-03-19-scheduler-work-switching.md)
@@ -81,4 +83,4 @@ Completed logs:
 
 ---
 
-**Last Updated**: 2026-06-08
+**Last Updated**: 2026-06-09

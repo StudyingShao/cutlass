@@ -492,17 +492,17 @@ template <
     bool ApplyTokenScale,
     typename ElementA,
     typename ElementB,
-    typename ElementWeightScalePacked,
+    typename ElementWeightScale,
     typename ElementTokenScale,
     typename ElementD
 >
 __device__ void single_gemm_verify_fused_e8m0_pre_mma(
   int bid, int tid,
-  int block_tile_k, int group_size,
+  int group_size,
   int M, int N, int K,
   ElementA *A_ptr,
   ElementB *B_ptr,
-  ElementWeightScalePacked *weight_scale_ptr,
+  ElementWeightScale *weight_scale_ptr,
   ElementTokenScale *token_scale_ptr,
   ElementD *D_ptr) {
 
@@ -511,11 +511,8 @@ __device__ void single_gemm_verify_fused_e8m0_pre_mma(
       float accum = 0.0f;
 
       for (int k_group = 0; k_group < K; k_group += group_size) {
-        ElementWeightScalePacked *local_weight_scale_ptr =
-            weight_scale_ptr + (k_group / block_tile_k) * N + n;
-        int const scale_idx = (k_group % block_tile_k) / group_size;
-        using ScaleScalar = typename ElementWeightScalePacked::Element;
-        ScaleScalar const scale = (*local_weight_scale_ptr)[scale_idx];
+        int const scale_group = k_group / group_size;
+        ElementWeightScale const scale = weight_scale_ptr[scale_group * N + n];
         uint8_t const exp_offset = scale.storage;
 
         for (int k = k_group; k < k_group + group_size; k += 2) {
@@ -548,7 +545,7 @@ template <
     typename ProblemSizes,
     typename ElementA,
     typename ElementB,
-    typename ElementWeightScalePacked,
+    typename ElementWeightScale,
     typename ElementTokenScale,
     typename ElementD,
     typename StrideA,
@@ -559,15 +556,15 @@ __global__ void groupwise_verify_fused_e8m0_pre_mma_kernel(
     int group_num,
     ElementA *A,
     ElementB *B,
-    ElementWeightScalePacked *weight_scale,
+    ElementWeightScale *weight_scale,
     ElementTokenScale *token_scale,
     ElementD *D,
-    int block_tile_k, int group_size,
+    int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
     ElementA *A_ptr = A;
     ElementB *B_ptr = B;
-    ElementWeightScalePacked *weight_scale_ptr = weight_scale;
+    ElementWeightScale *weight_scale_ptr = weight_scale;
     ElementTokenScale *token_scale_ptr = token_scale;
     ElementD *D_ptr = D;
 
@@ -581,14 +578,14 @@ __global__ void groupwise_verify_fused_e8m0_pre_mma_kernel(
 
         single_gemm_verify_fused_e8m0_pre_mma<ApplyTokenScale>(
           bid, tid,
-          block_tile_k, group_size,
+          group_size,
           M, N, K,
           A_ptr, B_ptr, weight_scale_ptr, token_scale_ptr, D_ptr
         );
 
         A_ptr += M * K;
         B_ptr += N * K / 2;
-        weight_scale_ptr += N * K / block_tile_k;
+        weight_scale_ptr += N * K / group_size;
         if constexpr (ApplyTokenScale) {
           token_scale_ptr += M;
         }
@@ -601,7 +598,7 @@ template <
     typename ProblemSizes,
     typename ElementA,
     typename ElementB,
-    typename ElementWeightScalePacked,
+    typename ElementWeightScale,
     typename ElementTokenScale,
     typename ElementD,
     typename StrideA,
@@ -612,17 +609,17 @@ void groupwise_verify_fused_e8m0_pre_mma(
     int group_num,
     ElementA *A,
     ElementB *B,
-    ElementWeightScalePacked *weight_scale,
+    ElementWeightScale *weight_scale,
     ElementTokenScale *token_scale,
     ElementD *D,
-    int block_tile_k, int group_size,
+    int group_size,
     StrideA stride_A, StrideB stride_B
 ) {
     groupwise_verify_fused_e8m0_pre_mma_kernel<ApplyTokenScale><<<1024, 1024>>>(
         problem_sizes,
         group_num,
         A, B, weight_scale, token_scale, D,
-        block_tile_k, group_size,
+        group_size,
         stride_A, stride_B);
     cudaDeviceSynchronize();
 }

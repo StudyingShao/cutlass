@@ -881,6 +881,9 @@ public:
       return 0;
     }
     else if constexpr (ModeHasScales) {
+      if constexpr (FusedE8M0PreMmaScale) {
+        return Collective::WeightScaleTransactionBytes;
+      }
       constexpr uint32_t scale_tx_bytes = cutlass::bits_to_bytes(size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) * static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
       static_assert(scale_tx_bytes % 128 == 0, "Each scale stage must be 128B aligned."); // required by TMA
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
@@ -1651,6 +1654,170 @@ public:
     Tensor scale_packs = cute::get<1>(partitioned_extra_info)(_, _, Int<0>{});
     convert_A_kblock_fused_e8m0_pre_mma_to_slot(
         tCrA_load, tCrA_mma_slot, scale_packs, k_block, scale_idx);
+  }
+
+  template <int KBlock,
+            class EngineIn,
+            class EngineOut,
+            class LayoutIn,
+            class LayoutOut,
+            class EngineScale,
+            class LayoutScale>
+  CUTLASS_DEVICE
+  static void convert_A_kblock_fused_e8m0_pre_mma_raw_scale_to_slot(
+    Tensor<EngineIn, LayoutIn> const& tCrA_load,
+    Tensor<EngineOut, LayoutOut>& tCrA_mma_slot,
+    Tensor<EngineScale, LayoutScale>& scale_values,
+    cute::Int<KBlock>) {
+
+    static_assert(FusedE8M0PreMmaScale, "This helper is only for fused e8m0 pre-MMA scale.");
+    static_assert(UseFP4ToFP8LookupTable, "Fused e8m0 pre-MMA scale currently supports MXFP4 x FP8 only.");
+    static_assert(cutlass::detail::is_Array_v<ElementScale>,
+        "Fused e8m0 pre-MMA scale expects e8m0 scale arrays at the API boundary.");
+    static_assert(is_rmem<EngineIn>::value, "Input tensor for A conversion must come from registers");
+    static_assert(is_rmem<EngineOut>::value, "Output tensor for A conversion must come from registers");
+    static_assert(is_rmem<EngineScale>::value, "Scale tensor for A conversion must come from registers");
+    using SrcType = typename EngineIn::value_type;
+    using ScaleScalar = typename ElementScale::Element;
+    static_assert(cute::is_same_v<typename EngineScale::value_type, ScaleScalar>,
+        "Raw fused e8m0 scale tensor must use scalar e8m0 elements.");
+
+    Tensor src = tCrA_load(_, _, cute::Int<KBlock>{});
+    Tensor dst = tCrA_mma_slot;
+    Tensor scales = scale_values(_, _, cute::Int<KBlock>{});
+
+    CUTE_STATIC_ASSERT_V(size(src(_, 0)) == cosize(src(_, 0).layout()),
+                         "The first mode of tensor src must be contiguous in memory");
+    CUTE_STATIC_ASSERT_V(size(src) == size(dst));
+    CUTE_STATIC_ASSERT_V(size(src) == size(scales));
+
+    int constexpr NumValPerSrcReg = cute::min(decltype(size(src(_, 0)))::value,
+                                              ceil_div(32, sizeof_bits_v<SrcType>));
+    Tensor src_vm = cute::group_modes<1,-1>(cute::zipped_divide(src, Int<NumValPerSrcReg>{}));
+    Tensor dst_vm = cute::group_modes<1,-1>(cute::zipped_divide(dst, Int<NumValPerSrcReg>{}));
+    Tensor scales_vm = cute::group_modes<1,-1>(
+        cute::zipped_divide(scales, Int<NumValPerSrcReg>{}));
+
+    auto scale_values_0 = cute::filter(scales_vm(_, Int<0>{}));
+    constexpr int ScaleValueCount = decltype(size(scale_values_0))::value;
+    constexpr int DstVecCount = decltype(size<1>(dst_vm))::value;
+    static_assert(ScaleValueCount == 2 || ScaleValueCount == NumValPerSrcReg,
+        "Fused e8m0 pre-MMA raw scale expects either two compact row scales or one scale per fp4 lane.");
+    static_assert((DstVecCount % 2) == 0,
+        "Fused e8m0 pre-MMA pair conversion expects an even number of fp4x8 operands.");
+
+    constexpr int HiScaleIndex =
+        (ScaleValueCount == NumValPerSrcReg) ? (NumValPerSrcReg / 2) : 1;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < DstVecCount; i += 2) {
+      auto row_scales = cute::filter(scales_vm(_, i));
+      ScaleScalar const lo_scale = row_scales(0);
+      ScaleScalar const hi_scale = row_scales(HiScaleIndex);
+      uint32_t const lo_exp_offset = static_cast<uint32_t>(lo_scale.storage);
+      uint32_t const hi_exp_offset = static_cast<uint32_t>(hi_scale.storage);
+      auto src_vec0 = src_vm(_, i);
+      auto src_vec1 = src_vm(_, i + 1);
+      auto dst_vec0 = dst_vm(_, i);
+      auto dst_vec1 = dst_vm(_, i + 1);
+      fp4tofp8_fused_e8m0_pre_mma_convert_pair(
+          src_vec0, src_vec1, dst_vec0, dst_vec1, lo_exp_offset, hi_exp_offset);
+    }
+  }
+
+  template <int KBlock,
+            int ScalePairCount,
+            class EngineScale,
+            class LayoutScale,
+            class LoOffsetArray,
+            class HiOffsetArray>
+  CUTLASS_DEVICE
+  static void cache_A_kblock_fused_e8m0_pre_mma_exp_offsets(
+    Tensor<EngineScale, LayoutScale> const& scales,
+    cute::Int<KBlock>,
+    cute::Int<ScalePairCount>,
+    LoOffsetArray& lo_exp_offsets,
+    HiOffsetArray& hi_exp_offsets) {
+
+    static_assert(FusedE8M0PreMmaScale, "This helper is only for fused e8m0 pre-MMA scale.");
+    using ScaleScalar = typename EngineScale::value_type;
+    constexpr int NumValPerSrcReg = 8;
+    Tensor scales_vm = cute::group_modes<1,-1>(
+        cute::zipped_divide(scales, Int<NumValPerSrcReg>{}));
+    static_assert(decltype(size<1>(scales_vm))::value == ScalePairCount * 2,
+        "Fused e8m0 pre-MMA scale tensor must match A operand pair layout.");
+
+    cute::for_each(cute::make_seq<ScalePairCount>{}, [&](auto pair_c) {
+      constexpr int pair = decltype(pair_c)::value;
+      constexpr int scale_vec = pair * 2;
+      Tensor row_scales = scales_vm(_, Int<scale_vec>{});
+      constexpr int ScaleValueCount = decltype(size(row_scales))::value;
+      static_assert(ScaleValueCount == 2 || ScaleValueCount == NumValPerSrcReg,
+          "Fused e8m0 pre-MMA raw scale expects either two compact row scales or one scale per fp4 lane.");
+      constexpr int HiScaleIndex =
+          (ScaleValueCount == NumValPerSrcReg) ? (NumValPerSrcReg / 2) : 1;
+      ScaleScalar const lo_scale = row_scales(0);
+      ScaleScalar const hi_scale = row_scales(HiScaleIndex);
+      constexpr int cache_index = KBlock * ScalePairCount + pair;
+      lo_exp_offsets[cache_index] = static_cast<uint32_t>(lo_scale.storage);
+      hi_exp_offsets[cache_index] = static_cast<uint32_t>(hi_scale.storage);
+    });
+  }
+
+  template <int KBlock,
+            int ScalePairCount,
+            class EngineIn,
+            class EngineOut,
+            class LayoutIn,
+            class LayoutOut,
+            class LoOffsetArray,
+            class HiOffsetArray>
+  CUTLASS_DEVICE
+  static void convert_A_kblock_fused_e8m0_pre_mma_exp_offsets_to_slot(
+    Tensor<EngineIn, LayoutIn> const& tCrA_load,
+    Tensor<EngineOut, LayoutOut>& tCrA_mma_slot,
+    cute::Int<KBlock>,
+    cute::Int<ScalePairCount>,
+    LoOffsetArray const& lo_exp_offsets,
+    HiOffsetArray const& hi_exp_offsets) {
+
+    static_assert(FusedE8M0PreMmaScale, "This helper is only for fused e8m0 pre-MMA scale.");
+    static_assert(UseFP4ToFP8LookupTable, "Fused e8m0 pre-MMA scale currently supports MXFP4 x FP8 only.");
+    static_assert(is_rmem<EngineIn>::value, "Input tensor for A conversion must come from registers");
+    static_assert(is_rmem<EngineOut>::value, "Output tensor for A conversion must come from registers");
+    using SrcType = typename EngineIn::value_type;
+
+    Tensor src = tCrA_load(_, _, cute::Int<KBlock>{});
+    Tensor dst = tCrA_mma_slot;
+
+    CUTE_STATIC_ASSERT_V(size(src(_, 0)) == cosize(src(_, 0).layout()),
+                         "The first mode of tensor src must be contiguous in memory");
+    CUTE_STATIC_ASSERT_V(size(src) == size(dst));
+
+    int constexpr NumValPerSrcReg = cute::min(decltype(size(src(_, 0)))::value,
+                                              ceil_div(32, sizeof_bits_v<SrcType>));
+    Tensor src_vm = cute::group_modes<1,-1>(cute::zipped_divide(src, Int<NumValPerSrcReg>{}));
+    Tensor dst_vm = cute::group_modes<1,-1>(cute::zipped_divide(dst, Int<NumValPerSrcReg>{}));
+
+    constexpr int DstVecCount = decltype(size<1>(dst_vm))::value;
+    static_assert((DstVecCount % 2) == 0,
+        "Fused e8m0 pre-MMA pair conversion expects an even number of fp4x8 operands.");
+    static_assert(ScalePairCount * 2 == DstVecCount,
+        "Fused e8m0 pre-MMA scale cache must provide one scale pair per fp4x8 operand pair.");
+
+    cute::for_each(cute::make_seq<ScalePairCount>{}, [&](auto pair_c) {
+      constexpr int pair = decltype(pair_c)::value;
+      constexpr int i = pair * 2;
+      auto src_vec0 = src_vm(_, i);
+      auto src_vec1 = src_vm(_, i + 1);
+      auto dst_vec0 = dst_vm(_, i);
+      auto dst_vec1 = dst_vm(_, i + 1);
+      constexpr int cache_index = KBlock * ScalePairCount + pair;
+      uint32_t const lo_exp_offset = lo_exp_offsets[cache_index];
+      uint32_t const hi_exp_offset = hi_exp_offsets[cache_index];
+      fp4tofp8_fused_e8m0_pre_mma_convert_pair(
+          src_vec0, src_vec1, dst_vec0, dst_vec1, lo_exp_offset, hi_exp_offset);
+    });
   }
 
   /// Utilities for any additional inputs inside of the TMA load

@@ -185,6 +185,7 @@ public:
   using SmemLayoutAtomB = SmemLayoutAtomB_;
   using SmemCopyAtomA = SmemCopyAtomA_;
   using SmemCopyAtomB = SmemCopyAtomB_;
+  using WeightScaleRawElement = typename ElementScale::Element;
   using SmemCopyAtomScale = Copy_Atom<cute::AutoVectorizingCopy, NonVoidElementScale>;
 
   // We must ensure the type to be scaled goes to RF
@@ -216,9 +217,6 @@ public:
 
   static constexpr int IsSubbyteA = cute::sizeof_bits_v<SwappedElementA> < 8;
   using TmaElementA = cute::conditional_t<IsSubbyteA, uint8_t, SwappedElementA>;
-  // TmaElementScale removed: scale no longer uses TMA
-  // Scale loaded via SM90_BULK_COPY_G2S (lightweight, no TMA descriptor needed)
-
   using MainloopPipeline = cutlass::PipelineTmaAsync<DispatchPolicy::Stages>;
   using PipelineState = cutlass::PipelineState<DispatchPolicy::Stages>;
   using PipelineParams = typename MainloopPipeline::Params;
@@ -243,8 +241,30 @@ public:
           ? (ActScaleTmaAlignmentChunks % ActScaleChunksPerTileK == 0)
           : (ActScaleChunksPerTileK % ActScaleTmaAlignmentChunks == 0)),
       "Activation scale TileShapeK must divide or be a multiple of the 16B TMA scale window.");
+  static constexpr int WeightScaleLogicalMPerFoldBlock = 64;
+  static constexpr int WeightScaleLogicalKPerFoldBlock = 128;
+  static constexpr int WeightScaleFoldedMPerFoldBlock = 16;
+  static constexpr int WeightScaleMSlicesPerFoldBlock = WeightScaleLogicalMPerFoldBlock / WeightScaleFoldedMPerFoldBlock;
+  static constexpr int WeightScaleScaleGroupsPerFoldBlock = WeightScaleLogicalKPerFoldBlock / ScalingGroupSize;
+  static constexpr int WeightScalePhysicalColsPerFoldBlock = WeightScaleMSlicesPerFoldBlock * WeightScaleScaleGroupsPerFoldBlock;
+  static constexpr int WeightScaleMBlocksPerTile = size<0>(TileShape{}) / WeightScaleLogicalMPerFoldBlock;
+  static constexpr int WeightScaleKBlocksPerTile = size<2>(TileShape{}) / WeightScaleLogicalKPerFoldBlock;
+  static_assert(size<0>(TileShape{}) % WeightScaleLogicalMPerFoldBlock == 0,
+      "Folded weight scale requires TileShapeM to be a multiple of 64.");
+  static_assert(size<2>(TileShape{}) % WeightScaleLogicalKPerFoldBlock == 0,
+      "Folded weight scale requires TileShapeK to be a multiple of 128.");
+  static_assert(WeightScaleLogicalMPerFoldBlock % WeightScaleFoldedMPerFoldBlock == 0,
+      "Folded weight scale M dimension must evenly divide the logical M block.");
+  static_assert(WeightScalePhysicalColsPerFoldBlock * cutlass::sizeof_bits<WeightScaleRawElement>::value == 128,
+      "Folded weight scale must expose 16B per folded-M coordinate.");
   static constexpr int ScaleNRawElementsPerStage = size<1>(TileShape{}) * ActScaleTmaChunks;
   static constexpr int ScaleNElementsPerStage = size<1>(TileShape{});
+  static constexpr int WeightScaleRawElementsPerFoldBlock = WeightScaleLogicalMPerFoldBlock * WeightScaleLogicalKPerFoldBlock / ScalingGroupSize;
+  static constexpr int WeightScaleRawElementsPerStage = WeightScaleRawElementsPerFoldBlock * WeightScaleMBlocksPerTile * WeightScaleKBlocksPerTile;
+  static constexpr uint32_t WeightScaleFoldBlockBytes =
+      cutlass::bits_to_bytes(WeightScaleRawElementsPerFoldBlock * cutlass::sizeof_bits<WeightScaleRawElement>::value);
+  static constexpr uint32_t WeightScaleTransactionBytes =
+      cutlass::bits_to_bytes(WeightScaleRawElementsPerStage * cutlass::sizeof_bits<WeightScaleRawElement>::value);
 
   using SmemLayoutAtomScale = Layout<Shape<decltype(cute::shape<0>(SwappedSmemLayoutAtomA{})), cute::Int<1>>>;
   using ScaleTileShape = decltype(make_shape(shape<0>(TileShape{}), shape<1>(SmemLayoutAtomScale{})));
@@ -270,6 +290,38 @@ public:
       SmemLayoutAtomScale{},
       make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<Stages>{}),
       cute::conditional_t< ::cutlass::gemm::detail::is_major<0,NonVoidStrideScale>(), Step<_2,_1,_3>, Step<_1,_2,_3>>{}));
+  using SmemLayoutWeightScaleRaw = Layout<
+      Shape<
+          Int<WeightScalePhysicalColsPerFoldBlock>,
+          Int<WeightScaleFoldedMPerFoldBlock>,
+          Int<WeightScaleMBlocksPerTile>,
+          Int<WeightScaleKBlocksPerTile>,
+          Int<Stages>>,
+      Stride<
+          _1,
+          Int<WeightScalePhysicalColsPerFoldBlock>,
+          Int<WeightScaleFoldedMPerFoldBlock * WeightScalePhysicalColsPerFoldBlock * WeightScaleKBlocksPerTile>,
+          Int<WeightScaleFoldedMPerFoldBlock * WeightScalePhysicalColsPerFoldBlock>,
+          Int<WeightScaleRawElementsPerStage>>>;
+  using SmemLayoutWeightScaleExpanded = Layout<
+      Shape<
+          Shape<
+              Int<WeightScaleFoldedMPerFoldBlock>,
+              Int<WeightScaleMSlicesPerFoldBlock>,
+              Int<WeightScaleMBlocksPerTile>>,
+          Shape<
+              Int<ScalingGroupSize>,
+              Shape<Int<WeightScaleScaleGroupsPerFoldBlock>, Int<WeightScaleKBlocksPerTile>>>,
+          Int<Stages>>,
+      Stride<
+          Stride<
+              Int<WeightScalePhysicalColsPerFoldBlock>,
+              Int<WeightScaleScaleGroupsPerFoldBlock>,
+              Int<WeightScaleFoldedMPerFoldBlock * WeightScalePhysicalColsPerFoldBlock * WeightScaleKBlocksPerTile>>,
+          Stride<
+              _0,
+              Stride<_1, Int<WeightScaleFoldedMPerFoldBlock * WeightScalePhysicalColsPerFoldBlock>>>,
+          Int<WeightScaleRawElementsPerStage>>>;
   // MXFP8 activation scales are independent from MXFP4 weight scales.  They are
   // stored in raw M-major, K-contiguous form and TMA-loaded into this raw scale
   // layout: (BLK_N, ActScaleTmaChunks, PIPE).  The TMA window is 16B-aligned:
@@ -338,7 +390,7 @@ public:
   static_assert(SmemAlignmentA >= 128 and SmemAlignmentB >= 128, "Require at least 128B alignment");
 
   struct SharedStorage {
-    static constexpr int scale_elements = Utils::elements_per_smem_scale();
+    static constexpr int scale_elements = cute::cosize_v<SmemLayoutWeightScaleRaw>;
     static constexpr int zero_elements = 0;
     static constexpr int activation_scale_elements = 0;
     struct TensorStorage {
@@ -347,7 +399,7 @@ public:
       // Keep the member layout aligned with mixed_input.hpp for online collective
       // switching.  Prescale only stages weight e8m0 scale; zero and activation
       // scale storage are intentionally empty.
-      cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
+      cute::ArrayEngine<WeightScaleRawElement, scale_elements> smem_scale;
       cute::ArrayEngine<NonVoidElementActivationScale, activation_scale_elements> smem_activation_scale;
       cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
     } tensors;
@@ -641,15 +693,13 @@ public:
               detail::get_gmem_layout(cute::make_shape(N,K,L), args.dB));
         }
         const int scale_mn = SwapAB ? N : M;
-        int scale_k = 0;
-        constexpr int min_tma_aligned_elements_scale = tma_alignment_bits / cutlass::sizeof_bits<ElementScale>::value;
         if (args.chunk_size == 0) {
           implementable = false;
         }
         else {
-          scale_k = (K + args.chunk_size - 1) / args.chunk_size;
-          implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_scale>(cute::make_shape(scale_mn,scale_k,L), StrideScale{});
-          implementable = implementable && (args.chunk_size == K || ((size<2>(TileShape{}) % args.chunk_size) == 0));
+          implementable = implementable && (args.chunk_size == ScalingGroupSize);
+          implementable = implementable && ((scale_mn % size<0>(TileShape{})) == 0);
+          implementable = implementable && ((K % size<2>(TileShape{})) == 0);
         }
         implementable = implementable && (args.ptr_S != nullptr);
         implementable = implementable && (args.ptr_Z == nullptr);
@@ -693,14 +743,12 @@ public:
     auto B_L = mock_L;
     Tensor mA_mkl = mainloop_params.tma_load_a.get_tma_tensor(shape(detail::get_gmem_layout(make_shape(M,K,A_L), mainloop_params.dA))); // (m,k,l)
     Tensor mB_nkl = mainloop_params.tma_load_b.get_tma_tensor(shape(detail::get_gmem_layout(make_shape(N,K,B_L), mainloop_params.dB))); // (n,k,l)
+    int const scale_total_k128_blocks = int(K) / WeightScaleLogicalKPerFoldBlock;
 
     // Make tiled views, defer the slice
     Tensor gA_mkl = local_tile(mA_mkl, TileShape{}, make_coord(_,_,_), Step<_1, X,_1>{});  // (BLK_M,BLK_K,m,k,l)
     Tensor gB_nkl = local_tile(mB_nkl, TileShape{}, make_coord(_,_,_), Step< X,_1,_1>{});  // (BLK_N,BLK_K,n,k,l)
-
-    // Scale ptr/stride placeholders are set by tensors_perform_update before first load().
-    return cute::make_tuple(gA_mkl, gB_nkl,
-        static_cast<NonVoidElementScale const*>(nullptr), int64_t(0));
+    return cute::make_tuple(gA_mkl, gB_nkl, scale_total_k128_blocks);
   }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -724,8 +772,8 @@ public:
       uint32_t block_rank_in_cluster,
       TensorStorage& shared_tensors) {
 
-    static_assert(sizeof... (Ts) == 4,
-        "Fused pre-MMA scale needs four inputs (gA, gB, scale_ptr, stride_k)");
+    static_assert(sizeof... (Ts) == 3,
+        "Fused pre-MMA scale needs three inputs (gA, gB, total_k128_blocks)");
     static_assert(sizeof... (TMs) == 2, "Only A and B tensormaps needed");
 
     Tensor sA_ = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});          // (BLK_M,BLK_K,PIPE)
@@ -742,6 +790,7 @@ public:
 
     Tensor gA_mkl = get<0>(load_inputs);
     Tensor gB_nkl = get<1>(load_inputs);
+    int const scale_total_k128_blocks = get<2>(load_inputs);
 
     auto block_tma_a = mainloop_params.tma_load_a.get_slice(cluster_local_block_id.y);
     auto block_tma_b = mainloop_params.tma_load_b.get_slice(cluster_local_block_id.x);
@@ -759,6 +808,10 @@ public:
 
     Tensor tBgB = block_tma_b.partition_S(gB);                                                 // (TMA,TMA_N,TMA_K,k)
     Tensor tBsB = block_tma_b.partition_D(sB);                                              // (TMA,TMA_N,TMA_K,PIPE)
+
+    Tensor sSRaw = make_tensor(
+        make_smem_ptr(reinterpret_cast<WeightScaleRawElement*>(shared_tensors.smem_scale.begin())),
+        SmemLayoutWeightScaleRaw{});
 
     uint16_t mcast_mask_a = 0;
     uint16_t mcast_mask_b = 0;
@@ -778,8 +831,6 @@ public:
         mcast_mask_b |= (uint16_t(1) << block_layout(m,cluster_local_block_id.y,Int<0>{}));
       }
     }
-
-    Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});
 
     // Mainloop
     CUTLASS_PRAGMA_NO_UNROLL
@@ -801,18 +852,32 @@ public:
         copy(mainloop_params.tma_load_a.with(mainloop_params.ptr_A_prebuilt_tma_desc, *tma_barrier, mcast_mask_a), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
         copy(mainloop_params.tma_load_b.with(current_tma_desc_b_, *tma_barrier, mcast_mask_b), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
 
-        // Fused pre-MMA scale uses a lightweight bulk copy for the weight e8m0 offsets.
-        auto scale_ptr = get<2>(load_inputs);
-        auto scale_stride_k = get<3>(load_inputs);
-        const int scale_k_tile = *k_tile_iter;
-        constexpr int BLK_M = size<0>(TileShape{});
-        constexpr int scale_load_bytes = BLK_M * sizeof(NonVoidElementScale);
+      }
 
-        auto* scale_gmem_addr = reinterpret_cast<void const*>(
-            scale_ptr + m_coord * BLK_M + scale_k_tile * scale_stride_k);
-        auto* scale_smem_addr = static_cast<void*>(&sS(0, 0, write_stage));
-        cute::SM90_BULK_COPY_G2S::copy(scale_gmem_addr,
-            reinterpret_cast<uint64_t*>(tma_barrier), scale_smem_addr, scale_load_bytes);
+      int const scale_k128_offset = int(*k_tile_iter) * WeightScaleKBlocksPerTile;
+      int const scale_m64_offset = int(m_coord) * int(size<0>(TileShape{})) / WeightScaleLogicalMPerFoldBlock;
+      auto* scale_base = reinterpret_cast<WeightScaleRawElement const*>(mainloop_params.ptr_S[current_group_idx_]);
+
+      auto scale_gmem_fold_block = [&](int m64_block, int k128_block) {
+        return int64_t(m64_block) * int64_t(scale_total_k128_blocks) + int64_t(k128_block);
+      };
+      auto issue_scale_bulk_copy = [&](int local_m64_block) {
+        int const m64_block = scale_m64_offset + local_m64_block;
+        int64_t const scale_gmem_offset = scale_gmem_fold_block(m64_block, scale_k128_offset) * int64_t(WeightScaleRawElementsPerFoldBlock);
+        auto* scale_gmem_addr = reinterpret_cast<void const*>(scale_base + scale_gmem_offset);
+        auto* scale_smem_addr = static_cast<void*>(&sSRaw(0, 0, local_m64_block, 0, write_stage));
+        cute::SM90_BULK_COPY_G2S::copy(
+            scale_gmem_addr,
+            reinterpret_cast<uint64_t*>(tma_barrier),
+            scale_smem_addr,
+            WeightScaleFoldBlockBytes * WeightScaleKBlocksPerTile);
+      };
+
+      if (cute::elect_one_sync()) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int local_m64_block = 0; local_m64_block < WeightScaleMBlocksPerTile; ++local_m64_block) {
+          issue_scale_bulk_copy(local_m64_block);
+        }
       }
       ++k_tile_iter;
 
@@ -884,7 +949,7 @@ public:
     Layout warp_group_thread_layout = make_layout(Int<MmaWarpGroups>{},
                                                   Int<NumThreadsPerWarpGroup>{});
 
-    int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / NumThreadsPerWarpGroup, 0);
+    int warp_group_idx = thread_idx / NumThreadsPerWarpGroup;
 
     TiledMma tiled_mma;
     auto mma_thread_slice = tiled_mma.get_thread_slice(thread_idx);
@@ -953,6 +1018,11 @@ public:
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+    Tensor sSRaw = make_tensor(
+        make_smem_ptr(reinterpret_cast<WeightScaleRawElement*>(shared_tensors.smem_scale.begin())),
+        SmemLayoutWeightScaleExpanded{});
+    Tensor tCsSRaw = mma_thread_slice.partition_A(sSRaw);
+
     PipelineState smem_pipe_release = smem_pipe_read;
 
     constexpr int K_BLOCK_MAX = size<2>(tCrA_load);
@@ -960,24 +1030,74 @@ public:
     constexpr int K_COMMIT_GROUPS =
         (K_BLOCK_MAX + K_COMMIT_GROUP_SIZE - 1) / K_COMMIT_GROUP_SIZE;
     constexpr int K_WAIT_MAX = (K_COMMIT_GROUPS - 1 < 7) ? K_COMMIT_GROUPS - 1 : 7;
-    constexpr int NumMMAsPerChunk = ScalingGroupSize / cute::get<0, 1>(tCsB.shape())();
+    // Large-N tiles expose scale smem->RF latency; small-N best configs keep
+    // the rolling copy to avoid extending scale register lifetime.
+    constexpr bool PreloadAllScaleKblocks = size<1>(TileShape{}) >= 128;
     static_assert(K_BLOCK_MAX >= 4, "Consider increasing TileShapeK");
     static_assert(ScalingGroupSize % cute::get<0, 1>(tCsB.shape())() == 0,
         "Fused e8m0 pre-MMA scale requires scale groups to align to MMA K blocks.");
+    Tensor tCrA_scale_probe = tCrA_load_4b_packed(_, _, Int<0>{});
+    Tensor tCrA_scale_probe_vm = cute::group_modes<1,-1>(
+        cute::zipped_divide(tCrA_scale_probe, Int<8>{}));
+    constexpr int ScalePairCount = decltype(size<1>(tCrA_scale_probe_vm))::value / 2;
+    static_assert(ScalePairCount > 0,
+        "Fused e8m0 pre-MMA scale cache expects at least one fp4x8 operand pair.");
+    // TileM256 has enough scale pairs per K block that the compact offset
+    // cache creates a longer dependency chain than keeping the expanded scale
+    // tensor in RF.  Smaller M tiles still prefer the compact offset cache.
+    constexpr bool UseExpandedScaleRFForLargeM = size<0>(TileShape{}) >= 256;
+    Tensor tCrA_scale = make_fragment_like<WeightScaleRawElement>(tCrA_load_4b_packed);
+    cute::array<uint32_t, K_BLOCK_MAX * ScalePairCount> lo_exp_offsets;
+    cute::array<uint32_t, K_BLOCK_MAX * ScalePairCount> hi_exp_offsets;
 
     ConsumerToken barrier_token = {BarrierStatus::WaitAgain};
-    auto partitioned_extra_info = Utils::partition_extra_mma_info(mma_thread_slice, shared_tensors);
-    auto copy_partitions_extra_info =
-        Utils::retile_extra_mma_info(tiled_mma, partitioned_extra_info, warp_group_thread_idx);
-    auto convert_A_kblock_static = [&](auto k_block_c) {
+    auto copy_scale_kblock = [&](auto k_block_c, int read_stage) {
       constexpr int k_block = decltype(k_block_c)::value;
+      if constexpr (k_block < size<2>(tCsSRaw.shape())) {
+        Tensor scales = tCsSRaw(_,_,k_block_c,read_stage);
+        if constexpr (UseExpandedScaleRFForLargeM) {
+          copy(scales, tCrA_scale(_,_,k_block_c));
+        }
+        else {
+          Utils::cache_A_kblock_fused_e8m0_pre_mma_exp_offsets(
+              scales,
+              k_block_c,
+              Int<ScalePairCount>{},
+              lo_exp_offsets,
+              hi_exp_offsets);
+        }
+      }
+    };
+    auto copy_scale_for_mma = [&](auto k_block_c, int read_stage) {
+      if constexpr (PreloadAllScaleKblocks) {
+        if constexpr (decltype(k_block_c)::value == 0) {
+          cute::for_each(cute::make_seq<K_BLOCK_MAX>{}, [&](auto preload_k_block_c) {
+            copy_scale_kblock(preload_k_block_c, read_stage);
+          });
+        }
+      }
+      else {
+        copy_scale_kblock(k_block_c, read_stage);
+      }
+    };
+    auto convert_A_kblock_static = [&](auto k_block_c, int read_stage) {
       auto tCrA_mma_slot = tCrA_mma(_,_,k_block_c);
-      Utils::convert_A_kblock_fused_e8m0_pre_mma_to_slot(
-          tCrA_load_4b_packed,
-          tCrA_mma_slot,
-          partitioned_extra_info,
-          k_block_c,
-          cute::Int<k_block / NumMMAsPerChunk>{});
+      if constexpr (UseExpandedScaleRFForLargeM) {
+        Utils::convert_A_kblock_fused_e8m0_pre_mma_raw_scale_to_slot(
+            tCrA_load_4b_packed,
+            tCrA_mma_slot,
+            tCrA_scale,
+            k_block_c);
+      }
+      else {
+        Utils::convert_A_kblock_fused_e8m0_pre_mma_exp_offsets_to_slot(
+            tCrA_load_4b_packed,
+            tCrA_mma_slot,
+            k_block_c,
+            Int<ScalePairCount>{},
+            lo_exp_offsets,
+            hi_exp_offsets);
+      }
     };
     auto commit_mma_group = [&] {
       warpgroup_commit_batch();
@@ -1006,13 +1126,13 @@ public:
       barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
 
       Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, read_stage);
+      copy_scale_for_mma(cute::Int<0>{}, read_stage);
       if (K_BLOCK_MAX > 1) {
         Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, read_stage);
+        copy_scale_for_mma(cute::Int<1>{}, read_stage);
       }
-      Utils::copy_tensors_SFA(
-          partitioned_extra_info, copy_partitions_extra_info, 0, read_stage);
 
-      convert_A_kblock_static(cute::Int<0>{});
+      convert_A_kblock_static(cute::Int<0>{}, read_stage);
 
       tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
       warpgroup_arrive();
@@ -1022,7 +1142,8 @@ public:
 
       Utils::copy_tensors_A(
           smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 2, read_stage);
-      convert_A_kblock_static(cute::Int<1>{});
+      copy_scale_for_mma(cute::Int<2>{}, read_stage);
+      convert_A_kblock_static(cute::Int<1>{}, read_stage);
 
       cute::for_each(cute::make_seq<K_BLOCK_MAX - 1>{}, [&](auto i) {
         constexpr int k_block = decltype(i)::value + 1;
@@ -1033,9 +1154,10 @@ public:
         if constexpr (k_block < K_BLOCK_MAX - 2) {
           Utils::copy_tensors_A(
               smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
+          copy_scale_for_mma(cute::Int<k_block + 2>{}, read_stage);
         }
         if constexpr (k_block < K_BLOCK_MAX - 1) {
-          convert_A_kblock_static(cute::Int<k_block + 1>{});
+          convert_A_kblock_static(cute::Int<k_block + 1>{}, read_stage);
         }
       });
 
@@ -1046,14 +1168,14 @@ public:
         int const next_read_stage = smem_pipe_read.index();
         Utils::copy_tensors_A(
             smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, next_read_stage);
+        copy_scale_for_mma(cute::Int<0>{}, next_read_stage);
         Utils::copy_tensors_A(
             smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, next_read_stage);
-        Utils::copy_tensors_SFA(
-            partitioned_extra_info, copy_partitions_extra_info, 0, next_read_stage);
+        copy_scale_for_mma(cute::Int<1>{}, next_read_stage);
 
         // The rolling wait after the last commit has retired the oldest group
         // from the previous tile, which is the group that reads A slots 0..3.
-        convert_A_kblock_static(cute::Int<0>{});
+        convert_A_kblock_static(cute::Int<0>{}, next_read_stage);
       }
       else {
         warpgroup_wait<0>();
@@ -1089,22 +1211,23 @@ public:
           int const next_read_stage = smem_pipe_read.index();
           Utils::copy_tensors_A(
               smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 0, next_read_stage);
+          copy_scale_for_mma(cute::Int<0>{}, next_read_stage);
           Utils::copy_tensors_A(
               smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, 1, next_read_stage);
-          Utils::copy_tensors_SFA(
-              partitioned_extra_info, copy_partitions_extra_info, 0, next_read_stage);
+          copy_scale_for_mma(cute::Int<1>{}, next_read_stage);
 
           // The rolling wait after the last commit has retired the previous
           // tile's first A-slot group.  Later A-slot groups are retired by
           // subsequent grouped commits before their convert points.
-          convert_A_kblock_static(cute::Int<0>{});
+          convert_A_kblock_static(cute::Int<0>{}, next_read_stage);
         }
         else {
           if constexpr (k_block < K_BLOCK_MAX - 2) {
             Utils::copy_tensors_A(
                 smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
+            copy_scale_for_mma(cute::Int<k_block + 2>{}, read_stage);
           }
-          convert_A_kblock_static(cute::Int<k_block + 1>{});
+          convert_A_kblock_static(cute::Int<k_block + 1>{}, read_stage);
         }
       });
     }
@@ -1126,9 +1249,10 @@ public:
         if constexpr (k_block < K_BLOCK_MAX - 2) {
           Utils::copy_tensors_A(
               smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM, k_block + 2, read_stage);
+          copy_scale_for_mma(cute::Int<k_block + 2>{}, read_stage);
         }
         if constexpr (k_block < K_BLOCK_MAX - 1) {
-          convert_A_kblock_static(cute::Int<k_block + 1>{});
+          convert_A_kblock_static(cute::Int<k_block + 1>{}, read_stage);
         }
       });
 
@@ -1203,10 +1327,7 @@ public:
       [[maybe_unused]] int32_t next_batch) {
     current_group_idx_ = next_batch;
     current_tma_desc_b_ = mainloop_params.ptr_B_prebuilt_tma_descs + next_batch;
-    auto new_scale_ptr = mainloop_params.ptr_S[next_batch];
-    int64_t new_stride_k = get<1>(mainloop_params.dS[next_batch]);
-    return cute::make_tuple(get<0>(input_tensors), get<1>(input_tensors),
-                            new_scale_ptr, new_stride_k);
+    return input_tensors;
   }
 
 };

@@ -126,6 +126,15 @@ inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 
 // Weight scales are the normal mixed-input scale attached to the 4-bit weight operand.
 using ElementScalePacked = cutlass::Array<ElementScale, TileShapeK / GROUP_SIZE>;
+// Fused pre-MMA scale stores GMEM scale as folded 64x128 -> 16x512 scalar
+// e8m0 blocks, arranged so each M64 lane has contiguous K128 blocks.  The
+// physical scale byte count is unchanged, while each folded row exposes a
+// 16B copy row independent of the selected Ktile.
+#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+using ElementWeightScaleStorage = ElementScale;
+#else
+using ElementWeightScaleStorage = ElementScalePacked;
+#endif
 inline constexpr bool ScaleAppliesToActivation =
 #if defined(CUTLASS_MIXED_GEMM_MXFP4_MXFP8)
     true;
@@ -438,7 +447,7 @@ extern cutlass::DeviceAllocation<MmaType>                                       
 extern cutlass::DeviceAllocation<QuantType>                                             block_B;
 extern cutlass::DeviceAllocation<QuantType>                                             block_B_interleaved;
 extern cutlass::DeviceAllocation<ElementScale>                                          block_weight_scale;
-extern cutlass::DeviceAllocation<ElementScalePacked>                                    block_weight_scale_packed;
+extern cutlass::DeviceAllocation<ElementWeightScaleStorage>                             block_weight_scale_packed;
 extern cutlass::DeviceAllocation<ElementActivationScale>                                block_activation_scale;
 extern cutlass::DeviceAllocation<ElementActivationScalePacked>                          block_activation_scale_packed;
 extern cutlass::DeviceAllocation<ElementEpilogueTokenScale>                             block_epilogue_token_scale;
