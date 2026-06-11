@@ -124,17 +124,10 @@ inline constexpr int TileShapeK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
 
 //--------------------------------------------------------------------------------------------
 
-// Weight scales are the normal mixed-input scale attached to the 4-bit weight operand.
-using ElementScalePacked = cutlass::Array<ElementScale, TileShapeK / GROUP_SIZE>;
-// Fused pre-MMA scale stores GMEM scale as folded 64x128 -> 16x512 scalar
-// e8m0 blocks, arranged so each M64 lane has contiguous K128 blocks.  The
-// physical scale byte count is unchanged, while each folded row exposes a
-// 16B copy row independent of the selected Ktile.
-#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
+// CMX kernels consume folded scalar weight scales so scale storage is
+// independent from the profiled TileK.
+using MainloopWeightScale = ElementScale;
 using ElementWeightScaleStorage = ElementScale;
-#else
-using ElementWeightScaleStorage = ElementScalePacked;
-#endif
 inline constexpr bool ScaleAppliesToActivation =
 #if defined(CUTLASS_MIXED_GEMM_MXFP4_MXFP8)
     true;
@@ -142,7 +135,6 @@ inline constexpr bool ScaleAppliesToActivation =
     false;
 #endif
 using ElementActivationScale = cutlass::float_ue8m0_t;
-using ElementActivationScalePacked = cutlass::Array<ElementActivationScale, TileShapeK / GROUP_SIZE>;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Options struct (defined here so all part files share the same type)
@@ -255,7 +247,7 @@ using MainloopElementA = cute::conditional_t<
     ScaleAppliesToActivation,
     cute::tuple<ElementA, ElementActivationScale>,
     ElementA>;
-using MainloopElementB = cute::tuple<ElementB, ElementScalePacked>;
+using MainloopElementB = cute::tuple<ElementB, MainloopWeightScale>;
 
 using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
 using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
@@ -447,9 +439,8 @@ extern cutlass::DeviceAllocation<MmaType>                                       
 extern cutlass::DeviceAllocation<QuantType>                                             block_B;
 extern cutlass::DeviceAllocation<QuantType>                                             block_B_interleaved;
 extern cutlass::DeviceAllocation<ElementScale>                                          block_weight_scale;
-extern cutlass::DeviceAllocation<ElementWeightScaleStorage>                             block_weight_scale_packed;
+extern cutlass::DeviceAllocation<ElementWeightScaleStorage>                             block_weight_scale_folded;
 extern cutlass::DeviceAllocation<ElementActivationScale>                                block_activation_scale;
-extern cutlass::DeviceAllocation<ElementActivationScalePacked>                          block_activation_scale_packed;
 extern cutlass::DeviceAllocation<ElementEpilogueTokenScale>                             block_epilogue_token_scale;
 extern cutlass::DeviceAllocation<ElementZero>                                           block_zero;
 extern cutlass::DeviceAllocation<ElementC>                                              block_C;
@@ -459,9 +450,8 @@ extern cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::Element
 extern cutlass::DeviceAllocation<const MmaType *>                    ptr_A;
 extern cutlass::DeviceAllocation<const QuantType *>                  ptr_B;
 extern cutlass::DeviceAllocation<const ElementActivationScale *>     ptr_activation_scale;
-extern cutlass::DeviceAllocation<ElementActivationScalePacked *>     ptr_activation_scale_packed;
 extern cutlass::DeviceAllocation<const ElementEpilogueTokenScale *>  ptr_epilogue_token_scale;
-extern cutlass::DeviceAllocation<const ElementScalePacked *>         ptr_weight_scale_packed;
+extern cutlass::DeviceAllocation<const MainloopWeightScale *>        ptr_weight_scale_folded;
 extern cutlass::DeviceAllocation<const ElementZero *>                ptr_zero;
 extern cutlass::DeviceAllocation<const ElementC *>                   ptr_C;
 extern cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput *> ptr_D;
@@ -531,7 +521,7 @@ typename Gemm::Arguments args_from_options(Options const& options)
 #endif
 
   decltype(arguments.mainloop) mainloop_args{
-    ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_weight_scale_packed.get(), stride_weight_scale.get(), GROUP_SIZE
+    ptr_B.get(), dB, ptr_A.get(), stride_A.get(), ptr_weight_scale_folded.get(), stride_weight_scale.get(), GROUP_SIZE
   };
   mainloop_args.ptr_B_prebuilt_tma_descs =
       precomputed_scheduler::prebuilt_tma_desc_B_data();

@@ -63,8 +63,7 @@ std::vector<int64_t> offset_A;
 std::vector<int64_t> offset_B;
 std::vector<int64_t> offset_C;
 std::vector<int64_t> offset_D;
-std::vector<int64_t> offset_weight_scale_packed;
-std::vector<int64_t> offset_activation_scale_packed;
+std::vector<int64_t> offset_weight_scale_folded;
 std::vector<int64_t> offset_activation_scale;
 std::vector<int64_t> offset_epilogue_token_scale;
 std::vector<int64_t> offset_zero;
@@ -90,9 +89,8 @@ cutlass::DeviceAllocation<MmaType>                                              
 cutlass::DeviceAllocation<QuantType>                                             block_B;
 cutlass::DeviceAllocation<QuantType>                                             block_B_interleaved;
 cutlass::DeviceAllocation<ElementScale>                                          block_weight_scale;
-cutlass::DeviceAllocation<ElementWeightScaleStorage>                             block_weight_scale_packed;
+cutlass::DeviceAllocation<ElementWeightScaleStorage>                             block_weight_scale_folded;
 cutlass::DeviceAllocation<ElementActivationScale>                                block_activation_scale;
-cutlass::DeviceAllocation<ElementActivationScalePacked>                          block_activation_scale_packed;
 cutlass::DeviceAllocation<ElementEpilogueTokenScale>                             block_epilogue_token_scale;
 cutlass::DeviceAllocation<ElementZero>                                           block_zero;
 cutlass::DeviceAllocation<ElementC>                                              block_C;
@@ -103,9 +101,8 @@ cutlass::DeviceAllocation<float>                                                
 cutlass::DeviceAllocation<const MmaType *>                                         ptr_A;
 cutlass::DeviceAllocation<const QuantType *>                                       ptr_B;
 cutlass::DeviceAllocation<const ElementActivationScale *>                          ptr_activation_scale;
-cutlass::DeviceAllocation<ElementActivationScalePacked *>                          ptr_activation_scale_packed;
 cutlass::DeviceAllocation<const ElementEpilogueTokenScale *>                       ptr_epilogue_token_scale;
-cutlass::DeviceAllocation<const ElementScalePacked *>                              ptr_weight_scale_packed;
+cutlass::DeviceAllocation<const MainloopWeightScale *>                             ptr_weight_scale_folded;
 cutlass::DeviceAllocation<const ElementZero *>                                     ptr_zero;
 cutlass::DeviceAllocation<const ElementC *>                                        ptr_C;
 cutlass::DeviceAllocation<typename DefaultGemm::EpilogueOutputOp::ElementOutput *> ptr_D;
@@ -187,7 +184,7 @@ static bool pack_fused_e8m0_offset_scale(
       int const N = get<1>(problem);
       int const K = get<2>(problem);
       int const scale_groups = K / GROUP_SIZE;
-      int64_t const group_base = offset_weight_scale_packed.at(group);
+      int64_t const group_base = offset_weight_scale_folded.at(group);
       for (int kg = 0; kg < scale_groups; ++kg) {
         for (int n = 0; n < N; ++n, ++logical_idx) {
           uint8_t const raw_scale = static_cast<uint8_t>(114 + (logical_idx % (131 - 114)));
@@ -220,6 +217,54 @@ static bool pack_fused_e8m0_offset_scale(
 }
 #endif
 
+template <class ProblemSizes, class ElementScaleRaw, class ElementScaleStorage>
+__global__ void fold_weight_scale_ktile_independent_kernel(
+    ProblemSizes problem_sizes,
+    int group_num,
+    ElementScaleRaw const* logical_scale,
+    ElementScaleStorage* folded_scale,
+    int group_size) {
+
+  static_assert(cute::is_same_v<ElementScaleRaw, ElementScaleStorage>,
+      "Folded weight scale storage is scalar raw scale storage.");
+
+  int const group = blockIdx.x;
+  if (group >= group_num) {
+    return;
+  }
+
+  int64_t group_base = 0;
+  for (int g = 0; g < group; ++g) {
+    int const prev_n = get<0>(problem_sizes[g]);
+    int const prev_k = get<2>(problem_sizes[g]);
+    group_base += int64_t(prev_n) * int64_t(prev_k / group_size);
+  }
+
+  int const N = get<0>(problem_sizes[group]);
+  int const K = get<2>(problem_sizes[group]);
+  int const scale_groups = K / group_size;
+  int const scale_groups_per_k128 = 128 / group_size;
+  int const physical_cols = 16 / int(sizeof(ElementScaleRaw));
+  int const m_slices_per_m64 = physical_cols / scale_groups_per_k128;
+  int const folded_m = 64 / m_slices_per_m64;
+  int const k128_blocks = K / 128;
+  int const fold_block_elems = 64 * scale_groups_per_k128;
+
+  for (int idx = threadIdx.x; idx < N * scale_groups; idx += blockDim.x) {
+    int const kg = idx / N;
+    int const n = idx % N;
+    int const k128 = kg / scale_groups_per_k128;
+    int const kg_in_k128 = kg % scale_groups_per_k128;
+    int const folded_idx =
+        ((n / 64) * k128_blocks + k128) * fold_block_elems +
+        (n % folded_m) * physical_cols +
+        ((n % 64) / folded_m) * scale_groups_per_k128 +
+        kg_in_k128;
+
+    folded_scale[group_base + folded_idx] = logical_scale[group_base + idx];
+  }
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Testbed functions
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -230,9 +275,8 @@ void allocate(Options const& options) {
   int64_t total_elements_C = 0;
   int64_t total_elements_D = 0;
   int64_t total_elements_weight_scale = 0;
-  int64_t total_elements_weight_scale_packed = 0;
+  int64_t total_elements_weight_scale_folded = 0;
   int64_t total_elements_activation_scale = 0;
-  int64_t total_elements_activation_scale_packed = 0;
   int64_t total_elements_epilogue_token_scale = 0;
   int64_t total_elements_zero = 0;
 
@@ -245,20 +289,13 @@ void allocate(Options const& options) {
 
     const int scale_k = K / TileShapeK;
     const int scale_groups = K / GROUP_SIZE;
-    const int weight_scale_storage_k =
-#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
-        scale_groups;
-#else
-        scale_k;
-#endif
-    const int scale_m_padded = ((M + TileShapeN - 1) / TileShapeN) * TileShapeN;
+    const int weight_scale_storage_k = scale_groups;
 
     offset_A.push_back(total_elements_A);
     offset_B.push_back(total_elements_B * cutlass::sizeof_bits<QuantType>::value / 8);
     offset_C.push_back(total_elements_C);
     offset_D.push_back(total_elements_D);
-    offset_weight_scale_packed.push_back(total_elements_weight_scale_packed);
-    offset_activation_scale_packed.push_back(total_elements_activation_scale_packed);
+    offset_weight_scale_folded.push_back(total_elements_weight_scale_folded);
     offset_activation_scale.push_back(total_elements_activation_scale);
     offset_epilogue_token_scale.push_back(total_elements_epilogue_token_scale);
     offset_zero.push_back(total_elements_zero);
@@ -270,8 +307,6 @@ void allocate(Options const& options) {
     int64_t elements_weight_scale = int64_t(weight_scale_storage_k) * N;
     int64_t elements_activation_scale =
         ScaleAppliesToActivation ? int64_t(M) * scale_groups : 0;
-    int64_t elements_activation_scale_packed =
-        ScaleAppliesToActivation ? int64_t(scale_m_padded) * scale_k : 0;
     int64_t elements_epilogue_token_scale =
 #if defined(CUTLASS_MIXED_GEMM_EPILOGUE_TOKEN_SCALE)
         M;
@@ -285,9 +320,8 @@ void allocate(Options const& options) {
     total_elements_C                       += elements_C;
     total_elements_D                       += elements_D;
     total_elements_weight_scale            += elements_weight_scale;
-    total_elements_weight_scale_packed     += elements_weight_scale;
+    total_elements_weight_scale_folded     += elements_weight_scale;
     total_elements_activation_scale        += elements_activation_scale;
-    total_elements_activation_scale_packed += elements_activation_scale_packed;
     total_elements_epilogue_token_scale    += elements_epilogue_token_scale;
     total_elements_zero                    += elements_zero;
 
@@ -311,9 +345,8 @@ void allocate(Options const& options) {
   block_ref_D.reset(total_elements_D);
   block_ref_abs_error_bound.reset(total_elements_D);
   block_weight_scale.reset(total_elements_weight_scale);
-  block_weight_scale_packed.reset(total_elements_weight_scale_packed);
+  block_weight_scale_folded.reset(total_elements_weight_scale_folded);
   block_activation_scale.reset(total_elements_activation_scale);
-  block_activation_scale_packed.reset(total_elements_activation_scale_packed);
   block_epilogue_token_scale.reset(total_elements_epilogue_token_scale);
   block_zero.reset(total_elements_zero);
 
@@ -342,9 +375,8 @@ void initialize(Options& options) {
   std::vector<QuantType *>                       ptr_B_host(options.groups);
   std::vector<ElementC *>                        ptr_C_host(options.groups);
   std::vector<ElementC *>                        ptr_D_host(options.groups);
-  std::vector<ElementScalePacked *>              ptr_weight_scale_packed_host(options.groups);
+  std::vector<MainloopWeightScale *>             ptr_weight_scale_folded_host(options.groups);
   std::vector<ElementActivationScale const *>    ptr_activation_scale_host(options.groups);
-  std::vector<ElementActivationScalePacked *>    ptr_activation_scale_packed_host(options.groups);
   std::vector<ElementEpilogueTokenScale const *> ptr_epilogue_token_scale_host(options.groups);
   std::vector<ElementZero *>                     ptr_zero_host(options.groups);
   std::vector<ElementAccumulator *>              ptr_alpha_host(options.groups);
@@ -355,14 +387,12 @@ void initialize(Options& options) {
     ptr_B_host.at(i)                       = block_B_interleaved.get() + offset_B.at(i);
     ptr_C_host.at(i)                       = block_C.get() + offset_C.at(i);
     ptr_D_host.at(i)                       = block_D.get() + offset_D.at(i);
-    ptr_weight_scale_packed_host.at(i)     =
-        reinterpret_cast<ElementScalePacked*>(
-            block_weight_scale_packed.get() + offset_weight_scale_packed.at(i));
+    ptr_weight_scale_folded_host.at(i)     =
+        reinterpret_cast<MainloopWeightScale*>(
+            block_weight_scale_folded.get() + offset_weight_scale_folded.at(i));
     if constexpr (ScaleAppliesToActivation) {
       ptr_activation_scale_host.at(i)        =
           block_activation_scale.get() + offset_activation_scale.at(i);
-      ptr_activation_scale_packed_host.at(i) =
-          block_activation_scale_packed.get() + offset_activation_scale_packed.at(i);
     }
 #if defined(CUTLASS_MIXED_GEMM_EPILOGUE_TOKEN_SCALE)
     ptr_epilogue_token_scale_host.at(i) =
@@ -380,9 +410,8 @@ void initialize(Options& options) {
   ptr_C.reset(options.groups);                       ptr_C.copy_from_host(ptr_C_host.data());
   ptr_D.reset(options.groups);                       ptr_D.copy_from_host(ptr_D_host.data());
   ptr_activation_scale.reset(options.groups);        ptr_activation_scale.copy_from_host(ptr_activation_scale_host.data());
-  ptr_activation_scale_packed.reset(options.groups); ptr_activation_scale_packed.copy_from_host(ptr_activation_scale_packed_host.data());
   ptr_epilogue_token_scale.reset(options.groups);    ptr_epilogue_token_scale.copy_from_host(ptr_epilogue_token_scale_host.data());
-  ptr_weight_scale_packed.reset(options.groups);     ptr_weight_scale_packed.copy_from_host(ptr_weight_scale_packed_host.data());
+  ptr_weight_scale_folded.reset(options.groups);     ptr_weight_scale_folded.copy_from_host(ptr_weight_scale_folded_host.data());
   ptr_zero.reset(options.groups);                    ptr_zero.copy_from_host(ptr_zero_host.data());
 
   stride_A.reset(options.groups);                    stride_A.copy_from_host(stride_A_host.data());
@@ -470,28 +499,24 @@ void initialize(Options& options) {
   float fused_e8m0_residual_scale = 1.0f;
   if (!pack_fused_e8m0_offset_scale(
       block_weight_scale.get(),
-      block_weight_scale_packed.get(),
-      block_weight_scale_packed.size(),
+      block_weight_scale_folded.get(),
+      block_weight_scale_folded.size(),
       options,
       options.debug_input_scale,
       &fused_e8m0_residual_scale)) {
     return;
   }
 #else
-  cutlass::pack_scale_fp32(
-      options.debug_input_scale,
+  fold_weight_scale_ktile_independent_kernel<<<options.groups, 256>>>(
+      problem_sizes.get(),
+      options.groups,
       block_weight_scale.get(),
-      block_weight_scale_packed.get(),
-      block_weight_scale.size(),
-      ElementScalePacked::kElements);
+      block_weight_scale_folded.get(),
+      GROUP_SIZE);
+  cudaDeviceSynchronize();
 #endif
-#if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
   print_device<<<1, 1>>>(
-      options.enable_print, block_weight_scale_packed.get(), block_weight_scale_packed.size(), options.groups, 'W');
-#else
-  print_device_packed<<<1, 1>>>(
-      options.enable_print, block_weight_scale_packed.get(), block_weight_scale_packed.size(), 'W');
-#endif
+      options.enable_print, block_weight_scale_folded.get(), block_weight_scale_folded.size(), options.groups, 'W');
 
   if constexpr (ScaleAppliesToActivation) {
     set_device_ue8m0<<<1, 1>>>(
@@ -531,7 +556,7 @@ void initialize(Options& options) {
     problem_sizes.get(),
     options.groups,
     block_A.get(), block_B.get(),
-    block_weight_scale_packed.get(), block_activation_scale.get(), block_ref_D.get(),
+    block_weight_scale.get(), block_activation_scale.get(), block_ref_D.get(),
     block_ref_abs_error_bound.get(),
     TileShapeK,
     GROUP_SIZE,

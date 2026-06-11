@@ -31,6 +31,7 @@
 #pragma once
 
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
+#include "cutlass/detail/collective/mixed_input_utils.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
 #include "cutlass/gemm/collective/collective_mma_decl.hpp"
@@ -133,6 +134,35 @@ constexpr int get_scale_k_chunks_for_possibly_array() {
   }
 }
 
+template <class ElementWeight, class ElementScale, class TileShapeMNK>
+constexpr int get_weight_scale_elements_per_stage() {
+  if constexpr (cute::is_void_v<ElementScale>) {
+    return 0;
+  }
+  else if constexpr (cutlass::detail::is_Array_v<ElementScale>) {
+    return size<0>(TileShapeMNK{}) * get_scale_k_chunks_for_possibly_array<ElementScale>();
+  }
+  else {
+    return size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{}) /
+        DefaultWeightScaleGroupSize<ElementWeight>::value;
+  }
+}
+
+template <class ElementActivationScale, class TileShapeMNK>
+constexpr int get_activation_scale_elements_per_stage() {
+  if constexpr (cute::is_void_v<ElementActivationScale>) {
+    return 0;
+  }
+  else {
+    constexpr int scale_group_size = 32;
+    constexpr int scale_chunks_per_tile_k = size<2>(TileShapeMNK{}) / scale_group_size;
+    constexpr int tma_alignment_chunks = 128 / sizeof_bits<ElementActivationScale>::value;
+    constexpr int tma_chunks =
+        (scale_chunks_per_tile_k <= tma_alignment_chunks) ? tma_alignment_chunks : scale_chunks_per_tile_k;
+    return size<1>(TileShapeMNK{}) * tma_chunks;
+  }
+}
+
 // Returns the maximum number of smem tiles that can be used with a given smem capacity (with an optional scale matrix), or overrides with manual count.
 template<int capacity_bytes_, class ElementA, class ElementB, class ElementScale, class ElementZero, class ElementActivationScale, class TileShapeMNK, int carveout_bytes_, int alignment = 128>
 constexpr int
@@ -146,16 +176,16 @@ compute_stage_count_or_override_single_affine_transformed_input(StageCountAutoCa
   constexpr auto s_bits = get_bits_for_possibly_void_element<ElementScale>();
   constexpr auto z_bits = get_bits_for_possibly_void_element<ElementZero>();
   constexpr auto as_bits = get_bits_for_possibly_void_element<ElementActivationScale>();
-  constexpr int weight_scale_elements = size<0>(TileShapeMNK{}) * scale_zero_k_tile;
+  constexpr int weight_scale_elements =
+      get_weight_scale_elements_per_stage<ElementA, ElementScale, TileShapeMNK>();
   constexpr int activation_scale_elements =
-      cute::is_void_v<ElementActivationScale> ? 0 :
-      size<1>(TileShapeMNK{}) * get_scale_k_chunks_for_possibly_array<ElementScale>();
+      get_activation_scale_elements_per_stage<ElementActivationScale, TileShapeMNK>();
   constexpr auto weight_scale_bytes = cutlass::bits_to_bytes(s_bits * weight_scale_elements);
   constexpr auto activation_scale_bytes = cutlass::bits_to_bytes(as_bits * activation_scale_elements);
   constexpr auto scale_bytes = weight_scale_bytes + activation_scale_bytes;
   constexpr auto zero_bytes  = cutlass::bits_to_bytes(z_bits * size<0>(TileShapeMNK{}) * scale_zero_k_tile);
-  static_assert(weight_scale_bytes % 128 == 0, "Weight scale bytes must be a multiple of 128");
-  static_assert(zero_bytes  % 128 == 0, "Zero bytes must be a multiple of 128");
+  static_assert(weight_scale_bytes % 16 == 0, "Weight scale bulk copy bytes must be 16B aligned");
+  static_assert(zero_bytes  % 16 == 0, "Zero bulk copy bytes must be 16B aligned");
 
   // When scales are void, s_bits will be 0 so no smem will be allocated for scales.
   constexpr int stage_bytes_ =

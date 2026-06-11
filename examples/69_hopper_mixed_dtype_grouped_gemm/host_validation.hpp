@@ -365,7 +365,7 @@ __global__ void compare_device(
 template <
     typename ElementA,
     typename ElementB,
-    typename ElementWeightScalePacked,
+    typename ElementWeightScale,
     typename ElementActivationScaleRaw,
     typename ElementD
 >
@@ -375,7 +375,7 @@ __device__ void single_gemm_varify(
   int M, int N, int K,
   ElementA *A_ptr,
   ElementB *B_ptr,
-  ElementWeightScalePacked *weight_scale_ptr,
+  ElementWeightScale *weight_scale_ptr,
   ElementActivationScaleRaw *activation_scale_ptr,
   ElementD *D_ptr,
   float *abs_error_bound_ptr = nullptr) {
@@ -424,10 +424,9 @@ __device__ void single_gemm_varify(
                     abs(elem_A_0) * abs(elem_B_low) + abs(elem_A_1) * abs(elem_B_high);
             }
 
-            ElementWeightScalePacked *local_weight_scale_ptr =
-                weight_scale_ptr + (k_group / block_tile_k) * N + n;
-            int scale_idx = (k_group % block_tile_k) / group_size;
-            float scale = static_cast<float>((*local_weight_scale_ptr)[scale_idx]);
+            ElementWeightScale *local_weight_scale_ptr =
+                weight_scale_ptr + (k_group / group_size) * N + n;
+            float scale = static_cast<float>(*local_weight_scale_ptr);
 
             if constexpr (ScaleAppliesToActivation) {
               ElementActivationScaleRaw *local_activation_scale_ptr =
@@ -630,7 +629,7 @@ template <
     typename ProblemSizes,
     typename ElementA, // fp8
     typename ElementB, // int4
-    typename ElementWeightScalePacked,
+    typename ElementWeightScale,
     typename ElementActivationScaleRaw,
     typename ElementD,
     typename StrideA,
@@ -641,7 +640,7 @@ __global__ void groupwise_verify_kernel(
     int group_num,
     ElementA *A,
     ElementB *B,
-    ElementWeightScalePacked *weight_scale,
+    ElementWeightScale *weight_scale,
     ElementActivationScaleRaw *activation_scale,
     ElementD *D,
     float *abs_error_bound,
@@ -677,7 +676,7 @@ __global__ void groupwise_verify_kernel(
 
     ElementA *A_ptr = A;
     ElementB *B_ptr = B;
-    ElementWeightScalePacked *weight_scale_ptr = weight_scale;
+    ElementWeightScale *weight_scale_ptr = weight_scale;
     ElementActivationScaleRaw *activation_scale_ptr = activation_scale;
     ElementD *D_ptr = D;
 
@@ -699,7 +698,7 @@ __global__ void groupwise_verify_kernel(
 
         A_ptr += M * K;
         B_ptr += N * K / 2;
-        weight_scale_ptr += N * K / block_tile_k;
+        weight_scale_ptr += N * K / group_size;
         if constexpr (ScaleAppliesToActivation) {
           activation_scale_ptr += M * K / group_size;
         }
@@ -715,7 +714,7 @@ template <
     typename ProblemSizes,
     typename ElementA,
     typename ElementB,
-    typename ElementWeightScalePacked,
+    typename ElementWeightScale,
     typename ElementActivationScaleRaw,
     typename ElementD,
     typename StrideA,
@@ -726,7 +725,7 @@ void groupwise_verify(
     int group_num,
     ElementA *A,
     ElementB *B,
-    ElementWeightScalePacked *weight_scale,
+    ElementWeightScale *weight_scale,
     ElementActivationScaleRaw *activation_scale,
     ElementD *D,
     float *abs_error_bound,

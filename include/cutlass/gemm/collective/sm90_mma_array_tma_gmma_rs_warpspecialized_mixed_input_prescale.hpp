@@ -172,9 +172,7 @@ public:
   static_assert(cutlass::gemm::detail::is_mn_major<NonVoidStrideScale>(),
     "Scale tensor consumed by the GEMM kernel must be MN major.");
 
-  // Group size 128 for int4 weights
-  // Group size 32 for mxfp4 weights
-  static constexpr int ScalingGroupSize = IsMXFP4? 32 : 128;
+  static constexpr int ScalingGroupSize = detail::DefaultWeightScaleGroupSize<ElementA>::value;
 
   using CtaShape_MNK = decltype(shape_div(TileShape{}, ClusterShape{}));
   using TiledMma = TiledMma_;
@@ -185,7 +183,7 @@ public:
   using SmemLayoutAtomB = SmemLayoutAtomB_;
   using SmemCopyAtomA = SmemCopyAtomA_;
   using SmemCopyAtomB = SmemCopyAtomB_;
-  using WeightScaleRawElement = typename ElementScale::Element;
+  using WeightScaleRawElement = NonVoidElementScale;
   using SmemCopyAtomScale = Copy_Atom<cute::AutoVectorizingCopy, NonVoidElementScale>;
 
   // We must ensure the type to be scaled goes to RF
@@ -263,8 +261,11 @@ public:
   static constexpr int WeightScaleRawElementsPerStage = WeightScaleRawElementsPerFoldBlock * WeightScaleMBlocksPerTile * WeightScaleKBlocksPerTile;
   static constexpr uint32_t WeightScaleFoldBlockBytes =
       cutlass::bits_to_bytes(WeightScaleRawElementsPerFoldBlock * cutlass::sizeof_bits<WeightScaleRawElement>::value);
+  static constexpr uint32_t WeightScaleBulkCopyBytes = WeightScaleFoldBlockBytes * WeightScaleKBlocksPerTile;
   static constexpr uint32_t WeightScaleTransactionBytes =
       cutlass::bits_to_bytes(WeightScaleRawElementsPerStage * cutlass::sizeof_bits<WeightScaleRawElement>::value);
+  static_assert(WeightScaleBulkCopyBytes % 16 == 0,
+      "Folded weight-scale bulk copy size must be 16B aligned.");
 
   using SmemLayoutAtomScale = Layout<Shape<decltype(cute::shape<0>(SwappedSmemLayoutAtomA{})), cute::Int<1>>>;
   using ScaleTileShape = decltype(make_shape(shape<0>(TileShape{}), shape<1>(SmemLayoutAtomScale{})));
@@ -370,8 +371,7 @@ public:
   static constexpr bool FusedE8M0PreMmaScale = true;
   static_assert(!HasActivationScale,
       "The prescale collective expects activation scale, if any, to be handled outside the mainloop.");
-  static constexpr bool UseScaleLookupTable = KernelConversionMode == ConversionMode::ConvertAndScale &&
-                                              cutlass::detail::is_Array_v<ElementScale>;
+  static constexpr bool UseScaleLookupTable = false;
   static constexpr bool UseFP4ToBF16LookupTable = KernelConversionMode == ConversionMode::ConvertAndScale &&
                                                   cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
                                                   cute::is_same_v<ElementB, cutlass::bfloat16_t>;
@@ -381,8 +381,8 @@ public:
   static constexpr bool UseInt4ToFP8LookupTable = KernelConversionMode == ConversionMode::ConvertAndScale &&
                                                   cute::is_same_v<ElementA, cutlass::int4_t> &&
                                                   cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
-  static_assert(UseFP4ToFP8LookupTable && cutlass::detail::is_Array_v<ElementScale>,
-      "Fused e8m0 pre-MMA scale is only implemented for MXFP4 x FP8 with TileK-packed e8m0 scales.");
+  static_assert(UseFP4ToFP8LookupTable && cute::is_same_v<ElementScale, cutlass::float_ue8m0_t>,
+      "Fused e8m0 pre-MMA scale is only implemented for MXFP4 x FP8 with folded scalar e8m0 scales.");
   static constexpr size_t SmemAlignmentA = cutlass::detail::alignment_for_swizzle(SmemLayoutA{});
   static constexpr size_t SmemAlignmentB = cutlass::detail::alignment_for_swizzle(SmemLayoutB{});
   static constexpr size_t SmemAlignmentScale = cute::max(SmemAlignmentA, SmemAlignmentB);
@@ -870,7 +870,7 @@ public:
             scale_gmem_addr,
             reinterpret_cast<uint64_t*>(tma_barrier),
             scale_smem_addr,
-            WeightScaleFoldBlockBytes * WeightScaleKBlocksPerTile);
+            WeightScaleBulkCopyBytes);
       };
 
       if (cute::elect_one_sync()) {

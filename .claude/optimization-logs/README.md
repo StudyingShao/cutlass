@@ -80,7 +80,8 @@ Completed logs:
 - [2026-05-29-cmx-precomputed-work-order.md](2026-05-29-cmx-precomputed-work-order.md)
 - [2026-06-02-cmx-prebuilt-tma-descriptors.md](2026-06-02-cmx-prebuilt-tma-descriptors.md)
 - [2026-06-05-cmx-mainloop-transfer-w4a16-w4a8.md](2026-06-05-cmx-mainloop-transfer-w4a16-w4a8.md)
+- [2026-06-11-cmx-ktile-independent-scale-final-status.md](2026-06-11-cmx-ktile-independent-scale-final-status.md)
 
 ---
 
-**Last Updated**: 2026-06-09
+**Last Updated**: 2026-06-11
