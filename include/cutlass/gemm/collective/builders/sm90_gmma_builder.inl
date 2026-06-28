@@ -53,21 +53,21 @@ namespace cutlass::gemm::collective {
 namespace detail {
 
 // Returns the maximum number of smem tiles that can be used with a given smem capacity, or overrides with manual count.
-template<int capacity_bytes, class ElementA, class ElementB, class TileShapeMNK, int stages, int alignment = 128>
+template<int capacity_bytes, class ElementA, class ElementB, class TileShapeMNK, int alignment = 128, int stages>
 constexpr int
 compute_stage_count_or_override(StageCount<stages> stage_count) {
   return stages;
 }
 
 // Returns the maximum number of smem tiles that can be used with a given smem capacity, or overrides with manual count.
-template<int capacity_bytes, class ElementA, class ElementB, class TileShapeMNK, int stages, int alignment = 128>
+template<int capacity_bytes, class ElementA, class ElementB, class TileShapeMNK, int alignment = 128, int stages>
 constexpr int
 compute_stage_count_or_override(cute::Int<stages> stage_count) {
   return stages;
 }
 
 // Returns the maximum number of smem tiles that can be used with a given smem capacity, or overrides with manual count.
-template<int capacity_bytes_, class ElementA, class ElementB, class TileShapeMNK, int carveout_bytes_, int alignment = 128>
+template<int capacity_bytes_, class ElementA, class ElementB, class TileShapeMNK, int alignment = 128, int carveout_bytes_>
 constexpr int
 compute_stage_count_or_override(StageCountAutoCarveout<carveout_bytes_> stage_count) {
   constexpr auto mainloop_pipeline_bytes = sizeof(typename cutlass::PipelineTmaAsync<1>::SharedStorage);
@@ -108,9 +108,15 @@ compute_stage_count_with_blockwise_scale(StageCountAutoCarveout<carveout_bytes_>
 }
 
 // Returns the maximum number of smem tiles that can be used with a given smem capacity (with an optional scale matrix), or overrides with manual count.
-template<int capacity_bytes, class ElementA, class ElementB, class ElementScale, class ElementZero, class ElementActivationScale, class TileShapeMNK, int stages, int alignment = 128>
+template<int capacity_bytes, class ElementA, class ElementB, class ElementScale, class ElementZero, class ElementActivationScale, class TileShapeMNK, int alignment = 128, int stages>
 constexpr int
 compute_stage_count_or_override_single_affine_transformed_input(StageCount<stages> stage_count) {
+  return stages;
+}
+
+template<int capacity_bytes, class ElementA, class ElementB, class ElementScale, class ElementZero, class ElementActivationScale, class TileShapeMNK, int alignment = 128, int stages>
+constexpr int
+compute_stage_count_or_override_single_affine_transformed_input(cute::Int<stages> stage_count) {
   return stages;
 }
 
@@ -164,7 +170,7 @@ constexpr int get_activation_scale_elements_per_stage() {
 }
 
 // Returns the maximum number of smem tiles that can be used with a given smem capacity (with an optional scale matrix), or overrides with manual count.
-template<int capacity_bytes_, class ElementA, class ElementB, class ElementScale, class ElementZero, class ElementActivationScale, class TileShapeMNK, int carveout_bytes_, int alignment = 128>
+template<int capacity_bytes_, class ElementA, class ElementB, class ElementScale, class ElementZero, class ElementActivationScale, class TileShapeMNK, int alignment = 128, int carveout_bytes_>
 constexpr int
 compute_stage_count_or_override_single_affine_transformed_input(StageCountAutoCarveout<carveout_bytes_> stage_count) {
 
@@ -506,12 +512,12 @@ public:
   static constexpr int PipelineStages = IsMixedInput ?
       ( IsArrayOfPointersGemm ? 
         detail::compute_stage_count_or_override_single_affine_transformed_input<Sm90ReducedSmemCapacityBytes,
-          RealElementA, RealElementB, ElementScale, ElementZero, ElementActivationScale, TileShape_MNK, StageCountType::bytes, SmemAlignment>(StageCountType{}) :
+          RealElementA, RealElementB, ElementScale, ElementZero, ElementActivationScale, TileShape_MNK, SmemAlignment>(StageCountType{}) :
         detail::compute_stage_count_or_override_single_affine_transformed_input<detail::sm90_smem_capacity_bytes,
-          RealElementA, RealElementB, ElementScale, ElementZero, ElementActivationScale, TileShape_MNK, StageCountType::bytes, SmemAlignment>(StageCountType{})
+          RealElementA, RealElementB, ElementScale, ElementZero, ElementActivationScale, TileShape_MNK, SmemAlignment>(StageCountType{})
       ) 
       : detail::compute_stage_count_or_override<detail::sm90_smem_capacity_bytes,
-          ElementAMma, ElementBMma, TileShape_MNK, StageCountType::bytes, SmemAlignment>(StageCountType{});
+          ElementAMma, ElementBMma, TileShape_MNK, SmemAlignment>(StageCountType{});
 
 #if defined(CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE)
   using ArrayMixedInputDispatchPolicy =

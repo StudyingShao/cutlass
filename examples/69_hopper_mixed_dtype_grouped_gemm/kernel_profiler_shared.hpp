@@ -23,6 +23,9 @@
 #include "cute/tensor.hpp"
 #include "cutlass/tensor_ref.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+#include "cutlass/epilogue/collective/default_epilogue_array_per_token_scale.hpp"
+#endif
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
@@ -31,6 +34,9 @@
 #include "cutlass/epilogue/fusion/sm90_ptr_array_scale_callbacks_tma_warpspecialized.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM)
+#include "cutlass/gemm/kernel/sm90_gemm_array_tma_single_warpgroup_persistent.hpp"
+#endif
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
@@ -221,6 +227,9 @@ void build_precomputed_work_tile_map(
 namespace precomputed_scheduler {
 
 uint64_t const* work_tiles_data();
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+uint32_t work_tiles_per_worker();
+#endif
 cute::TmaDescriptor const* prebuilt_tma_desc_A_data();
 cute::TmaDescriptor const* prebuilt_tma_desc_B_data();
 cute::TmaDescriptor const* prebuilt_tma_desc_activation_scale_data();
@@ -313,7 +322,7 @@ using DefaultFusionOperation = cutlass::epilogue::fusion::LinearCombination<
     ElementAccumulator>;
 #endif
 
-using DefaultCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+using DefaultTmaCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
     DefaultTileShape, DefaultClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
@@ -324,22 +333,54 @@ using DefaultCollectiveEpilogue = typename cutlass::epilogue::collective::Collec
     DefaultFusionOperation
 >::CollectiveOp;
 
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+using DefaultEpilogueLayoutC = typename cutlass::layout::LayoutTranspose<LayoutC>::type;
+using DefaultEpilogueLayoutD = typename cutlass::layout::LayoutTranspose<LayoutD>::type;
+using DefaultSmallKEpilogue = cutlass::epilogue::collective::SmemEpilogueArrayPerTokenScale<
+    DefaultTileShape,
+    ElementC,
+    cutlass::detail::TagToStrideC_t<DefaultEpilogueLayoutC *>,
+    ElementD,
+    cutlass::detail::TagToStrideC_t<DefaultEpilogueLayoutD *>,
+    ElementAccumulator,
+    ElementEpilogueTokenScale>;
+using DefaultCollectiveEpilogue =
+    cutlass::epilogue::collective::detail::Sm90TmaWarpSpecializedAdapter<DefaultSmallKEpilogue>;
+#else
+using DefaultCollectiveEpilogue = DefaultTmaCollectiveEpilogue;
+#endif
+
+#if defined(CUTLASS_MIXED_GEMM_MANUAL_STAGE_COUNT)
+using DefaultMainloopStageCount = cutlass::gemm::collective::StageCount<
+    CUTLASS_MIXED_GEMM_MANUAL_STAGE_COUNT>;
+#else
+using DefaultMainloopStageCount = cutlass::gemm::collective::StageCountAutoCarveout<
+    static_cast<int>(sizeof(typename DefaultCollectiveEpilogue::SharedStorage))>;
+#endif
+
 using DefaultCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
     MainloopElementB, LayoutB_Transpose *, AlignmentB,
     MainloopElementA, LayoutA_Transpose *, AlignmentA,
     ElementAccumulator,
     DefaultTileShape, DefaultClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename DefaultCollectiveEpilogue::SharedStorage))>,
+    DefaultMainloopStageCount,
     DefaultKernelSchedule
 >::CollectiveOp;
 
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM)
+using DefaultGemmKernel = cutlass::gemm::kernel::SingleWarpgroupPersistentGemm<
+    ProblemShape,
+    DefaultCollectiveMainloop,
+    DefaultCollectiveEpilogue,
+    CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM,
+    CUTLASS_MIXED_GEMM_SINGLE_WG_PREFETCH_NEXT_TILE>;
+#else
 using DefaultGemmKernel = cutlass::gemm::kernel::GemmUniversal<
     ProblemShape,
     DefaultCollectiveMainloop,
-    DefaultCollectiveEpilogue
->;
+    DefaultCollectiveEpilogue>;
+#endif
 
 using DefaultGemm    = cutlass::gemm::device::GemmUniversalAdapter<DefaultGemmKernel>;
 using GemmScaleOnly  = DefaultGemm;  // alias for backward compatibility with main .cu
@@ -490,6 +531,9 @@ typename Gemm::Arguments args_from_options(Options const& options)
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = 0;
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM)
+  hw_info.sm_count *= CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM;
+#endif
 
   Args arguments;
   decltype(arguments.epilogue.thread) fusion_args;
@@ -534,11 +578,63 @@ typename Gemm::Arguments args_from_options(Options const& options)
         precomputed_scheduler::prebuilt_tma_desc_activation_scale_data();
   }
 
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+  ElementAccumulator compact_epilogue_beta = ElementAccumulator(0);
+  if (options.beta != FLT_MAX) {
+    compact_epilogue_beta = options.beta;
+  }
+  else {
+    for (ElementAccumulator beta : beta_host) {
+      if (beta != ElementAccumulator(0)) {
+        compact_epilogue_beta = beta;
+        break;
+      }
+    }
+  }
+
+  int64_t compact_output_channel_extent = 0;
+  if (!options.problem_sizes_host.empty()) {
+    compact_output_channel_extent =
+        int64_t(cute::get<1>(options.problem_sizes_host.front()));
+    for (auto const& problem : options.problem_sizes_host) {
+      if (int64_t(cute::get<1>(problem)) != compact_output_channel_extent) {
+        compact_output_channel_extent = 0;
+        break;
+      }
+    }
+  }
+
+  int64_t compact_output_row_stride = 0;
+  if (!stride_D_host.empty()) {
+    compact_output_row_stride = int64_t(cute::get<1>(stride_D_host.front()));
+    for (auto const& stride : stride_D_host) {
+      if (int64_t(cute::get<1>(stride)) != compact_output_row_stride) {
+        compact_output_row_stride = 0;
+        break;
+      }
+    }
+  }
+#endif
+
   arguments = Args {
     cutlass::gemm::GemmUniversalMode::kGrouped,
     {options.groups, problem_sizes.get(), nullptr},
     mainloop_args,
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+    {
+      fusion_args,
+      nullptr,
+      stride_C.get(),
+      ptr_D.get(),
+      stride_D.get(),
+      block_D.get(),
+      compact_output_channel_extent,
+      compact_output_row_stride,
+      compact_epilogue_beta
+    },
+#else
     {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
+#endif
     hw_info
   };
 
@@ -547,6 +643,10 @@ typename Gemm::Arguments args_from_options(Options const& options)
 #if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
   arguments.scheduler.precomputed_work_tiles =
       precomputed_scheduler::work_tiles_data();
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+  arguments.scheduler.precomputed_work_tiles_per_worker =
+      precomputed_scheduler::work_tiles_per_worker();
+#endif
 #endif
 
   return arguments;

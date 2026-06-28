@@ -72,6 +72,8 @@ Active logs (optimization in progress):
 - [2026-06-05-cmx-fused-e8m0-correctness-revalidation.md](2026-06-05-cmx-fused-e8m0-correctness-revalidation.md)
 - [2026-06-09-cmx-folded-m64-priority/scale_ktile_decoupling.md](2026-06-09-cmx-folded-m64-priority/scale_ktile_decoupling.md)
 - [2026-06-09-cmx-folded-m64-priority/m64_priority_comparison.md](2026-06-09-cmx-folded-m64-priority/m64_priority_comparison.md)
+- [2026-06-16-flashinfer-cmx-w4-performance-alignment.md](2026-06-16-flashinfer-cmx-w4-performance-alignment.md)
+- [2026-06-17-flashinfer-humming-style-phase3.md](2026-06-17-flashinfer-humming-style-phase3.md)
 
 Completed logs:
 - [2026-03-19-scheduler-work-switching.md](2026-03-19-scheduler-work-switching.md)
@@ -81,7 +83,8 @@ Completed logs:
 - [2026-06-02-cmx-prebuilt-tma-descriptors.md](2026-06-02-cmx-prebuilt-tma-descriptors.md)
 - [2026-06-05-cmx-mainloop-transfer-w4a16-w4a8.md](2026-06-05-cmx-mainloop-transfer-w4a16-w4a8.md)
 - [2026-06-11-cmx-ktile-independent-scale-final-status.md](2026-06-11-cmx-ktile-independent-scale-final-status.md)
+- [2026-06-15-cmx-split-timing-profiler-pitfall.md](2026-06-15-cmx-split-timing-profiler-pitfall.md)
 
 ---
 
-**Last Updated**: 2026-06-11
+**Last Updated**: 2026-06-17

@@ -111,6 +111,9 @@ public:
     RasterOrderOptions raster_order = RasterOrderOptions::AlongM;
 #if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
     uint64_t const* precomputed_work_tiles = nullptr;
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+    uint32_t precomputed_work_tiles_per_worker = 0;
+#endif
 #endif
   };
 
@@ -153,6 +156,10 @@ public:
       RasterOrderOptions::AlongM
     );
     params.precomputed_work_tiles_ = arguments.precomputed_work_tiles;
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+    params.precomputed_work_tiles_per_worker_ =
+        arguments.precomputed_work_tiles_per_worker;
+#endif
 #else
     params.initialize(
       problem_blocks,
@@ -245,10 +252,16 @@ public:
     // like blockIdx and gridDim, with __CUDA_ARCH__.
 #if defined(__CUDA_ARCH__)
 #if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
-    current_work_linear_idx_ =
+    WorkLinearIdx const worker_idx =
         uint32_t(blockIdx.x) * uint32_t(gridDim.y) +
         uint32_t(blockIdx.y) +
         uint32_t(blockIdx.z) * uint32_t(gridDim.x) * uint32_t(gridDim.y);
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+    current_work_linear_idx_ =
+        worker_idx * scheduler_params.precomputed_work_tiles_per_worker_;
+#else
+    current_work_linear_idx_ = worker_idx;
+#endif
 #else
     if (scheduler_params.raster_order_ == RasterOrder::AlongN) {
       current_work_linear_idx_ = uint64_t(blockIdx.x) + uint64_t(blockIdx.y) * uint64_t(gridDim.x);
@@ -259,6 +272,9 @@ public:
 #endif
 
     total_grid_size_ = WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+    total_grid_size_ = 1;
+#endif
 
 #if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
     CUTLASS_ASSERT(scheduler_params.precomputed_work_tiles_ != nullptr);

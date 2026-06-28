@@ -1708,6 +1708,9 @@ struct PersistentTileSchedulerSm90GroupParams {
   bool pre_processed_problem_shapes = true;
 #if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
   uint64_t const* precomputed_work_tiles_ = nullptr;
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+  uint32_t precomputed_work_tiles_per_worker_ = 0;
+#endif
 #endif
   int32_t log_swizzle_size_ = 0;
   RasterOrder raster_order_ = RasterOrder::AlongN;

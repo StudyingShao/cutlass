@@ -17,6 +17,7 @@ struct State {
   cutlass::DeviceAllocation<cute::TmaDescriptor> prebuilt_tma_desc_activation_scale;
   uint64_t max_work_tile_count = 0;
   uint64_t work_tile_capacity = 0;
+  uint32_t work_tiles_per_worker = 0;
   uint64_t prebuilt_tma_desc_A_capacity = 0;
   uint64_t prebuilt_tma_desc_B_capacity = 0;
   uint64_t prebuilt_tma_desc_activation_scale_capacity = 0;
@@ -27,6 +28,10 @@ inline State scheduler_state;
 
 inline uint64_t const* work_tiles_data() {
   return scheduler_state.work_tiles.get();
+}
+
+inline uint32_t work_tiles_per_worker() {
+  return scheduler_state.work_tiles_per_worker;
 }
 
 inline cute::TmaDescriptor const* prebuilt_tma_desc_A_data() {
@@ -124,6 +129,9 @@ inline dim3 gemm_grid_shape(Options const& options) {
   hw_info.device_id = 0;
   hw_info.sm_count =
       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM)
+  hw_info.sm_count *= CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM;
+#endif
 
   cutlass::gemm::GemmCoord cluster_shape(
       ClusterShapeM,
@@ -210,8 +218,18 @@ inline void prepare_work_tiles(Options const& options) {
       uint64_t(state.gemm_grid_shape.x) *
       uint64_t(state.gemm_grid_shape.y) *
       uint64_t(state.gemm_grid_shape.z);
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+  state.work_tiles_per_worker = static_cast<uint32_t>(
+      (state.max_work_tile_count + scheduler_sentinel_count - 1) /
+          scheduler_sentinel_count +
+      1);
+  uint64_t const required_work_tile_capacity =
+      scheduler_sentinel_count * uint64_t(state.work_tiles_per_worker);
+#else
+  state.work_tiles_per_worker = 0;
   uint64_t const required_work_tile_capacity =
       state.max_work_tile_count + scheduler_sentinel_count;
+#endif
   if (required_work_tile_capacity > uint64_t(0xffffffffu)) {
     throw std::runtime_error("Precomputed scheduler work-map exceeds uint32_t index range");
   }
@@ -507,6 +525,7 @@ void build_work_tile_map_kernel(
     int swizzle_log,
     int gemm_grid_x,
     int gemm_grid_y,
+    uint32_t work_tiles_per_worker,
     uint64_t* work_tiles,
     MainloopParams mainloop_params,
     cute::TmaDescriptor* prebuilt_tma_desc_A,
@@ -518,7 +537,11 @@ void build_work_tile_map_kernel(
   if (groups <= 0) {
     if (blockIdx.x == 0) {
       for (uint64_t i = uint64_t(tid); i < total_grid_size; i += uint64_t(blockDim.x)) {
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+        work_tiles[i * uint64_t(work_tiles_per_worker)] = WorkTileCodec::Invalid;
+#else
         work_tiles[i] = WorkTileCodec::Invalid;
+#endif
       }
     }
     return;
@@ -534,7 +557,12 @@ void build_work_tile_map_kernel(
       reinterpret_cast<cute::TmaDescriptor*>(shared_storage);
   unsigned long long* prefix_partials =
       reinterpret_cast<unsigned long long*>(shared_storage + PrebuiltTmaDescriptorScratchBytes);
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+  unsigned long long* total_partials = prefix_partials + blockDim.x;
+  unsigned long long* group_info_storage = total_partials + blockDim.x;
+#else
   unsigned long long* group_info_storage = prefix_partials + blockDim.x;
+#endif
 
   if (tid == 0) {
     GroupInfo const info = get_group_info_static<
@@ -558,6 +586,23 @@ void build_work_tile_map_kernel(
       prebuilt_tma_desc_activation_scale);
 
   uint64_t prefix_sum = 0;
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+  uint64_t total_sum = 0;
+  for (int scan_group = tid; scan_group < groups; scan_group += blockDim.x) {
+    GroupInfo const info = get_group_info_static<
+        StaticTileShapeM,
+        StaticTileShapeN,
+        StaticClusterShapeM,
+        StaticClusterShapeN>(
+        problem_shapes[scan_group],
+        swizzle_log);
+    total_sum += info.group_tiles;
+    if (scan_group < group) {
+      prefix_sum += info.group_tiles;
+    }
+  }
+  total_partials[tid] = static_cast<unsigned long long>(total_sum);
+#else
   for (int prefix_group = tid; prefix_group < group; prefix_group += blockDim.x) {
     GroupInfo const info = get_group_info_static<
         StaticTileShapeM,
@@ -568,6 +613,7 @@ void build_work_tile_map_kernel(
         swizzle_log);
     prefix_sum += info.group_tiles;
   }
+#endif
 
   prefix_partials[tid] = static_cast<unsigned long long>(prefix_sum);
   __syncthreads();
@@ -575,6 +621,9 @@ void build_work_tile_map_kernel(
   for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
     if (tid < offset) {
       prefix_partials[tid] += prefix_partials[tid + offset];
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+      total_partials[tid] += total_partials[tid + offset];
+#endif
     }
     __syncthreads();
   }
@@ -582,12 +631,26 @@ void build_work_tile_map_kernel(
   uint64_t const group_start = static_cast<uint64_t>(prefix_partials[0]);
   uint64_t const problem_blocks_m = static_cast<uint64_t>(group_info_storage[0]);
   uint64_t const group_tiles = static_cast<uint64_t>(group_info_storage[1]);
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+  uint64_t const total_tiles = static_cast<uint64_t>(total_partials[0]);
+  uint64_t const tiles_per_worker = total_tiles == 0
+      ? 1
+      : (total_tiles + total_grid_size - 1) / total_grid_size;
+#endif
 
   for (uint64_t local_tile = uint64_t(tid);
        local_tile < group_tiles;
        local_tile += uint64_t(blockDim.x)) {
     uint64_t const global_tile = group_start + local_tile;
-    work_tiles[global_tile] = make_work_tile_static<
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+    uint64_t const worker_idx = global_tile / tiles_per_worker;
+    uint64_t const worker_tile_idx = global_tile % tiles_per_worker;
+    uint64_t const storage_idx =
+        worker_idx * uint64_t(work_tiles_per_worker) + worker_tile_idx;
+#else
+    uint64_t const storage_idx = global_tile;
+#endif
+    work_tiles[storage_idx] = make_work_tile_static<
         StaticClusterShapeM,
         StaticClusterShapeN>(
         global_tile,
@@ -600,10 +663,20 @@ void build_work_tile_map_kernel(
   }
 
   if (group == groups - 1) {
-    uint64_t const sentinel_start = group_start + group_tiles;
+    [[maybe_unused]] uint64_t const sentinel_start = group_start + group_tiles;
     for (uint64_t i = uint64_t(tid); i < total_grid_size; i += uint64_t(blockDim.x)) {
-      work_tiles[sentinel_start + i] =
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+      uint64_t const worker_start = i * tiles_per_worker;
+      uint64_t const worker_tile_count = worker_start < total_tiles
+          ? ((total_tiles - worker_start < tiles_per_worker)
+                 ? total_tiles - worker_start
+                 : tiles_per_worker)
+          : 0;
+      work_tiles[i * uint64_t(work_tiles_per_worker) + worker_tile_count] =
           WorkTileCodec::Invalid;
+#else
+      work_tiles[sentinel_start + i] = WorkTileCodec::Invalid;
+#endif
     }
   }
 }
@@ -624,7 +697,13 @@ inline void build_work_tile_map(
   dim3 const scheduler_grid(options.groups > 0 ? options.groups : 1);
   size_t const scheduler_smem =
       PrebuiltTmaDescriptorScratchBytes +
-      size_t(scheduler_threads + 2) * sizeof(unsigned long long);
+      size_t(
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
+          scheduler_threads * 2 + 2
+#else
+          scheduler_threads + 2
+#endif
+          ) * sizeof(unsigned long long);
   build_work_tile_map_kernel<
       TileShapeM,
       TileShapeN,
@@ -636,6 +715,7 @@ inline void build_work_tile_map(
       log_swizzle_size(options, state.max_work_tile_count, 1),
       state.gemm_grid_shape.x,
       state.gemm_grid_shape.y,
+      state.work_tiles_per_worker,
       state.work_tiles.get(),
       mainloop_params,
       state.prebuilt_tma_desc_A.get(),
