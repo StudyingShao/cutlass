@@ -322,17 +322,6 @@ using DefaultFusionOperation = cutlass::epilogue::fusion::LinearCombination<
     ElementAccumulator>;
 #endif
 
-using DefaultTmaCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    DefaultTileShape, DefaultClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type *, AlignmentC,
-    ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type *, AlignmentD,
-    DefaultEpilogueSchedule,
-    DefaultFusionOperation
->::CollectiveOp;
-
 #if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
 using DefaultEpilogueLayoutC = typename cutlass::layout::LayoutTranspose<LayoutC>::type;
 using DefaultEpilogueLayoutD = typename cutlass::layout::LayoutTranspose<LayoutD>::type;
@@ -347,7 +336,16 @@ using DefaultSmallKEpilogue = cutlass::epilogue::collective::SmemEpilogueArrayPe
 using DefaultCollectiveEpilogue =
     cutlass::epilogue::collective::detail::Sm90TmaWarpSpecializedAdapter<DefaultSmallKEpilogue>;
 #else
-using DefaultCollectiveEpilogue = DefaultTmaCollectiveEpilogue;
+using DefaultCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    DefaultTileShape, DefaultClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type *, AlignmentC,
+    ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type *, AlignmentD,
+    DefaultEpilogueSchedule,
+    DefaultFusionOperation
+>::CollectiveOp;
 #endif
 
 #if defined(CUTLASS_MIXED_GEMM_MANUAL_STAGE_COUNT)

@@ -59,14 +59,16 @@ class SmemEpilogueArrayPerTokenScale {
   static constexpr int RequiredChannelMultiple = 128;
   static constexpr int ElementsPerVector = 128 / cute::sizeof_bits_v<ElementD>;
   static constexpr int VectorCount = TileElements / ElementsPerVector;
+  static constexpr int VectorsPerThread = VectorCount / NumThreadsPerWarpGroup;
   static constexpr int kOutputAlignment = ElementsPerVector;
 
   static_assert(OutputAlignmentBits % cute::sizeof_bits_v<ElementD> == 0);
   static_assert(TileElements % ElementsPerVector == 0);
+  static_assert(TileN % 8 == 0);
   static_assert(TileM % ElementsPerVector == 0,
                 "Each vector store must remain inside one output row.");
-  static_assert(VectorCount == NumThreadsPerWarpGroup,
-                "The compact SMEM epilogue expects one output vector per thread.");
+  static_assert(VectorCount % NumThreadsPerWarpGroup == 0,
+                "The compact SMEM epilogue expects an integer number of output vectors per thread.");
   static_assert(cute::is_same_v<decltype(cute::get<0>(InternalStrideD{})), cute::Int<1>>,
                 "The compact SMEM epilogue requires a unit-stride channel dimension.");
   static_assert(cute::rank(InternalStrideC{}) == 3, "StrideC must be rank-3.");
@@ -74,6 +76,7 @@ class SmemEpilogueArrayPerTokenScale {
 
   struct SharedStorage {
     alignas(16) ElementD output[TileElements];
+    alignas(16) ElementCompute token_scale[TileN > 8 ? TileN : 1];
   };
   using TensorMapStorage = SharedStorage;
 
@@ -234,23 +237,85 @@ class SmemEpilogueArrayPerTokenScale {
         make_coord(m_coord, n_coord));
     Tensor thread_coordinates = thread_mma.partition_C(tile_coordinates);
 
-    ElementScalar const* token_scales = params_.thread.token_scale_ptr_array
-        ? params_.thread.token_scale_ptr_array[group_coord]
-        : nullptr;
-    NumericConverter<ElementD, ElementCompute> convert;
     SharedStorage& shared = *reinterpret_cast<SharedStorage*>(shared_storage_ptr);
 
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(accumulators); ++i) {
-      auto coordinate = thread_coordinates(i);
-      if (get<1>(coordinate) < N) {
-        int const local_m = int(get<0>(coordinate)) - tile_m_origin;
-        int const local_n = int(get<1>(coordinate)) - tile_n_origin;
-        ElementCompute const token_scale = token_scales
-            ? static_cast<ElementCompute>(token_scales[int(get<1>(coordinate))])
+    if constexpr (TileN > 8) {
+      if (thread_idx < TileN) {
+        ElementScalar const* token_scales = params_.thread.token_scale_ptr_array
+            ? params_.thread.token_scale_ptr_array[group_coord]
+            : nullptr;
+        int const global_n = tile_n_origin + thread_idx;
+        shared.token_scale[thread_idx] = global_n < N && token_scales
+            ? static_cast<ElementCompute>(token_scales[global_n])
             : static_cast<ElementCompute>(params_.thread.token_scale_default);
-        shared.output[local_n * TileM + local_m] =
-            convert(static_cast<ElementCompute>(accumulators(i)) * token_scale);
+      }
+      __syncthreads();
+    }
+
+    if constexpr (TileN == 8) {
+      ElementScalar const* token_scales = params_.thread.token_scale_ptr_array
+          ? params_.thread.token_scale_ptr_array[group_coord]
+          : nullptr;
+      NumericConverter<ElementD, ElementCompute> convert;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(accumulators); ++i) {
+        auto coordinate = thread_coordinates(i);
+        if (get<1>(coordinate) < N) {
+          int const local_m = int(get<0>(coordinate)) - tile_m_origin;
+          int const local_n = int(get<1>(coordinate)) - tile_n_origin;
+          ElementCompute const token_scale = token_scales
+              ? static_cast<ElementCompute>(token_scales[int(get<1>(coordinate))])
+              : static_cast<ElementCompute>(params_.thread.token_scale_default);
+          shared.output[local_n * TileM + local_m] =
+              convert(static_cast<ElementCompute>(accumulators(i)) * token_scale);
+        }
+      }
+    }
+    else {
+      static_assert(decltype(size(accumulators))::value % 4 == 0);
+      NumericArrayConverter<ElementD, ElementCompute, 2> convert;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(accumulators); i += 4) {
+        auto coordinate_0 = thread_coordinates(i);
+        auto coordinate_1 = thread_coordinates(i + 1);
+        int const local_m_0 = int(get<0>(coordinate_0)) - tile_m_origin;
+        int const local_n_0 = int(get<1>(coordinate_0)) - tile_n_origin;
+        int const local_m_1 = int(get<0>(coordinate_1)) - tile_m_origin;
+        int const local_n_1 = int(get<1>(coordinate_1)) - tile_n_origin;
+        ElementCompute const token_scale_0 = shared.token_scale[local_n_0];
+        ElementCompute const token_scale_1 = shared.token_scale[local_n_1];
+        cutlass::Array<ElementCompute, 2> scaled_accumulators_01{
+            static_cast<ElementCompute>(accumulators(i)) * token_scale_0,
+            static_cast<ElementCompute>(accumulators(i + 1)) * token_scale_1};
+        auto converted_01 = convert(scaled_accumulators_01);
+
+        if (get<1>(coordinate_0) < N) {
+          shared.output[local_n_0 * TileM + local_m_0] = converted_01[0];
+        }
+        if (get<1>(coordinate_1) < N) {
+          shared.output[local_n_1 * TileM + local_m_1] = converted_01[1];
+        }
+
+        auto coordinate_2 = thread_coordinates(i + 2);
+        auto coordinate_3 = thread_coordinates(i + 3);
+        int const local_m_2 = int(get<0>(coordinate_2)) - tile_m_origin;
+        int const local_m_3 = int(get<0>(coordinate_3)) - tile_m_origin;
+#if !defined(NDEBUG)
+        // The SM90 GMMA C fragment repeats each token pair across two adjacent
+        // channel octets. Reuse those two scales for all four accumulators.
+        CUTLASS_ASSERT(int(get<1>(coordinate_2)) - tile_n_origin == local_n_0);
+        CUTLASS_ASSERT(int(get<1>(coordinate_3)) - tile_n_origin == local_n_1);
+#endif
+        cutlass::Array<ElementCompute, 2> scaled_accumulators_23{
+            static_cast<ElementCompute>(accumulators(i + 2)) * token_scale_0,
+            static_cast<ElementCompute>(accumulators(i + 3)) * token_scale_1};
+        auto converted_23 = convert(scaled_accumulators_23);
+        if (get<1>(coordinate_2) < N) {
+          shared.output[local_n_0 * TileM + local_m_2] = converted_23[0];
+        }
+        if (get<1>(coordinate_3) < N) {
+          shared.output[local_n_1 * TileM + local_m_3] = converted_23[1];
+        }
       }
     }
 
@@ -271,19 +336,27 @@ class SmemEpilogueArrayPerTokenScale {
     CUTLASS_ASSERT((stride_n % ElementsPerVector) == 0);
 #endif
 
-    int const vector_idx = thread_idx;
-    int const element_idx = vector_idx * ElementsPerVector;
-    int const local_n = element_idx / TileM;
-    int const local_m = element_idx % TileM;
-    int const global_n = tile_n_origin + local_n;
+    CUTLASS_PRAGMA_UNROLL
+    for (int vector_group = 0; vector_group < VectorsPerThread; ++vector_group) {
+      int const vector_idx =
+          thread_idx + vector_group * NumThreadsPerWarpGroup;
+      int const element_idx = vector_idx * ElementsPerVector;
+      int const local_n = element_idx / TileM;
+      int const local_m = element_idx % TileM;
+      int const global_n = tile_n_origin + local_n;
 
-    if (global_n < N) {
-      auto* output_vector = reinterpret_cast<OutputVector*>(
-          output + int64_t(tile_m_origin + local_m) + int64_t(global_n) * stride_n);
-      *output_vector = shared_vectors[vector_idx];
+      if (global_n < N) {
+        auto* output_vector = reinterpret_cast<OutputVector*>(
+            output + int64_t(tile_m_origin + local_m) + int64_t(global_n) * stride_n);
+        *output_vector = shared_vectors[vector_idx];
+      }
     }
 
-    __syncthreads();
+    // Larger token tiles synchronize before the next tile scatters output, so
+    // that token-scale barrier also protects this output scratch from reuse.
+    if constexpr (TileN == 8) {
+      __syncthreads();
+    }
   }
 
  private:
