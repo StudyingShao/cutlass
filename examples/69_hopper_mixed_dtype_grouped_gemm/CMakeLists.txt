@@ -250,6 +250,35 @@ cutlass_mixed_gemm_add_69_small_k_target(16 5)
 cutlass_mixed_gemm_add_69_small_k_target(32 4)
 cutlass_mixed_gemm_add_69_small_k_target(40 3)
 
+function(cutlass_mixed_gemm_add_69_small_k_rolling_target token_tile ctas_per_sm)
+  cutlass_mixed_gemm_add_69_run_target(
+    69_hopper_mxfp4_fp8_grouped_gemm_fused_e8m0_token_scale_small_k_rolling_m128n${token_tile}_c${ctas_per_sm}_chunk_major_carry_group
+    CUTLASS_MIXED_GEMM_MXFP4_FP8=1
+    CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1
+    CUTLASS_MIXED_GEMM_FUSED_E8M0_PRE_MMA_SCALE=1
+    CUTLASS_MIXED_GEMM_EPILOGUE_TOKEN_SCALE=1
+    CUTLASS_MIXED_GEMM_TILE_SHAPE_M=128
+    CUTLASS_MIXED_GEMM_TILE_SHAPE_N=${token_tile}
+    CUTLASS_MIXED_GEMM_TILE_SHAPE_K=128
+    CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_M=1
+    CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_N=1
+    CUTLASS_MIXED_GEMM_DEFAULT_CLUSTER_K=1
+    CUTLASS_MIXED_GEMM_DEFAULT_SCHEDULE_PINGPONG=1
+    CUTLASS_MIXED_GEMM_MANUAL_STAGE_COUNT=3
+    CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM=${ctas_per_sm}
+    CUTLASS_MIXED_GEMM_SINGLE_WG_PREFETCH_NEXT_TILE=3
+    CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE=1
+    CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP=1
+    CUTLASS_MIXED_GEMM_SINGLE_WG_ROLLING_REFILL=1
+    CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED=1
+  )
+endfunction()
+
+cutlass_mixed_gemm_add_69_small_k_rolling_target(8 5)
+cutlass_mixed_gemm_add_69_small_k_rolling_target(16 5)
+cutlass_mixed_gemm_add_69_small_k_rolling_target(32 4)
+cutlass_mixed_gemm_add_69_small_k_rolling_target(40 3)
+
 cutlass_mixed_gemm_add_69_run_target(
   69_hopper_mxfp4_fp8_grouped_gemm_fused_e8m0_token_scale_pp_1x1x1_m64n32k256
   CUTLASS_MIXED_GEMM_MXFP4_FP8=1

@@ -367,12 +367,22 @@ using DefaultCollectiveMainloop = typename cutlass::gemm::collective::Collective
 >::CollectiveOp;
 
 #if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM)
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_ROLLING_REFILL)
+using DefaultGemmKernel = cutlass::gemm::kernel::SingleWarpgroupPersistentGemm<
+    ProblemShape,
+    DefaultCollectiveMainloop,
+    DefaultCollectiveEpilogue,
+    CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM,
+    CUTLASS_MIXED_GEMM_SINGLE_WG_PREFETCH_NEXT_TILE,
+    cutlass::gemm::kernel::SingleWarpgroupPipelineMode::RollingRefill>;
+#else
 using DefaultGemmKernel = cutlass::gemm::kernel::SingleWarpgroupPersistentGemm<
     ProblemShape,
     DefaultCollectiveMainloop,
     DefaultCollectiveEpilogue,
     CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM,
     CUTLASS_MIXED_GEMM_SINGLE_WG_PREFETCH_NEXT_TILE>;
+#endif
 #else
 using DefaultGemmKernel = cutlass::gemm::kernel::GemmUniversal<
     ProblemShape,

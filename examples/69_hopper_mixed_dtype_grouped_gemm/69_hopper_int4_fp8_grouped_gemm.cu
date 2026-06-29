@@ -650,6 +650,24 @@ int main(int argc, char const **args) {
     return 0;
   }
 
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CTAS_PER_SM)
+  constexpr int SingleWarpgroupTileK = CUTLASS_MIXED_GEMM_TILE_SHAPE_K;
+  if (options.k <= 0 || (options.k % SingleWarpgroupTileK) != 0) {
+    std::cerr << "Single-warpgroup GEMM requires K to be a positive multiple of "
+              << SingleWarpgroupTileK << ".\n";
+    return -1;
+  }
+#if !defined(CUTLASS_MIXED_GEMM_SINGLE_WG_ROLLING_REFILL)
+  constexpr int SingleWarpgroupMaxPrefillK =
+      CUTLASS_MIXED_GEMM_MANUAL_STAGE_COUNT * SingleWarpgroupTileK;
+  if (options.k > SingleWarpgroupMaxPrefillK) {
+    std::cerr << "Prefill-only single-warpgroup GEMM requires K <= "
+              << SingleWarpgroupMaxPrefillK << ".\n";
+    return -1;
+  }
+#endif
+#endif
+
   if (options.explore) {
     #ifdef PROFILE
     if (!best_config_finder(options)) {

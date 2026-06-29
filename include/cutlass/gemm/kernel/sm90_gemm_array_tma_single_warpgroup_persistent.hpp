@@ -34,6 +34,11 @@
 
 namespace cutlass::gemm::kernel {
 
+enum class SingleWarpgroupPipelineMode {
+  PrefillAll,
+  RollingRefill
+};
+
 // Small-K persistent kernel that keeps the existing mixed-input collectives
 // intact while one warpgroup overlaps the next output tile with current MMA.
 template <
@@ -41,7 +46,8 @@ template <
     class CollectiveMainloop_,
     class CollectiveEpilogue_,
     int MinCtasPerMultiprocessor_,
-    int PrefetchNextTileStages_>
+    int PrefetchNextTileStages_,
+    SingleWarpgroupPipelineMode PipelineMode_ = SingleWarpgroupPipelineMode::PrefillAll>
 class SingleWarpgroupPersistentGemm
     : public GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_> {
  private:
@@ -60,18 +66,36 @@ class SingleWarpgroupPersistentGemm
   using InternalStrideD = typename Base::InternalStrideD;
   using ClusterShape = typename Base::ClusterShape;
   using TileScheduler = typename Base::TileScheduler;
+  using Arguments = typename Base::Arguments;
   using Params = typename Base::Params;
   using SharedStorage = typename Base::SharedStorage;
 
   static constexpr uint32_t MaxThreadsPerBlock = NumThreadsPerWarpGroup;
   static constexpr uint32_t MinBlocksPerMultiprocessor = MinCtasPerMultiprocessor_;
   static constexpr int PrefetchNextTileStages = PrefetchNextTileStages_;
+  static constexpr SingleWarpgroupPipelineMode PipelineMode = PipelineMode_;
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
   static_assert(MinCtasPerMultiprocessor_ > 0,
                 "Single-warpgroup persistent GEMM requires a positive CTA/SM target.");
 
   static dim3 get_block_shape() { return dim3(MaxThreadsPerBlock, 1, 1); }
+
+  static bool can_implement(Arguments const& args) {
+    bool implementable = Base::can_implement(args);
+    if constexpr (PipelineMode == SingleWarpgroupPipelineMode::PrefillAll) {
+      auto problem_shape = args.problem_shape;
+      if (problem_shape.is_host_problem_shape_available()) {
+        constexpr int MaxPrefillK =
+            CollectiveMainloop::DispatchPolicy::Stages * cute::size<2>(TileShape{});
+        for (int group = 0; group < problem_shape.groups(); ++group) {
+          implementable &=
+              cute::get<2>(problem_shape.get_host_problem_shape(group)) <= MaxPrefillK;
+        }
+      }
+    }
+    return implementable;
+  }
 
   CUTLASS_DEVICE
   void operator()(Params const& params, char* smem_buf) {
@@ -234,8 +258,18 @@ class SingleWarpgroupPersistentGemm
       for (int stage = 0; stage < current_prefetched_stages; ++stage) {
         ++k_tile_iter;
       }
+
+      int current_prefill_stage_count = work_k_tile_count;
+      int current_k_tiles_to_refill = 0;
+      if constexpr (PipelineMode == SingleWarpgroupPipelineMode::RollingRefill) {
+        current_prefill_stage_count = work_k_tile_count < CollectiveMainloop::DispatchPolicy::Stages
+            ? work_k_tile_count
+            : CollectiveMainloop::DispatchPolicy::Stages;
+        current_k_tiles_to_refill = work_k_tile_count - current_prefill_stage_count;
+      }
       int const current_k_tiles_to_produce =
-          work_k_tile_count - current_prefetched_stages;
+          current_prefill_stage_count - current_prefetched_stages;
+      CUTLASS_ASSERT(current_k_tiles_to_produce >= 0);
       if (current_k_tiles_to_produce > 0 && warp_idx == 0) {
         collective_mainloop.load(
             params.mainloop,
@@ -251,6 +285,11 @@ class SingleWarpgroupPersistentGemm
             shared_storage.tensors.mainloop);
         mainloop_pipe_producer_state.advance(current_k_tiles_to_produce);
       }
+      auto current_refill_k_tile_iter = k_tile_iter;
+      CUTLASS_PRAGMA_UNROLL
+      for (int stage = 0; stage < current_k_tiles_to_produce; ++stage) {
+        ++current_refill_k_tile_iter;
+      }
 
       auto next_work = scheduler.fetch_next_work(work_tile_info);
       next_work_tile_info = get<0>(next_work);
@@ -258,9 +297,12 @@ class SingleWarpgroupPersistentGemm
       auto next_producer_blk_coord = producer_blk_coord;
       auto next_work_k_tile_start = work_k_tile_start;
       int next_work_k_tile_count = 0;
+      bool next_group_change = false;
+      bool next_group_mainloop_state_ready = true;
 
       if (next_work_tile_info.is_valid()) {
-        bool const next_group_change = next_work_tile_info.L_idx != current_group;
+        next_group_change = next_work_tile_info.L_idx != current_group;
+        next_group_mainloop_state_ready = !next_group_change;
         if (next_group_change) {
           next_problem_shape_MNKL = append<4>(
               params.problem_shape.get_problem_shape(next_work_tile_info.L_idx), 1);
@@ -280,13 +322,16 @@ class SingleWarpgroupPersistentGemm
           next_work_k_tile_start = work_k_tile_start;
         }
 
-        if (next_group_change && warp_idx == 0) {
-          next_load_inputs = collective_mainloop.tensors_perform_update(
-              next_load_inputs,
-              params.mainloop,
-              next_problem_shape_MNKL,
-              next_work_tile_info.L_idx);
-          collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
+        if constexpr (PipelineMode == SingleWarpgroupPipelineMode::PrefillAll) {
+          if (next_group_change && warp_idx == 0) {
+            next_load_inputs = collective_mainloop.tensors_perform_update(
+                next_load_inputs,
+                params.mainloop,
+                next_problem_shape_MNKL,
+                next_work_tile_info.L_idx);
+            collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
+          }
+          next_group_mainloop_state_ready = true;
         }
       }
 
@@ -304,8 +349,44 @@ class SingleWarpgroupPersistentGemm
                 : PrefetchNextTileStages_)
           : 0;
       int next_k_tiles_to_produce = next_prefetch_stage_count;
-      auto prefetch_next_tile_stage = [&] {
+      auto produce_released_stage = [&] {
+        if constexpr (PipelineMode == SingleWarpgroupPipelineMode::RollingRefill) {
+          if (current_k_tiles_to_refill > 0) {
+            if (warp_idx == 0) {
+              collective_mainloop.load(
+                  params.mainloop,
+                  mainloop_pipeline,
+                  mainloop_pipe_producer_state,
+                  load_inputs,
+                  input_tensormaps,
+                  producer_blk_coord,
+                  current_refill_k_tile_iter,
+                  1,
+                  lane_idx,
+                  block_rank_in_cluster,
+                  shared_storage.tensors.mainloop);
+              ++current_refill_k_tile_iter;
+              ++mainloop_pipe_producer_state;
+            }
+            --current_k_tiles_to_refill;
+            return;
+          }
+        }
+
         if (next_k_tiles_to_produce > 0) {
+          if constexpr (PipelineMode == SingleWarpgroupPipelineMode::RollingRefill) {
+            if (!next_group_mainloop_state_ready) {
+              if (warp_idx == 0) {
+                next_load_inputs = collective_mainloop.tensors_perform_update(
+                    next_load_inputs,
+                    params.mainloop,
+                    next_problem_shape_MNKL,
+                    next_work_tile_info.L_idx);
+                collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
+              }
+              next_group_mainloop_state_ready = true;
+            }
+          }
           if (warp_idx == 0) {
             collective_mainloop.load(
                 params.mainloop,
@@ -334,10 +415,25 @@ class SingleWarpgroupPersistentGemm
           mma_thread_idx,
           shared_storage.tensors.mainloop,
           params.mainloop,
-          prefetch_next_tile_stage);
+          produce_released_stage);
       collective_mainloop.mma_tail(
           mainloop_pipeline, mainloop_pipe_consumer_state, work_k_tile_count);
-      prefetch_next_tile_stage();
+      CUTLASS_ASSERT(current_k_tiles_to_refill == 0);
+      produce_released_stage();
+
+      if constexpr (PipelineMode == SingleWarpgroupPipelineMode::RollingRefill) {
+        if (next_work_tile_info.is_valid() && !next_group_mainloop_state_ready) {
+          if (warp_idx == 0) {
+            next_load_inputs = collective_mainloop.tensors_perform_update(
+                next_load_inputs,
+                params.mainloop,
+                next_problem_shape_MNKL,
+                next_work_tile_info.L_idx);
+            collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
+          }
+          next_group_mainloop_state_ready = true;
+        }
+      }
       next_prefetched_stages = next_prefetch_stage_count - next_k_tiles_to_produce;
       mainloop_pipe_consumer_state.advance(work_k_tile_count);
 
