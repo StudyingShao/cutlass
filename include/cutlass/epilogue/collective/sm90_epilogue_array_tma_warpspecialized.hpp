@@ -64,6 +64,7 @@ template <
   bool ReuseSmemC_,
   bool DelayTmaStore_,
   int NumEpilogueWarpGroups_,
+  bool UsesPrebuiltDDescriptor_,
   class CtaTileMNK_,   //     (CTA_M,CTA_N,CTA_K)
   class EpilogueTile_, // (EPI_TILE_M,EPI_TILE_N)
   class ElementC_,
@@ -86,7 +87,8 @@ class CollectiveEpilogue<
                                    FragmentSize_,
                                    ReuseSmemC_,
                                    DelayTmaStore_,
-                                   NumEpilogueWarpGroups_
+                                   NumEpilogueWarpGroups_,
+                                   UsesPrebuiltDDescriptor_
                                   >,
     CtaTileMNK_,
     EpilogueTile_,
@@ -113,7 +115,8 @@ public:
                                                         FragmentSize_,
                                                         ReuseSmemC_,
                                                         DelayTmaStore_, 
-                                                        NumEpilogueWarpGroups_
+                                                        NumEpilogueWarpGroups_,
+                                                        UsesPrebuiltDDescriptor_
                                                        >;
   using CtaTileMNK = CtaTileMNK_;
   using EpilogueTile = EpilogueTile_;
@@ -221,12 +224,25 @@ public:
   constexpr static bool RequiresTransactionBytes = true;
 
   constexpr static int NumEpilogueWarpGroups = NumEpilogueWarpGroups_;
+  static constexpr bool IsGroupedGemmKernel =
+      !cute::is_same_v<InternalStrideC, StrideC>;
+  static constexpr bool UsesPrebuiltDDescriptor =
+      UsesPrebuiltDDescriptor_ && IsGroupedGemmKernel;
 
   // TMA pipeline for storing D
   using StorePipeline = cute::conditional_t<ReuseSmemC,
                           cutlass::PipelineTmaStore<StagesC, StagesD-1>,
                           cutlass::PipelineTmaStore<StagesD>>;
   using StorePipelineState = cutlass::PipelineState<ReuseSmemC ? StagesC : StagesD>;
+
+  struct TensorMapStorageWithMutableD : cute::aligned_struct<128, _0> {
+    cute::TmaDescriptor smem_tensormap_C;
+    cute::array<cute::TmaDescriptor, NumEpilogueWarpGroups> smem_tensormap_D;
+  };
+
+  struct TensorMapStorageWithPrebuiltD : cute::aligned_struct<128, _0> {
+    cute::TmaDescriptor smem_tensormap_C;
+  };
 
   struct SharedStorage {
     struct TensorStorage {
@@ -238,10 +254,11 @@ public:
       FusionStorage thread;
     } tensors;
 
-    struct TensorMapStorage : cute::aligned_struct<128, _0> {
-      cute::TmaDescriptor smem_tensormap_C;
-      cute::array<cute::TmaDescriptor, NumEpilogueWarpGroups> smem_tensormap_D;
-    } tensormaps;
+    using TensorMapStorage = cute::conditional_t<
+        UsesPrebuiltDDescriptor,
+        TensorMapStorageWithPrebuiltD,
+        TensorMapStorageWithMutableD>;
+    TensorMapStorage tensormaps;
 
     using PipelineStorage = typename LoadPipeline::SharedStorage;
     PipelineStorage pipeline;
@@ -250,8 +267,6 @@ public:
   using TensorMapStorage = typename SharedStorage::TensorMapStorage;
   using PipelineStorage = typename SharedStorage::PipelineStorage;
 
-  static constexpr bool IsGroupedGemmKernel = !cute::is_same_v<InternalStrideC, StrideC>;
-
   // Host side epilogue arguments
   struct Arguments {
     typename FusionCallbacks::Arguments thread{};
@@ -259,6 +274,7 @@ public:
     StrideC dC;
     ElementD ** ptr_D = nullptr;
     StrideD dD;
+    cute::TmaDescriptor const* ptr_D_prebuilt_tma_descs = nullptr;
   };
 
   // Device side epilogue params
@@ -287,6 +303,7 @@ public:
     StrideC dC;
     ElementD** ptr_D;
     StrideD dD;
+    cute::TmaDescriptor const* ptr_D_prebuilt_tma_descs;
     uint32_t tma_transaction_bytes = TmaTransactionBytes;
   };
 
@@ -366,6 +383,7 @@ public:
       args.dC,
       args.ptr_D,
       args.dD,
+      args.ptr_D_prebuilt_tma_descs,
       transaction_bytes,
     };
   }
@@ -374,11 +392,15 @@ public:
   static size_t
   get_workspace_size(ProblemShape const& problem_shape, Arguments const& args, int sm_count) {
     
-    constexpr uint32_t NumInputTensors = NumEpilogueWarpGroups + (cute::is_void_v<ElementC> ? 0 : 1);
+    constexpr uint32_t NumMutableOutputTensors =
+        UsesPrebuiltDDescriptor ? 0 : NumEpilogueWarpGroups;
+    constexpr uint32_t NumInputTensors =
+        NumMutableOutputTensors + (cute::is_void_v<ElementC> ? 0 : 1);
     auto descriptors_shape = cute::make_shape(sm_count, Int<NumInputTensors>{});
     constexpr size_t SizeOfCuTensorMap = sizeof(cute::TmaDescriptor);
 
-    // Allocate gmem space for input tensormaps per each SM, A tensormap copies followed by B tensormap copies
+    // Grouped D descriptors are immutable and live in the per-expert builder
+    // workspace. This per-SM workspace retains only C and non-grouped D maps.
     return (size(descriptors_shape) * SizeOfCuTensorMap) + FusionCallbacks::get_workspace_size(problem_shape, args.thread);
   }
 
@@ -397,6 +419,10 @@ public:
 
     bool implementable = true;
     bool fusion_implementable = true;
+
+    if constexpr (UsesPrebuiltDDescriptor && is_destination_supported) {
+      implementable = implementable && (args.ptr_D_prebuilt_tma_descs != nullptr);
+    }
 
     if (problem_shape.is_host_problem_shape_available()) {
       for (int i = 0; i < problem_shape.groups(); ++i) {
@@ -786,8 +812,9 @@ public:
     // to ensure visibility of smem reads/writes to threads or TMA unit
     auto synchronize = [&] () { cutlass::arch::NamedBarrier::sync(size(TiledMma{}), cutlass::arch::ReservedNamedBarriers::EpilogueBarrier); };
 
-    // Predication for TMA store (one warp issues TMA store)
-    bool issue_tma_store = (thread_idx / NumThreadsPerWarp) == 0;
+    // Predication for TMA store (a single thread from one warp issues TMA store)
+    bool issue_tma_store =
+        ((thread_idx / NumThreadsPerWarp) == 0) && cute::elect_one_sync();
 
     // In the reuse smem configuration we have StagesC smem buffers and at most StagesD committed TMA stores in flight.
     // The TMA store pipeline producer acquire returns when at most StagesD-1 committed stores are in-flight, so we can
@@ -991,17 +1018,28 @@ public:
       TensorMapStorage& shared_tensormaps,
       int32_t sm_count,
       int32_t sm_idx,
-      int32_t warp_group_idx) {
-    int warp_idx_in_warp_group = canonical_warp_idx_sync() % NumWarpsPerWarpGroup;
-    // Since only one warp issues TMA store, we only need that one warp to initialize tensormaps
-    if (warp_idx_in_warp_group == 0) {
-      // Initialize tma
-      constexpr bool IsLoad = false;
-      auto store_tensormaps = tensormaps_init<IsLoad>(params, shared_tensormaps, sm_count, sm_idx, warp_group_idx);
-      return store_tensormaps;
+      int32_t warp_group_idx,
+      int32_t group_idx = 0,
+      bool issue_tma_store = true) {
+    if constexpr (UsesPrebuiltDDescriptor) {
+      if (issue_tma_store) {
+        return cute::make_tuple(params.ptr_D_prebuilt_tma_descs + group_idx);
+      }
+      TmaDescriptor const* null_tma_desc = nullptr;
+      return cute::make_tuple(null_tma_desc);
     }
-    TmaDescriptor* null_tma_desc = nullptr;
-    return cute::make_tuple(null_tma_desc);
+    else {
+      int warp_idx_in_warp_group = canonical_warp_idx_sync() % NumWarpsPerWarpGroup;
+      // Since only one warp issues TMA store, we only need that one warp to initialize tensormaps
+      if (warp_idx_in_warp_group == 0) {
+        // Initialize tma
+        constexpr bool IsLoad = false;
+        auto store_tensormaps = tensormaps_init<IsLoad>(params, shared_tensormaps, sm_count, sm_idx, warp_group_idx);
+        return store_tensormaps;
+      }
+      TmaDescriptor* null_tma_desc = nullptr;
+      return cute::make_tuple(null_tma_desc);
+    }
   }
 
   //
@@ -1017,14 +1055,17 @@ public:
       int32_t sm_idx,
       int32_t warp_group_idx) {
 
-    constexpr uint32_t NumInputTensors = NumEpilogueWarpGroups + (cute::is_void_v<ElementC> ? 0 : 1);
+    constexpr uint32_t NumMutableOutputTensors =
+        UsesPrebuiltDDescriptor ? 0 : NumEpilogueWarpGroups;
+    constexpr uint32_t NumInputTensors =
+        NumMutableOutputTensors + (cute::is_void_v<ElementC> ? 0 : 1);
     Layout desc_layout = make_layout(make_shape(sm_count, Int<NumInputTensors>{}));
 
     Tensor gmem_tensormap = make_tensor(params.tensormaps, desc_layout);                      // (SMs, NumInputTensors)
 
     if constexpr (IsLoad) {
       if (is_source_supported) {
-        constexpr int C_tensormap_index = NumEpilogueWarpGroups;
+        constexpr int C_tensormap_index = NumMutableOutputTensors;
         Tensor pC_tensormap = make_tensor(params.tma_load_c.get_tma_descriptor(), Int<1>{}, Int<1>{});
         Tensor sC_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_C), Int<1>{}, Int<1>{});
 
@@ -1040,15 +1081,20 @@ public:
       return cute::make_tuple(null_tma_desc);
     }
     else {
-      Tensor pD_tensormap = make_tensor(params.tma_store_d.get_tma_descriptor(), Int<1>{}, Int<1>{});
-      Tensor sD_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_D[warp_group_idx]), Int<1>{}, Int<1>{});
-
-      if (cute::elect_one_sync()) {
-        // Bringing tensormaps from params to smem for modification later
-        copy(recast<uint128_t>(pD_tensormap), recast<uint128_t>(sD_tensormap));
+      if constexpr (UsesPrebuiltDDescriptor) {
+        return cute::make_tuple(params.ptr_D_prebuilt_tma_descs);
       }
-      __syncwarp();
-      return cute::make_tuple(&gmem_tensormap(sm_idx, warp_group_idx));
+      else {
+        Tensor pD_tensormap = make_tensor(params.tma_store_d.get_tma_descriptor(), Int<1>{}, Int<1>{});
+        Tensor sD_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_D[warp_group_idx]), Int<1>{}, Int<1>{});
+
+        if (cute::elect_one_sync()) {
+          // Bringing tensormaps from params to smem for modification later
+          copy(recast<uint128_t>(pD_tensormap), recast<uint128_t>(sD_tensormap));
+        }
+        __syncwarp();
+        return cute::make_tuple(&gmem_tensormap(sm_idx, warp_group_idx));
+      }
     }
   }
 
@@ -1070,9 +1116,10 @@ public:
         }
       }
     }
-    else if constexpr (is_destination_supported) {
-      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_D[warp_group_idx],
-                                                      params.ptr_D[next_batch]);
+    else if constexpr (is_destination_supported && !UsesPrebuiltDDescriptor) {
+      cute::tma_descriptor_replace_addr_in_shared_mem(
+          shared_tensormaps.smem_tensormap_D[warp_group_idx],
+          params.ptr_D[next_batch]);
     }
   }
 
@@ -1111,7 +1158,7 @@ public:
         }
       }
     }
-    else if constexpr (is_destination_supported) {
+    else if constexpr (is_destination_supported && !UsesPrebuiltDDescriptor) {
       ElementD const* ptr_D = nullptr;
       Tensor tensor_d = make_tensor(ptr_D, make_layout(make_shape(M,N,Int<1>{}), params.dD[next_group]));
 
@@ -1166,8 +1213,10 @@ public:
         tma_descriptor_cp_fence_release(tensormap, shared_tensormaps.smem_tensormap_C);
       }
     }
-    else if constexpr (is_destination_supported) {
-      tma_descriptor_cp_fence_release(tensormap, shared_tensormaps.smem_tensormap_D[warp_group_idx]);
+    else if constexpr (is_destination_supported && !UsesPrebuiltDDescriptor) {
+      tma_descriptor_cp_fence_release(
+          tensormap,
+          shared_tensormaps.smem_tensormap_D[warp_group_idx]);
     }
   }
 

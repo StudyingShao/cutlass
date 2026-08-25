@@ -168,7 +168,8 @@ template<
   int FragmentSize_,
   bool ReuseSmemC_,
   bool DelayTmaStore_,
-  int NumEpilogueWarpGroups_
+  int NumEpilogueWarpGroups_,
+  bool UsesPrebuiltDDescriptor_ = false
 >
 struct Sm90PtrArrayTmaWarpSpecialized {
   constexpr static int StagesC = StagesC_;
@@ -177,6 +178,7 @@ struct Sm90PtrArrayTmaWarpSpecialized {
   constexpr static bool ReuseSmemC = ReuseSmemC_;
   constexpr static bool DelayTmaStore = DelayTmaStore_;
   constexpr static int NumEpilogueWarpGroups = NumEpilogueWarpGroups_;
+  constexpr static bool UsesPrebuiltDDescriptor = UsesPrebuiltDDescriptor_;
 };
 
 // DEPRECATED policies, will be removed in next release

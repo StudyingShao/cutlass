@@ -113,7 +113,8 @@ template<
   int FragmentSize,
   bool ReuseSmemC,
   bool DelayTmaStore,
-  int NumEpilogueWarpGroups
+  int NumEpilogueWarpGroups,
+  bool UsesPrebuiltDDescriptor
 >
 struct sm90_is_ptr_array_tma_dispatch_policy<
     Sm90PtrArrayTmaWarpSpecialized<StagesC, 
@@ -121,7 +122,8 @@ struct sm90_is_ptr_array_tma_dispatch_policy<
                                    FragmentSize,
                                    ReuseSmemC, 
                                    DelayTmaStore, 
-                                   NumEpilogueWarpGroups>> 
+                                   NumEpilogueWarpGroups,
+                                   UsesPrebuiltDDescriptor>>
     : cute::true_type {};
 
 template<class DispatchPolicy>
@@ -237,6 +239,7 @@ public:
   using LoadPipelineState = cutlass::PipelineState<0>;
   constexpr static uint32_t TmaTransactionBytes = 0;
   constexpr static bool RequiresTransactionBytes = false;
+  static constexpr bool UsesPrebuiltDDescriptor = false;
 
   using StorePipeline = cutlass::PipelineTmaStore<0>;
   using StorePipelineState = cutlass::PipelineState<0>;

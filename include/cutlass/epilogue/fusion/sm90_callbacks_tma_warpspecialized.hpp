@@ -214,6 +214,7 @@ template <
   bool ReuseSmemC,
   bool DelayTmaStore,
   int NumEpilogueWarpGroups,
+  bool UsesPrebuiltDDescriptor,
   class ElementOutput,
   class ElementCompute,
   class ElementSource,
@@ -228,7 +229,8 @@ struct FusionCallbacks<
                                              FragmentSize, 
                                              ReuseSmemC, 
                                              DelayTmaStore, 
-                                             NumEpilogueWarpGroups
+                                             NumEpilogueWarpGroups,
+                                             UsesPrebuiltDDescriptor
                                             >,
     fusion::LinearCombination<ElementOutput, ElementCompute, ElementSource, ElementScalar, RoundStyle>,
     CtaTileShapeMNK,
@@ -370,6 +372,7 @@ template <
   bool ReuseSmemC,
   bool DelayTmaStore,
   int NumEpilogueWarpGroups,
+  bool UsesPrebuiltDDescriptor,
   template <class> class ActivationFn,
   class ElementOutput,
   class ElementCompute,
@@ -385,7 +388,8 @@ struct FusionCallbacks<
                                              FragmentSize, 
                                              ReuseSmemC, 
                                              DelayTmaStore, 
-                                             NumEpilogueWarpGroups
+                                             NumEpilogueWarpGroups,
+                                             UsesPrebuiltDDescriptor
                                             >,
     fusion::LinCombEltAct<ActivationFn, ElementOutput, ElementCompute, ElementSource, ElementScalar, RoundStyle>,
     CtaTileShapeMNK,

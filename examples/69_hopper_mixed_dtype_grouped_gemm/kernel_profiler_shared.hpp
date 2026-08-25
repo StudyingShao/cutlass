@@ -210,7 +210,8 @@ template <
     int TileShapeM,
     int TileShapeN,
     int ClusterShapeM,
-    int ClusterShapeN>
+    int ClusterShapeN,
+    bool BuildPrebuiltDDescriptor>
 void prepare_precomputed_work_tile_map(Options const& options);
 
 template <
@@ -218,10 +219,13 @@ template <
     int TileShapeN,
     int ClusterShapeM,
     int ClusterShapeN,
-    class MainloopParams>
+    bool BuildPrebuiltDDescriptor,
+    class MainloopParams,
+    class EpilogueParams>
 void build_precomputed_work_tile_map(
     Options const& options,
     MainloopParams const& mainloop_params,
+    EpilogueParams const& epilogue_params,
     cudaStream_t stream);
 
 namespace precomputed_scheduler {
@@ -233,6 +237,7 @@ uint32_t work_tiles_per_worker();
 cute::TmaDescriptor const* prebuilt_tma_desc_A_data();
 cute::TmaDescriptor const* prebuilt_tma_desc_B_data();
 cute::TmaDescriptor const* prebuilt_tma_desc_activation_scale_data();
+cute::TmaDescriptor const* prebuilt_tma_desc_D_data();
 
 }  // namespace precomputed_scheduler
 
@@ -641,7 +646,16 @@ typename Gemm::Arguments args_from_options(Options const& options)
       compact_epilogue_beta
     },
 #else
-    {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
+    {
+      fusion_args,
+      ptr_C.get(),
+      stride_C.get(),
+      ptr_D.get(),
+      stride_D.get(),
+      Gemm::CollectiveEpilogue::UsesPrebuiltDDescriptor
+          ? precomputed_scheduler::prebuilt_tma_desc_D_data()
+          : nullptr
+    },
 #endif
     hw_info
   };
@@ -685,9 +699,11 @@ void profile_grouped_mixed_dtype(
         CurrentTileShapeM,
         CurrentTileShapeN,
         CurrentClusterShapeM,
-        CurrentClusterShapeN>(
+        CurrentClusterShapeN,
+        Gemm::CollectiveEpilogue::UsesPrebuiltDDescriptor>(
         options,
         gemm.params().mainloop,
+        gemm.params().epilogue,
         stream);
   };
 
@@ -802,7 +818,8 @@ MixedDtypeResult run(Options &options)
       CurrentTileShapeM,
       CurrentTileShapeN,
       CurrentClusterShapeM,
-      CurrentClusterShapeN>(options);
+      CurrentClusterShapeN,
+      Gemm::CollectiveEpilogue::UsesPrebuiltDDescriptor>(options);
 
   Gemm gemm;
   auto arguments    = args_from_options<Gemm>(options);
@@ -827,9 +844,11 @@ MixedDtypeResult run(Options &options)
       CurrentTileShapeM,
       CurrentTileShapeN,
       CurrentClusterShapeM,
-      CurrentClusterShapeN>(
+      CurrentClusterShapeN,
+      Gemm::CollectiveEpilogue::UsesPrebuiltDDescriptor>(
       options,
       gemm.params().mainloop,
+      gemm.params().epilogue,
       nullptr);
   result.status = gemm.run();
   if (result.status != cutlass::Status::kSuccess) {

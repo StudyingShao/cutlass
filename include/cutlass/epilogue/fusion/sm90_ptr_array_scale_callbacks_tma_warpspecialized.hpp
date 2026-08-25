@@ -50,6 +50,7 @@ template <
   bool ReuseSmemC,
   bool DelayTmaStore,
   int NumEpilogueWarpGroups,
+  bool UsesPrebuiltDDescriptor,
   class ElementOutput,
   class ElementCompute,
   class ElementScalar,
@@ -60,7 +61,8 @@ template <
 >
 struct FusionCallbacks<
     epilogue::Sm90PtrArrayTmaWarpSpecialized<
-      StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore, NumEpilogueWarpGroups>,
+      StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore,
+      NumEpilogueWarpGroups, UsesPrebuiltDDescriptor>,
     fusion::PtrArrayPerTokenScaledAcc<
       ElementOutput, ElementCompute, ElementScalar, AlignmentScalar, RoundStyle>,
     CtaTileShapeMNK,

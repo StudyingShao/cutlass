@@ -15,12 +15,14 @@ struct State {
   cutlass::DeviceAllocation<cute::TmaDescriptor> prebuilt_tma_desc_A;
   cutlass::DeviceAllocation<cute::TmaDescriptor> prebuilt_tma_desc_B;
   cutlass::DeviceAllocation<cute::TmaDescriptor> prebuilt_tma_desc_activation_scale;
+  cutlass::DeviceAllocation<cute::TmaDescriptor> prebuilt_tma_desc_D;
   uint64_t max_work_tile_count = 0;
   uint64_t work_tile_capacity = 0;
   uint32_t work_tiles_per_worker = 0;
   uint64_t prebuilt_tma_desc_A_capacity = 0;
   uint64_t prebuilt_tma_desc_B_capacity = 0;
   uint64_t prebuilt_tma_desc_activation_scale_capacity = 0;
+  uint64_t prebuilt_tma_desc_D_capacity = 0;
   dim3 gemm_grid_shape = dim3(1, 1, 1);
 };
 
@@ -44,6 +46,10 @@ inline cute::TmaDescriptor const* prebuilt_tma_desc_B_data() {
 
 inline cute::TmaDescriptor const* prebuilt_tma_desc_activation_scale_data() {
   return scheduler_state.prebuilt_tma_desc_activation_scale.get();
+}
+
+inline cute::TmaDescriptor const* prebuilt_tma_desc_D_data() {
+  return scheduler_state.prebuilt_tma_desc_D.get();
 }
 
 inline int log_swizzle_size(
@@ -199,7 +205,8 @@ template <
     int TileShapeM,
     int TileShapeN,
     int ClusterShapeM,
-    int ClusterShapeN>
+    int ClusterShapeN,
+    bool BuildPrebuiltDDescriptor>
 inline void prepare_work_tiles(Options const& options) {
 #if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
   auto& state = scheduler_state;
@@ -257,6 +264,16 @@ inline void prepare_work_tiles(Options const& options) {
     state.prebuilt_tma_desc_activation_scale.reset(
         state.prebuilt_tma_desc_activation_scale_capacity);
   }
+#if !defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+  if constexpr (BuildPrebuiltDDescriptor) {
+    if (required_prebuilt_desc_capacity > state.prebuilt_tma_desc_D_capacity) {
+      state.prebuilt_tma_desc_D_capacity = required_prebuilt_desc_capacity;
+      state.prebuilt_tma_desc_D.reset(state.prebuilt_tma_desc_D_capacity);
+    }
+  }
+#else
+  static_assert(!BuildPrebuiltDDescriptor);
+#endif
 #else
   (void)options;
 #endif
@@ -333,19 +350,29 @@ GroupInfo get_group_info_static(
 
 // The builder CTA stages TMA descriptors in dynamic shared memory before
 // publishing them to the global prebuilt descriptor arrays. Slot and warp
-// assignments are fixed so A, B, and activation-scale descriptors can be
+// assignments are fixed so A, B, activation-scale, and D descriptors can be
 // constructed independently inside one CTA.
-static constexpr int PrebuiltTmaDescriptorScratchCount = 3;
+template <bool BuildPrebuiltDDescriptor>
+static constexpr int PrebuiltTmaDescriptorScratchCount =
+    3 + (BuildPrebuiltDDescriptor ? 1 : 0);
+template <bool BuildPrebuiltDDescriptor>
 static constexpr size_t PrebuiltTmaDescriptorScratchBytes =
-    PrebuiltTmaDescriptorScratchCount * sizeof(cute::TmaDescriptor);
+    PrebuiltTmaDescriptorScratchCount<BuildPrebuiltDDescriptor> *
+    sizeof(cute::TmaDescriptor);
 // Descriptor scratch slots inside the dynamic shared-memory prefix.
 static constexpr int PrebuiltTmaDescriptorSlotA = 0;
 static constexpr int PrebuiltTmaDescriptorSlotB = 1;
 static constexpr int PrebuiltTmaDescriptorSlotActivationScale = 2;
+#if !defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+static constexpr int PrebuiltTmaDescriptorSlotD = 3;
+#endif
 // Publisher warp assignments for descriptor release to global memory.
 static constexpr int PrebuiltTmaDescriptorWarpA = 0;
 static constexpr int PrebuiltTmaDescriptorWarpB = 1;
 static constexpr int PrebuiltTmaDescriptorWarpActivationScale = 2;
+#if !defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+static constexpr int PrebuiltTmaDescriptorWarpD = 3;
+#endif
 
 template <class MainloopParams>
 static constexpr bool HasPrebuiltActivationScaleTmaDesc =
@@ -512,12 +539,68 @@ void build_prebuilt_tma_descriptors(
   }
 }
 
+#if !defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+template <class EpilogueParams>
+__device__ __forceinline__
+void build_prebuilt_d_tma_descriptor(
+    typename ProblemShape::UnderlyingProblemShape const& problem,
+    int group,
+    cute::TmaDescriptor* smem_tma_desc,
+    EpilogueParams const& epilogue_params,
+    cute::TmaDescriptor* prebuilt_tma_desc_D) {
+  cute::TmaDescriptor& smem_desc = smem_tma_desc[PrebuiltTmaDescriptorSlotD];
+  if (threadIdx.x == PrebuiltTmaDescriptorWarpD * 32) {
+    constexpr int MaxTensorRank = 5;
+    cute::array<uint32_t, MaxTensorRank> prob_shape_D  = {1,1,1,1,1};
+    cute::array<uint64_t, MaxTensorRank> prob_stride_D = {0,0,0,0,0};
+    using ElementD = std::remove_cv_t<std::remove_pointer_t<
+        std::remove_reference_t<decltype(epilogue_params.ptr_D[group])>>>;
+    ElementD const* ptr_D = nullptr;
+    // The device problem is already SwapAB-transformed to
+    // (output_channels, routed_tokens, K). TMA extents cannot be zero, but
+    // zero-token experts have no work tiles and therefore never store.
+    uint32_t const M = static_cast<uint32_t>(cute::get<0>(problem));
+    uint32_t const logical_N = static_cast<uint32_t>(cute::get<1>(problem));
+    uint32_t const N = logical_N == 0 ? 1 : logical_N;
+    Tensor tensor_d = make_tensor(
+        ptr_D,
+        make_layout(
+            make_shape(M, N, uint32_t(1)),
+            epilogue_params.dD[group]));
+
+    smem_desc = *epilogue_params.tma_store_d.get_tma_descriptor();
+    cute::tma_descriptor_replace_addr_in_shared_mem(
+        smem_desc,
+        epilogue_params.ptr_D[group]);
+    cute::detail::fill_tma_gmem_shape_stride(
+        epilogue_params.tma_store_d,
+        tensor_d,
+        prob_shape_D,
+        prob_stride_D);
+
+    for (uint64_t& stride : prob_stride_D) {
+      stride = (stride * cutlass::sizeof_bits<ElementD>::value) / 8;
+    }
+    cute::tma_descriptor_replace_dims_strides_in_shared_mem(
+        smem_desc,
+        prob_shape_D,
+        prob_stride_D);
+  }
+  publish_prebuilt_tma_descriptor(
+      &prebuilt_tma_desc_D[group],
+      smem_desc,
+      PrebuiltTmaDescriptorWarpD);
+}
+#endif
+
 template <
     int StaticTileShapeM,
     int StaticTileShapeN,
     int StaticClusterShapeM,
     int StaticClusterShapeN,
-    class MainloopParams>
+    bool BuildPrebuiltDDescriptor,
+    class MainloopParams,
+    class... PrebuiltDArgs>
 __global__
 void build_work_tile_map_kernel(
     typename ProblemShape::UnderlyingProblemShape const* problem_shapes,
@@ -530,7 +613,14 @@ void build_work_tile_map_kernel(
     MainloopParams mainloop_params,
     cute::TmaDescriptor* prebuilt_tma_desc_A,
     cute::TmaDescriptor* prebuilt_tma_desc_B,
-    cute::TmaDescriptor* prebuilt_tma_desc_activation_scale) {
+    cute::TmaDescriptor* prebuilt_tma_desc_activation_scale,
+    PrebuiltDArgs... prebuilt_d_args) {
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+  static_assert(!BuildPrebuiltDDescriptor);
+#endif
+  static_assert(
+      BuildPrebuiltDDescriptor ? sizeof...(PrebuiltDArgs) == 2
+                               : sizeof...(PrebuiltDArgs) == 0);
   int const tid = threadIdx.x;
   uint64_t const total_grid_size = uint64_t(gemm_grid_x) * uint64_t(gemm_grid_y);
 
@@ -556,7 +646,9 @@ void build_work_tile_map_kernel(
   cute::TmaDescriptor* smem_tma_desc =
       reinterpret_cast<cute::TmaDescriptor*>(shared_storage);
   unsigned long long* prefix_partials =
-      reinterpret_cast<unsigned long long*>(shared_storage + PrebuiltTmaDescriptorScratchBytes);
+      reinterpret_cast<unsigned long long*>(
+          shared_storage +
+          PrebuiltTmaDescriptorScratchBytes<BuildPrebuiltDDescriptor>);
 #if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
   unsigned long long* total_partials = prefix_partials + blockDim.x;
   unsigned long long* group_info_storage = total_partials + blockDim.x;
@@ -584,6 +676,16 @@ void build_work_tile_map_kernel(
       prebuilt_tma_desc_A,
       prebuilt_tma_desc_B,
       prebuilt_tma_desc_activation_scale);
+
+#if !defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+  if constexpr (BuildPrebuiltDDescriptor) {
+    build_prebuilt_d_tma_descriptor(
+        problem_shapes[group],
+        group,
+        smem_tma_desc,
+        prebuilt_d_args...);
+  }
+#endif
 
   uint64_t prefix_sum = 0;
 #if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
@@ -686,17 +788,20 @@ template <
     int TileShapeN,
     int ClusterShapeM,
     int ClusterShapeN,
-    class MainloopParams>
+    bool BuildPrebuiltDDescriptor,
+    class MainloopParams,
+    class EpilogueParams>
 inline void build_work_tile_map(
     Options const& options,
     MainloopParams const& mainloop_params,
+    EpilogueParams const& epilogue_params,
     cudaStream_t stream) {
 #if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
   auto& state = scheduler_state;
   int const scheduler_threads = 128;
   dim3 const scheduler_grid(options.groups > 0 ? options.groups : 1);
   size_t const scheduler_smem =
-      PrebuiltTmaDescriptorScratchBytes +
+      PrebuiltTmaDescriptorScratchBytes<BuildPrebuiltDDescriptor> +
       size_t(
 #if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_CHUNK_MAJOR_WORK_MAP)
           scheduler_threads * 2 + 2
@@ -704,27 +809,61 @@ inline void build_work_tile_map(
           scheduler_threads + 2
 #endif
           ) * sizeof(unsigned long long);
-  build_work_tile_map_kernel<
-      TileShapeM,
-      TileShapeN,
-      ClusterShapeM,
-      ClusterShapeN,
-      MainloopParams><<<scheduler_grid, scheduler_threads, scheduler_smem, stream>>>(
-      problem_sizes.get(),
-      options.groups,
-      log_swizzle_size(options, state.max_work_tile_count, 1),
-      state.gemm_grid_shape.x,
-      state.gemm_grid_shape.y,
-      state.work_tiles_per_worker,
-      state.work_tiles.get(),
-      mainloop_params,
-      state.prebuilt_tma_desc_A.get(),
-      state.prebuilt_tma_desc_B.get(),
-      state.prebuilt_tma_desc_activation_scale.get());
+  if constexpr (BuildPrebuiltDDescriptor) {
+#if defined(CUTLASS_MIXED_GEMM_SINGLE_WG_SMEM_EPILOGUE)
+    static_assert(
+        !BuildPrebuiltDDescriptor,
+        "Prebuilt D descriptors are unavailable for single-WG SMEM epilogues.");
+#else
+    build_work_tile_map_kernel<
+        TileShapeM,
+        TileShapeN,
+        ClusterShapeM,
+        ClusterShapeN,
+        true,
+        MainloopParams,
+        EpilogueParams,
+        cute::TmaDescriptor*><<<scheduler_grid, scheduler_threads, scheduler_smem, stream>>>(
+        problem_sizes.get(),
+        options.groups,
+        log_swizzle_size(options, state.max_work_tile_count, 1),
+        state.gemm_grid_shape.x,
+        state.gemm_grid_shape.y,
+        state.work_tiles_per_worker,
+        state.work_tiles.get(),
+        mainloop_params,
+        state.prebuilt_tma_desc_A.get(),
+        state.prebuilt_tma_desc_B.get(),
+        state.prebuilt_tma_desc_activation_scale.get(),
+        epilogue_params,
+        state.prebuilt_tma_desc_D.get());
+#endif
+  }
+  else {
+    build_work_tile_map_kernel<
+        TileShapeM,
+        TileShapeN,
+        ClusterShapeM,
+        ClusterShapeN,
+        false,
+        MainloopParams><<<scheduler_grid, scheduler_threads, scheduler_smem, stream>>>(
+        problem_sizes.get(),
+        options.groups,
+        log_swizzle_size(options, state.max_work_tile_count, 1),
+        state.gemm_grid_shape.x,
+        state.gemm_grid_shape.y,
+        state.work_tiles_per_worker,
+        state.work_tiles.get(),
+        mainloop_params,
+        state.prebuilt_tma_desc_A.get(),
+        state.prebuilt_tma_desc_B.get(),
+        state.prebuilt_tma_desc_activation_scale.get());
+  }
   CUDA_CHECK(cudaPeekAtLastError());
 #else
   (void)options;
   (void)mainloop_params;
+  (void)epilogue_params;
   (void)stream;
 #endif
 }
@@ -735,13 +874,15 @@ template <
     int TileShapeM,
     int TileShapeN,
     int ClusterShapeM,
-    int ClusterShapeN>
+    int ClusterShapeN,
+    bool BuildPrebuiltDDescriptor>
 void prepare_precomputed_work_tile_map(Options const& options) {
   precomputed_scheduler::prepare_work_tiles<
       TileShapeM,
       TileShapeN,
       ClusterShapeM,
-      ClusterShapeN>(options);
+      ClusterShapeN,
+      BuildPrebuiltDDescriptor>(options);
 }
 
 template <
@@ -749,17 +890,22 @@ template <
     int TileShapeN,
     int ClusterShapeM,
     int ClusterShapeN,
-    class MainloopParams>
+    bool BuildPrebuiltDDescriptor,
+    class MainloopParams,
+    class EpilogueParams>
 void build_precomputed_work_tile_map(
     Options const& options,
     MainloopParams const& mainloop_params,
+    EpilogueParams const& epilogue_params,
     cudaStream_t stream) {
   precomputed_scheduler::build_work_tile_map<
       TileShapeM,
       TileShapeN,
       ClusterShapeM,
-      ClusterShapeN>(
+      ClusterShapeN,
+      BuildPrebuiltDDescriptor>(
       options,
       mainloop_params,
+      epilogue_params,
       stream);
 }

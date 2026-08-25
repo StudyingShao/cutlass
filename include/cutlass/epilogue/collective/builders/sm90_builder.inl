@@ -75,10 +75,17 @@ sm90_get_tma_dispatch_policy() {
   constexpr int StagesD = cute::min(EpiTiles, 2);
   constexpr int StagesC = ReuseSmem ? cute::max(cute::min(EpiTiles, 4), StagesD+1)
                                     : cute::min(EpiTiles, 4);
+#if defined(CUTLASS_MIXED_GEMM_PRECOMPUTED_GROUP_OFFSETS)
+  constexpr bool UsesPrebuiltDDescriptor =
+      detail::sm90_is_ptr_array_tma_cooperative_v<Schedule>;
+#else
+  constexpr bool UsesPrebuiltDDescriptor = false;
+#endif
 
   if constexpr (detail::sm90_is_ptr_array_tma_v<Schedule>) {
       return Sm90PtrArrayTmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmem, 
-                                            DelayTmaStore, Schedule::NumEpilogueWarpGroups>{};
+                                            DelayTmaStore, Schedule::NumEpilogueWarpGroups,
+                                            UsesPrebuiltDDescriptor>{};
   } 
   else {
     return Sm90TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmem, DelayTmaStore>{};
